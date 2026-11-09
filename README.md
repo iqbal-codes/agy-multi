@@ -1,6 +1,9 @@
 # agy-multi
 
-Run the **official** Antigravity CLI (`agy`) with multiple Google accounts and
+> [!IMPORTANT]
+> **Disclaimer**: `agy-multi` is an **unofficial**, community-driven open-source project. It is **not** developed, affiliated with, maintained, or endorsed by Google. "Antigravity", "Gemini", and "Google" are trademarks of Google LLC.
+
+Run the official Antigravity CLI (`agy`) with multiple Google accounts and
 automatic, quota-aware failover — without patching the binary, proxying traffic,
 or reimplementing the protocol.
 
