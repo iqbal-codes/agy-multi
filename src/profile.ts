@@ -98,6 +98,28 @@ export async function hasValidAuth(profile: Profile): Promise<boolean> {
 	return false;
 }
 
+async function provisionShellBridge(home: string, sourceHome: string): Promise<void> {
+	if (process.platform === "win32") return;
+	const files = [
+		{ name: ".zshenv", target: ".zshenv" },
+		{ name: ".zprofile", target: ".zprofile" },
+		{ name: ".zshrc", target: ".zshrc" },
+		{ name: ".bashrc", target: ".bashrc" },
+		{ name: ".profile", target: ".profile" },
+	];
+	for (const { name, target } of files) {
+		const filePath = join(home, name);
+		const content = [
+			`# agy-multi: restore real user HOME for child shells`,
+			`export REAL_HOME="${sourceHome}"`,
+			`export HOME="$REAL_HOME"`,
+			`[ -f "$REAL_HOME/${target}" ] && . "$REAL_HOME/${target}"`,
+			"",
+		].join("\n");
+		await Bun.write(filePath, content);
+	}
+}
+
 async function provision(home: string): Promise<void> {
 	await ensureDir(join(home, ".gemini/antigravity-cli"));
 	await ensureKeychain(home);
@@ -105,6 +127,7 @@ async function provision(home: string): Promise<void> {
 	for (const rel of [...SHARED_ENTRIES, ...TOOL_ENTRIES]) {
 		await symlinkIfMissing(join(home, rel), join(sourceHome, rel));
 	}
+	await provisionShellBridge(home, sourceHome);
 }
 
 function readEmailFromLog(text: string): string | undefined {
