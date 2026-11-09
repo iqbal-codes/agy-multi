@@ -1,0 +1,35 @@
+{
+  "name": "agy-multi",
+  "version": "0.1.0",
+  "description": "Multi-account, quota-aware failover wrapper and ACP proxy for the official Google Antigravity CLI (agy)",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "agy-multi": "./src/index.ts",
+    "agy-multi-acp": "./src/acp-bin.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "build": "bun build --compile --minify src/index.ts --outfile dist/agy-multi && bun build --compile --minify src/acp-bin.ts --outfile dist/agy-multi-acp",
+    "acp": "bun run src/index.ts acp",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/efishery/agy-multi.git"
+  },
+  "keywords": [
+    "antigravity",
+    "agy",
+    "google-antigravity",
+    "acp",
+    "failover",
+    "multi-account",
+    "ai-agent"
+  ],
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}
