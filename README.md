@@ -3,6 +3,10 @@
 > [!IMPORTANT]
 > **Disclaimer**: `agy-multi` is an **unofficial**, community-driven open-source project. It is **not** developed, affiliated with, maintained, or endorsed by Google. "Antigravity", "Gemini", and "Google" are trademarks of Google LLC.
 
+> [!NOTE]
+> **Requires an ACP Client / Host**:
+> `agy-multi` is an **ACP (Agent Client Protocol) Proxy Server**, not an interactive terminal chat replacement or patch for `agy`. It is designed to be connected to an **ACP Client / AI Editor** (such as **T3 Code**, **Zed**, **Oh My Pi (OMP)**, or custom ACP harnesses). The ACP client sees a single agent, while `agy-multi` manages multiple Google accounts and seamless quota failover in the background.
+
 Run the official Antigravity CLI (`agy`) with multiple Google accounts and
 automatic, quota-aware failover — without patching the binary, proxying traffic,
 or reimplementing the protocol.
