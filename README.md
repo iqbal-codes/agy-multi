@@ -21,6 +21,112 @@ or reimplementing the protocol.
 The wrapper only chooses which HOME runs, at turn boundaries. On the wire it is
 100% the official client.
 
+## Architecture & How It Works
+
+```mermaid
+flowchart TD
+    subgraph Client["Your Development Environment"]
+        IDE["ACP Host / IDE<br/>(t3code, Zed, OMP, CLI)"]
+    end
+
+    subgraph Wrapper["agy-multi Engine"]
+        Proxy["ACP Proxy & Quota-Aware Router"]
+        Store[("State & Quota Store<br/>~/.agy/state.json")]
+        Proxy <--> Store
+    end
+
+    subgraph Profiles["100% Isolated Profile Environments"]
+        direction TB
+        subgraph P1["Profile: Account A (Active)"]
+            H1["HOME: ~/.agy/profiles/work/home"]
+            K1["Isolated Keychain & .gemini"]
+            I1["Unique installation_id A"]
+        end
+        subgraph P2["Profile: Account B (Standby)"]
+            H2["HOME: ~/.agy/profiles/personal/home"]
+            K2["Isolated Keychain & .gemini"]
+            I2["Unique installation_id B"]
+        end
+    end
+
+    subgraph ShellBridge["Developer Shell Bridge"]
+        SB["Child Terminal Commands (zsh/bash)<br/>Transparently restored to Main User HOME<br/>(gh, git, ssh, docker, devtools)"]
+    end
+
+    subgraph GoogleOfficial["Official Google Client (Unmodified)"]
+        Bin1["Official agy Binary (Subprocess A)"]
+        Bin2["Official agy Binary (Subprocess B)"]
+    end
+
+    subgraph Backend["Google Cloud / Antigravity Infrastructure"]
+        API["Antigravity Backend APIs<br/>(Direct, Untampered TLS)"]
+    end
+
+    IDE -->|"stdio (JSON-RPC)"| Proxy
+    Proxy -->|"Route Turn"| P1
+    Proxy -.->|"Auto-Failover on Quota"| P2
+    P1 --> Bin1
+    P2 --> Bin2
+    Bin1 -->|"Run tools & terminal"| SB
+    Bin2 -->|"Run tools & terminal"| SB
+    Bin1 -->|"Direct Official TLS"| API
+    Bin2 -->|"Direct Official TLS"| API
+```
+
+## How `agy-multi` Stays Safe & Avoids Google ToS Bans
+
+Multi-account tooling often risks account suspension when implemented carelessly (e.g. via proxy hacks, header tampering, or session replay). `agy-multi` is architected specifically to eliminate these risks:
+
+1. **Zero Binary Patching (100% Official Binary)**:
+   - `agy-multi` never disassembles, patches, bytecode-edits, or hooks into the Google Antigravity binary.
+   - It runs the official binary directly as an external subprocess, preserving Google's authentic binary signatures, checksums, and runtime integrity.
+
+2. **Zero Traffic Decryption / No MITM Proxy**:
+   - `agy-multi` **never** decrypts or intercepts network traffic between `agy` and Google.
+   - TLS connections originate directly from the official `agy` client and terminate at Google servers using standard system TLS certificates. No self-signed certificates, proxies, or packet modifications exist.
+
+3. **Isolated Identity & Pristine Fingerprints**:
+   - Anti-abuse systems flag accounts when multiple identities share conflicting cookies, shared SQLite stores, or identical persistent installation keys.
+   - By creating a separate `HOME` directory per profile, each account receives its own isolated `~/.gemini/` storage, private macOS Keychain, and independent `installation_id`. Google sees each profile as a genuine, cleanly separated installation.
+
+4. **Legitimate Single-Writer Turn Boundaries**:
+   - Conversations are strictly single-writer. `agy-multi` never runs multiple accounts against the same conversation simultaneously.
+   - A turn is **never replayed** once output has been streamed to the user, preventing anomalous duplicate requests or state desynchronization.
+
+5. **Quota Protection & Anti-Spam Backoff**:
+   - When an account hits `RESOURCE_EXHAUSTED` (429) or drops below the 10% reserve threshold, `agy-multi` marks it blocked and honors the reset duration.
+   - It does not hammer exhausted endpoints or retry failed calls repeatedly, ensuring standard respectful API behavior.
+
+6. **Transparent Developer Shell Bridge**:
+   - The isolated `HOME` is confined to `agy`'s internal auth. Child commands spawned by the agent (`gh`, `git`, `ssh`, `docker`) automatically map to your primary user's environment, avoiding missing SSH keys or broken developer tool credentials.
+
+## Failover Workflow
+
+When an active account runs out of quota, `agy-multi` seamlessly shifts to the next available account without dropping your session or losing conversational context:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Dev as Developer / IDE (t3code)
+    participant Proxy as agy-multi Proxy
+    participant ActA as Account A (Active)
+    participant ActB as Account B (Standby)
+    participant Google as Google Antigravity API
+
+    Dev->>Proxy: session/prompt ("Refactor database layer")
+    Proxy->>ActA: Forward prompt via agy acp
+    ActA->>Google: Direct TLS request (Account A token)
+    Google-->>ActA: 429 RESOURCE_EXHAUSTED (Quota limit)
+    Note over Proxy,ActA: Quota cap detected BEFORE output streaming
+    Proxy->>Proxy: Mark Account A blocked in state.json until reset
+    Proxy->>Proxy: Rank & select Account B (highest headroom / nearest reset)
+    Proxy->>ActB: Create session with contextual handoff (history + cwd + git HEAD)
+    ActB->>Google: Direct TLS request (Account B token)
+    Google-->>ActB: 200 OK (Streaming generation)
+    ActB-->>Proxy: Stream assistant output & tool calls
+    Proxy-->>Dev: Seamless response (same session ID!)
+```
+
 ## Installation
 
 ### Option 1: One-line Install (Recommended)
