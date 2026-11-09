@@ -4,9 +4,9 @@ set -e
 # agy-multi installer for macOS and Linux
 # Usage:
 #   Local:  ./install.sh
-#   Remote: curl -fsSL https://raw.githubusercontent.com/efishery/agy-multi/main/install.sh | bash
+#   Remote: curl -fsSL https://raw.githubusercontent.com/iqbal-codes/agy-multi/main/install.sh | bash
 
-REPO_URL="${REPO_URL:-https://github.com/efishery/agy-multi.git}"
+REPO_URL="${REPO_URL:-https://github.com/iqbal-codes/agy-multi.git}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 SOURCE_DIR="${SOURCE_DIR:-$HOME/.local/share/agy-multi}"
 

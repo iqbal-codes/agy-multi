@@ -1,11 +1,11 @@
 # agy-multi installer for Windows (PowerShell)
 # Usage:
 #   Local:  powershell -ExecutionPolicy Bypass -File .\install.ps1
-#   Remote: irm https://raw.githubusercontent.com/efishery/agy-multi/main/install.ps1 | iex
+#   Remote: irm https://raw.githubusercontent.com/iqbal-codes/agy-multi/main/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
-$RepoUrl = if ($env:REPO_URL) { $env:REPO_URL } else { "https://github.com/efishery/agy-multi.git" }
+$RepoUrl = if ($env:REPO_URL) { $env:REPO_URL } else { "https://github.com/iqbal-codes/agy-multi.git" }
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { "$HOME\.local\bin" }
 $SourceDir = "$HOME\.local\share\agy-multi"
 

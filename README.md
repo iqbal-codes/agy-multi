@@ -24,12 +24,12 @@ The wrapper only chooses which HOME runs, at turn boundaries. On the wire it is
 
 **macOS & Linux:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/efishery/agy-multi/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/iqbal-codes/agy-multi/main/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/efishery/agy-multi/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/iqbal-codes/agy-multi/main/install.ps1 | iex
 ```
 
 *The installer automatically installs Bun if needed, compiles standalone native executables, and places them into your `~/.local/bin` (`PATH`).*
@@ -38,10 +38,10 @@ irm https://raw.githubusercontent.com/efishery/agy-multi/main/install.ps1 | iex
 
 ```bash
 # Direct from GitHub:
-bun install -g github:efishery/agy-multi
+bun install -g github:iqbal-codes/agy-multi
 
 # Or from local clone:
-git clone https://github.com/efishery/agy-multi.git
+git clone https://github.com/iqbal-codes/agy-multi.git
 cd agy-multi
 bun install -g .
 ```
@@ -49,7 +49,7 @@ bun install -g .
 ### Option 3: Local clone & installer
 
 ```bash
-git clone https://github.com/efishery/agy-multi.git
+git clone https://github.com/iqbal-codes/agy-multi.git
 cd agy-multi
 bun install
 ./install.sh       # compiles standalone binaries to ~/.local/bin
