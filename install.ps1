@@ -101,5 +101,6 @@ Write-Host "`nInstallation complete!" -ForegroundColor Green
 Write-Host "Quick start:"
 Write-Host "  1. Add an account:      agy-multi profile add <slug>"
 Write-Host "  2. List profiles:       agy-multi profile list"
-Write-Host "  3. Check quotas:        agy-multi usage"
-Write-Host "  4. Connect ACP host:    agy-multi acp  (or binary: agy-multi-acp)`n"
+Write-Host "  3. Check quotas:        agy-multi quota"
+Write-Host "  4. Check token usage:   agy-multi tokens"
+Write-Host "  5. Connect ACP host:    agy-multi acp  (or binary: agy-multi-acp)`n"

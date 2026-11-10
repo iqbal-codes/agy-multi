@@ -114,6 +114,7 @@ if [ -x "$INSTALL_DIR/agy-multi" ]; then
     printf "Quick start:\n"
     printf "  1. Add an account:      agy-multi profile add <slug>\n"
     printf "  2. List profiles:       agy-multi profile list\n"
-    printf "  3. Check quotas:        agy-multi usage\n"
-    printf "  4. Connect ACP host:    agy-multi acp  (or binary: agy-multi-acp)\n\n"
+    printf "  3. Check quotas:        agy-multi quota\n"
+    printf "  4. Check token usage:   agy-multi tokens\n"
+    printf "  5. Connect ACP host:    agy-multi acp  (or binary: agy-multi-acp)\n\n"
 fi
