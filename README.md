@@ -106,7 +106,7 @@ Multi-account tooling often risks account suspension when implemented carelessly
 
 ## Failover Workflow
 
-When an active account runs out of quota, `agy-multi` seamlessly shifts to the next available account without dropping your session or losing conversational context:
+When an active account runs out of quota, `agy-multi` keeps the client session ID and creates a new backend conversation on the next available account, carrying recent user/assistant text in a handoff prompt:
 
 ```mermaid
 sequenceDiagram
@@ -384,25 +384,38 @@ What the proxy does:
   performs the handoff. A turn is never replayed under another account.
 - Banned and quota-blocked profiles are stored in `state.json` and excluded from
   selection. A 403 ToS ban is never retried.
-- `session/load` after a proxy restart is mapped through `acp-sessions.json`
-  (proxy session id → profile + child session id) and replayed by the official
-  agent.
+- `session/load` and `session/resume` after a proxy restart use the persisted
+  profile, child session ID, model, user/assistant history, and handoff state in
+  `acp-sessions.json`. Load replays messages; resume does not duplicate them.
+  Older mapping-only records hydrate history through a silent load on resume.
+- If an agent process exits, the next prompt resumes its existing conversation.
+  If the conversation is unavailable, a replacement receives a contextual handoff.
+- Native `usage_update` events are forwarded immediately during an active prompt,
+  unchanged apart from the session ID; they are not buffered until the turn ends.
+  Update frequency depends on when the official agent publishes usage, not on
+  streamed text chunks. The proxy does not invent model capacity, token occupancy,
+  or zero-dollar cost.
+  If the agent provides no usage event, a context meter is unavailable. An AGY
+  checkpoint may reduce active context without changing the conversation ID.
 - `session/list` lists sessions created through the proxy. Sessions created
   directly by the `agy` CLI are not merged into that list.
 - `authenticate` targets the highest-ranked profile. Re-authenticate a specific
   account with `agy-multi profile add <slug>` (or `agy acp --login` in its HOME);
   the proxy is intentionally one provider instance, not one per account.
 
-Limitations: handoff keeps the session's model id where the target supports it;
-if the target does not expose that model, `session/set_model` fails and the
-target's default model is used while the client still shows the original label.
+Limitations: handoff carries recent user/assistant text under a 60,000-character
+budget, not complete tool results or in-memory tool state. Handoff requires the
+selected model; if the target rejects `session/set_model`, the turn fails rather
+than silently generating with another model. Completed and protocol-error turns
+are persisted, but a hard process kill can still interrupt a streamed response
+before its full text is saved.
 
 ## Layout
 
 ```
 ~/.agy/
 ├── state.json                    # pins, quota blocks, checkpoints
-├── acp-sessions.json             # ACP proxy id -> profile + child session id
+├── acp-sessions.json             # session mapping, model, text history, handoff state
 └── profiles/<slug>/
     ├── profile.json              # email, status, timestamps
     ├── acp-<pid>.log             # ACP process log (debugging)

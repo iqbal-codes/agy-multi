@@ -1,5 +1,6 @@
 import { ACP_SESSIONS_PATH } from "../paths";
 import { readJson, writeJsonAtomic } from "../fs-utils";
+import type { HistoryEntry } from "./prompt";
 
 /**
  * A proxy session id is what t3code sees. It stays stable across account
@@ -12,6 +13,10 @@ export interface AcpSessionRecord {
 	cwd: string;
 	additionalDirectories?: string[];
 	mcpServers?: unknown[];
+	modelId?: string;
+	history?: HistoryEntry[];
+	needsHandoff?: boolean;
+	handoffSessionReady?: boolean;
 	title?: string;
 	createdAt: string;
 	updatedAt: string;

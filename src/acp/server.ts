@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { classifyAcpError } from "../classify";
 import { run } from "../fs-utils";
 import { AGY_BIN, ACP_SESSIONS_PATH, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, USAGE_TTL_MS } from "../paths";
-import { listProfiles, profileHomeOf, saveProfile } from "../registry";
+import { listProfiles, saveProfile } from "../registry";
 import { block, isBlocked, loadState, saveState } from "../state";
 import { rankProfiles } from "../select";
 import { syncProfiles } from "../profile";
@@ -11,7 +11,6 @@ import { blockingReset, familyForModel, fetchUsage, minRemaining } from "../usag
 import { AcpChild, AcpRpcError } from "./child";
 import { isRecord } from "./guards";
 import { buildHandoffPrompt, promptToText, toolTitle, type HistoryEntry } from "./prompt";
-import { getModelContextSize, resolveSessionTokenUsage } from "./token-usage";
 import {
 	isNotification,
 	isRequest,
@@ -56,7 +55,8 @@ interface SessionState {
 	needsHandoff?: boolean;
 	handoffSessionReady?: boolean;
 	loading?: boolean;
-	loadBuffers?: { user: string; assistant: string };
+	suppressReplay?: boolean;
+	loadBuffers?: { user: string; assistant: string; history: HistoryEntry[] };
 	/** Updates received before the client saw `session/new`; flushed after it. */
 	pendingOut?: unknown[];
 	closed?: boolean;
@@ -281,6 +281,7 @@ class AcpProxy {
 		const outParams = { ...(params ?? {}), sessionId: session.id };
 		const outMessage = { ...message, params: outParams };
 		const deliver = (value: unknown): void => {
+			if (session.suppressReplay) return;
 			if (session.pendingOut) session.pendingOut.push(value);
 			else this.sendToClient(value);
 		};
@@ -337,7 +338,7 @@ class AcpProxy {
 			if (title) {
 				session.record.title = title;
 				session.record.updatedAt = new Date().toISOString();
-				void this.saveStore();
+				void this.saveStore().catch(error => this.log(`failed to persist session title: ${errorMessage(error)}`));
 			}
 			deliver(outMessage);
 			return;
@@ -365,36 +366,6 @@ class AcpProxy {
 			if (pending.child !== child) continue;
 			this.agentRequests.delete(proxyId);
 			this.sendToClient({ jsonrpc: "2.0", id: proxyId, error: { code: -32603, message: "agent exited" } });
-		}
-	}
-
-	private emitUsageUpdate(session: SessionState, profile?: Profile): void {
-		const targetProfile = profile ?? this.profiles.get(session.profile);
-		const home = targetProfile ? profileHomeOf(targetProfile) : undefined;
-		const used = resolveSessionTokenUsage(home, session.childSessionId, session.history);
-		const size = getModelContextSize(session.modelId);
-
-		const message = {
-			jsonrpc: "2.0",
-			method: "session/update",
-			params: {
-				sessionId: session.id,
-				update: {
-					sessionUpdate: "usage_update",
-					used,
-					size,
-					cost: {
-						amount: 0,
-						currency: "USD",
-					},
-				},
-			},
-		};
-
-		if (session.pendingOut) {
-			session.pendingOut.push(message);
-		} else {
-			this.sendToClient(message);
 		}
 	}
 
@@ -444,7 +415,8 @@ class AcpProxy {
 		const resumed = await child.request("session/resume", {
 			sessionId: session.childSessionId,
 			cwd: session.cwd,
-			...(session.mcpServers.length ? { mcpServers: session.mcpServers } : {}),
+			mcpServers: session.mcpServers,
+			...(session.additionalDirectories ? { additionalDirectories: session.additionalDirectories } : {}),
 		});
 		if (!resumed.error) {
 			child.loadedSessions.add(session.childSessionId);
@@ -658,7 +630,6 @@ class AcpProxy {
 				}
 				this.respond(request.id, { ...result, sessionId: proxySessionId });
 				this.drainPendingOut(session);
-				this.emitUsageUpdate(session, profile);
 				return;
 			} catch (error) {
 				lastError = error;
@@ -681,7 +652,7 @@ class AcpProxy {
 		if (!session) {
 			const record = this.store.sessions[requestedId];
 			if (record) {
-				session = { ...record, mcpServers: record.mcpServers ?? [], history: [], record };
+				session = { ...record, mcpServers: record.mcpServers ?? [], history: [...(record.history ?? [])], record };
 				this.sessions.set(record.id, session);
 				this.sessionsByChild.set(this.childKey(record.profile, record.childSessionId), session);
 			}
@@ -739,7 +710,6 @@ class AcpProxy {
 				request.id,
 				typeof result.sessionId === "string" ? { ...result, sessionId: requestedId } : result,
 			);
-			this.emitUsageUpdate(createdSession, profile);
 			return;
 		}
 
@@ -755,9 +725,18 @@ class AcpProxy {
 		};
 		if (additionalDirectories) payload.additionalDirectories = additionalDirectories;
 
-		session.loading = !resume;
-		const response = await child.request(resume ? "session/resume" : "session/load", payload);
-		session.loading = false;
+		// Old stores contain mappings only; hydrate once without replaying into
+		// a client that requested resume (which must not duplicate its messages).
+		const hydrate = resume && session.record.history === undefined;
+		session.loading = !resume || hydrate;
+		session.suppressReplay = hydrate;
+		let response: JsonRpcResponse;
+		try {
+			response = await child.request(resume && !hydrate ? "session/resume" : "session/load", payload);
+		} finally {
+			session.loading = false;
+			session.suppressReplay = false;
+		}
 		if (response.error) {
 			session.loadBuffers = undefined;
 			throw new AcpRpcError(response.error);
@@ -783,7 +762,6 @@ class AcpProxy {
 			request.id,
 			typeof result.sessionId === "string" ? { ...result, sessionId: requestedId } : result,
 		);
-		this.emitUsageUpdate(session, profile);
 	}
 
 	private onSessionList(request: JsonRpcRequest): void {
@@ -1007,14 +985,16 @@ class AcpProxy {
 	): Promise<void> {
 		let text = originalText;
 		try {
-			const child = await this.ensureChild(profile);
+			const child = handoff ? await this.ensureChild(profile) : await this.ensureSessionChild(session);
 			await child.initialize(this.clientInitialize);
+			handoff ||= Boolean(session.needsHandoff);
 
 			if (handoff) {
 				const ready =
 					session.handoffSessionReady === true &&
 					session.profile === profile.slug &&
-					this.sessionsByChild.get(this.childKey(profile.slug, session.childSessionId)) === session;
+					this.sessionsByChild.get(this.childKey(profile.slug, session.childSessionId)) === session &&
+					child.loadedSessions.has(session.childSessionId);
 				if (!ready) {
 					const created = await child.request("session/new", {
 						cwd: session.cwd,
@@ -1039,6 +1019,7 @@ class AcpProxy {
 					child.loadedSessions.add(createdId);
 					this.sessionsByChild.set(this.childKey(profile.slug, createdId), session);
 					session.handoffSessionReady = true;
+					session.needsHandoff = true;
 
 					const oldChild = this.children.get(previousProfile);
 					if (oldChild?.alive) {
@@ -1050,16 +1031,14 @@ class AcpProxy {
 					if (!session.modelId && models && typeof models.currentModelId === "string") {
 						session.modelId = models.currentModelId;
 					}
-					if (session.modelId) {
-						const setModel = await child.request("session/set_model", {
-							sessionId: createdId,
-							modelId: session.modelId,
-						});
-						if (setModel.error) {
-							this.log(`set_model ${session.modelId} failed on ${profile.slug}: ${setModel.error.message}`);
-						}
-					}
 					await this.saveStore();
+				}
+				if (session.modelId) {
+					const setModel = await child.request("session/set_model", {
+						sessionId: session.childSessionId,
+						modelId: session.modelId,
+					});
+					if (setModel.error) throw new AcpRpcError(setModel.error);
 				}
 				const gitHead = await this.gitHead(session.cwd);
 				text = buildHandoffPrompt({ history: session.history, cwd: session.cwd, gitHead });
@@ -1072,6 +1051,7 @@ class AcpProxy {
 				suppressUserChunk: handoff,
 			};
 			session.activeTurn = turn;
+			await this.saveStore();
 			this.log(`prompt on ${profile.slug}${handoff ? " (handoff)" : ""} session=${session.id}`);
 
 			const response = await child.request("session/prompt", {
@@ -1132,7 +1112,6 @@ class AcpProxy {
 			if (profile.authRequiredAt) delete profile.authRequiredAt;
 			await saveProfile(profile);
 			await this.saveStore();
-			this.emitUsageUpdate(session, profile);
 			this.respond(clientId, response.result ?? { stopReason });
 		} catch (error) {
 			session.activeTurn = undefined;
@@ -1152,17 +1131,17 @@ class AcpProxy {
 
 	private trackLoadChunk(session: SessionState, role: "user" | "assistant", text: string): void {
 		if (!text) return;
-		session.loadBuffers ??= { user: "", assistant: "" };
+		session.loadBuffers ??= { user: "", assistant: "", history: [] };
 		const buffers = session.loadBuffers;
 		if (role === "user") {
 			if (buffers.assistant) {
-				session.history.push({ role: "assistant", text: buffers.assistant });
+				buffers.history.push({ role: "assistant", text: buffers.assistant });
 				buffers.assistant = "";
 			}
 			buffers.user += text;
 		} else {
 			if (buffers.user) {
-				session.history.push({ role: "user", text: buffers.user });
+				buffers.history.push({ role: "user", text: buffers.user });
 				buffers.user = "";
 			}
 			buffers.assistant += text;
@@ -1171,10 +1150,11 @@ class AcpProxy {
 
 	private flushLoadBuffers(session: SessionState): void {
 		if (!session.loadBuffers) return;
-		if (session.loadBuffers.user) session.history.push({ role: "user", text: session.loadBuffers.user });
-		if (session.loadBuffers.assistant) {
-			session.history.push({ role: "assistant", text: session.loadBuffers.assistant });
-		}
+		const buffers = session.loadBuffers;
+		if (buffers.user) buffers.history.push({ role: "user", text: buffers.user });
+		if (buffers.assistant) buffers.history.push({ role: "assistant", text: buffers.assistant });
+		// Child replay covers only the current account, not earlier handoffs.
+		if (!session.history.length) session.history = buffers.history;
 		session.loadBuffers = undefined;
 	}
 
@@ -1191,12 +1171,16 @@ class AcpProxy {
 	}
 
 	private saveStore(): Promise<void> {
-		const next = this.saveChain
-			.then(() => saveAcpSessions(this.store, this.sessionsPath))
-			.catch(error => {
-				this.log(`failed to save ACP sessions: ${errorMessage(error)}`);
-			});
-		this.saveChain = next;
+		for (const session of this.sessions.values()) {
+			session.record.history = [...session.history];
+			session.record.modelId = session.modelId;
+			session.record.needsHandoff = session.needsHandoff;
+			session.record.handoffSessionReady = session.handoffSessionReady;
+		}
+		const snapshot = structuredClone(this.store);
+		const next = this.saveChain.then(() => saveAcpSessions(snapshot, this.sessionsPath));
+		// The caller sees this write's failure; the queue remains usable.
+		this.saveChain = next.catch(() => {});
 		return next;
 	}
 

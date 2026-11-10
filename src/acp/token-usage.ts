@@ -9,31 +9,9 @@ export interface TokenUsageResult {
 }
 
 /**
- * Returns the context window limit for a given model ID.
- * Gemini models default to 1M (or 2M for pro), Claude to 200k, GPT to 128k.
- */
-export function getModelContextSize(modelId?: string): number {
-	if (!modelId) return 1_048_576;
-	const lower = modelId.toLowerCase();
-	if (lower.includes("gemini")) {
-		if (lower.includes("pro") || lower.includes("1.5-pro") || lower.includes("2.5-pro")) {
-			return 2_097_152;
-		}
-		return 1_048_576;
-	}
-	if (lower.includes("claude")) {
-		return 200_000;
-	}
-	if (lower.includes("gpt")) {
-		return 128_000;
-	}
-	return 1_048_576;
-}
-
-/**
  * Reads the latest token usage numbers from a session transcript file.
- * Efficiently scans the last 64KB of the file backwards to find the last step
- * with input_tokens.
+ * Scans backwards in 64KiB blocks, carrying incomplete lines across blocks.
+ * Context may decrease after a checkpoint; do not sum usage across steps.
  */
 export function readLatestTokenUsage(filePath: string): TokenUsageResult | null {
 	try {
@@ -41,35 +19,35 @@ export function readLatestTokenUsage(filePath: string): TokenUsageResult | null 
 		const stat = statSync(filePath);
 		if (stat.size === 0) return null;
 
-		const readSize = Math.min(stat.size, 65536);
-		const buffer = Buffer.alloc(readSize);
 		const fd = openSync(filePath, "r");
 		try {
-			readSync(fd, buffer, 0, readSize, stat.size - readSize);
+			let position = stat.size;
+			let carry = Buffer.alloc(0);
+			while (position > 0) {
+				const size = Math.min(position, 65536);
+				position -= size;
+				const block = Buffer.alloc(size);
+				const count = readSync(fd, block, 0, size, position);
+				const data = Buffer.concat([block.subarray(0, count), carry]);
+				let end = data.length;
+				for (let index = data.length - 1; index >= -1; index--) {
+					if (index >= 0 && data[index] !== 10) continue;
+					if (index === -1 && position > 0) break;
+					const line = data.subarray(index + 1, end).toString("utf8");
+					end = index;
+					if (!line.trim()) continue;
+					let item;
+					try { item = JSON.parse(line); } catch { continue; } // A writer may have an unfinished final row.
+					if (!item || !Number.isFinite(item.input_tokens) || item.input_tokens < 0) continue;
+					const inputTokens = item.input_tokens;
+					const cacheReadTokens = Number.isFinite(item.cache_read_tokens) && item.cache_read_tokens >= 0 ? item.cache_read_tokens : 0;
+					const outputTokens = Number.isFinite(item.output_tokens) && item.output_tokens >= 0 ? item.output_tokens : 0;
+					return { usedTokens: inputTokens + cacheReadTokens + outputTokens, inputTokens, cacheReadTokens, outputTokens };
+				}
+				carry = data.subarray(0, Math.max(0, end));
+			}
 		} finally {
 			closeSync(fd);
-		}
-
-		const chunk = buffer.toString("utf8");
-		const lines = chunk.split("\n").filter(line => line.trim().length > 0);
-
-		for (let i = lines.length - 1; i >= 0; i--) {
-			try {
-				const item = JSON.parse(lines[i]);
-				if (typeof item.input_tokens === "number") {
-					const inputTokens = item.input_tokens;
-					const cacheReadTokens = typeof item.cache_read_tokens === "number" ? item.cache_read_tokens : 0;
-					const outputTokens = typeof item.output_tokens === "number" ? item.output_tokens : 0;
-					return {
-						usedTokens: inputTokens + cacheReadTokens + outputTokens,
-						inputTokens,
-						cacheReadTokens,
-						outputTokens,
-					};
-				}
-			} catch {
-				// Partial line at chunk boundary, safe to ignore
-			}
 		}
 	} catch {
 		// Ignore any fs or parsing errors
@@ -93,33 +71,12 @@ export function findSessionTranscript(profileHomeDir: string, childSessionId: st
 	return null;
 }
 
-/**
- * Fallback token estimation based on character count when transcript is not yet available.
- */
-export function estimateTokensFromHistory(history: { text: string }[]): number {
-	let chars = 0;
-	for (const h of history) {
-		chars += h.text.length;
-	}
-	return Math.max(100, Math.round(chars / 3.8));
-}
-
-/**
- * Resolves the token usage for a session:
- * 1. Checks transcript file on disk for exact tokens from Google API.
- * 2. Falls back to estimation from history.
- */
+/** Transcript usage is unavailable when there is no complete token-bearing row. */
 export function resolveSessionTokenUsage(
 	profileHomeDir: string | undefined,
 	childSessionId: string,
-	history: { text: string }[],
-): number {
-	if (profileHomeDir) {
-		const transcript = findSessionTranscript(profileHomeDir, childSessionId);
-		if (transcript) {
-			const usage = readLatestTokenUsage(transcript);
-			if (usage) return usage.usedTokens;
-		}
-	}
-	return estimateTokensFromHistory(history);
+): TokenUsageResult | null {
+	if (!profileHomeDir) return null;
+	const transcript = findSessionTranscript(profileHomeDir, childSessionId);
+	return transcript ? readLatestTokenUsage(transcript) : null;
 }
