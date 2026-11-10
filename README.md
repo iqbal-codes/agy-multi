@@ -195,11 +195,10 @@ agy-multi profile list
 agy-multi profile remove work
 
 # Check quota percentage (rolling 5h & weekly remaining)
-agy-multi usage [--profile <slug>]
+agy-multi quota [--profile <slug>]
 
-# Check token usage & Gemini 3.8 Flash cost analytics
+# Check token usage & Gemini 3.8 Flash cost analytics (alias: agy-multi usage)
 agy-multi tokens [--daily | --weekly | --monthly] [--profile <slug>] [--json]
-agy-multi usage stats [--daily | --weekly | --monthly] [--profile <slug>] [--json]
 
 # Start ACP proxy server for t3code, Zed, OMP, or any ACP orchestrator
 agy-multi acp [--clean] [-- agy acp args...]
@@ -215,9 +214,9 @@ agy-multi run --conversation <id> --prompt "continue"
 agy-multi state
 ```
 
-### Token Usage & Cost Analytics (`tokens` / `usage stats`)
+### Token Usage & Cost Analytics (`tokens`)
 
-While `agy-multi usage` queries the real-time remaining quota percentages from Google's `/usage` API, `agy-multi tokens` aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
+While `agy-multi quota` queries the real-time remaining quota percentages from Google's `/usage` API, `agy-multi tokens` (or `agy-multi usage`) aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
 
 Rates are calculated based on **Gemini 3.8 Flash** pricing:
 - **Input Tokens**: `$1.50` / 1M tokens

@@ -19,8 +19,7 @@ Usage:
   agy-multi profile enable <slug>
   agy-multi profile sync [<slug>]
   agy-multi profile remove <slug>
-  agy-multi usage [--profile <slug>]
-  agy-multi usage stats [--daily | --weekly | --monthly] [--profile <slug>] [--json]
+  agy-multi quota [--profile <slug>]
   agy-multi tokens [--daily | --weekly | --monthly] [--profile <slug>] [--json]
   agy-multi acp [--clean] [-- agy acp args...]
   agy-multi run --prompt <text> [--clean] [--no-skills] [--skills <list>]
@@ -179,7 +178,29 @@ async function main(): Promise<void> {
 		throw new Error(`unknown profile command: ${subcommand ?? "(none)"}`);
 	}
 
-	if (command === "tokens" || (command === "usage" && subcommand === "stats")) {
+	if (command === "quota") {
+		await ensureAgy();
+		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
+		if (!profiles.length) {
+			console.log("no profiles");
+			return;
+		}
+		for (const profile of profiles) {
+			const snapshot = await fetchUsage(profile).catch(() => null);
+			if (!snapshot) {
+				console.log(`${profile.slug}\t(unavailable)`);
+				continue;
+			}
+			for (const window of snapshot.windows) {
+				console.log(
+					`${profile.slug}\t${window.family}\t${window.window}\t${window.remainingPct}%\t${window.resetsAt}`,
+				);
+			}
+		}
+		return;
+	}
+
+	if (command === "tokens" || command === "usage") {
 		const turns = await collectAllTurns(values.profile);
 		const stats = aggregateTokens(turns);
 
@@ -199,28 +220,6 @@ async function main(): Promise<void> {
 			console.log(renderPeriodTable(stats.thisMonth));
 		} else {
 			console.log(renderStatsTable(stats));
-		}
-		return;
-	}
-
-	if (command === "usage") {
-		await ensureAgy();
-		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
-		if (!profiles.length) {
-			console.log("no profiles");
-			return;
-		}
-		for (const profile of profiles) {
-			const snapshot = await fetchUsage(profile).catch(() => null);
-			if (!snapshot) {
-				console.log(`${profile.slug}\t(unavailable)`);
-				continue;
-			}
-			for (const window of snapshot.windows) {
-				console.log(
-					`${profile.slug}\t${window.family}\t${window.window}\t${window.remainingPct}%\t${window.resetsAt}`,
-				);
-			}
 		}
 		return;
 	}
