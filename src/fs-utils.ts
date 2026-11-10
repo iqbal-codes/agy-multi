@@ -1,4 +1,4 @@
-import { copyFile, link, mkdir, readFile, rename, stat, symlink, lstat, writeFile } from "node:fs/promises";
+import { copyFile, link, mkdir, readFile, rename, stat, symlink, lstat, writeFile, rm, realpath } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export async function readJson<T>(path: string, fallback: T): Promise<T> {
@@ -37,6 +37,57 @@ export async function symlinkIfMissing(target: string, source: string): Promise<
 	} catch {
 		return false;
 	}
+	await mkdir(dirname(target), { recursive: true });
+	const sourceStat = await stat(source);
+	if (sourceStat.isDirectory()) {
+		await symlink(source, target, process.platform === "win32" ? "junction" : "dir");
+	} else {
+		try {
+			await symlink(source, target, "file");
+		} catch (err: unknown) {
+			const code = (err as { code?: string })?.code;
+			if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) {
+				try {
+					await link(source, target);
+				} catch {
+					await copyFile(source, target);
+				}
+			} else {
+				throw err;
+			}
+		}
+	}
+	return true;
+}
+
+/**
+ * Ensures `target` is a symlink pointing to `source`.
+ * If target exists as a regular file or directory (or broken/wrong symlink),
+ * it is removed and replaced with a symlink to prevent profile-local duplicate storage.
+ */
+export async function linkOrReplaceWithSymlink(target: string, source: string): Promise<boolean> {
+	try {
+		await stat(source);
+	} catch {
+		return false;
+	}
+
+	try {
+		const targetStat = await lstat(target);
+		if (targetStat.isSymbolicLink()) {
+			const currentTarget = await realpath(target).catch(() => null);
+			const expectedTarget = await realpath(source).catch(() => null);
+			if (currentTarget && expectedTarget && currentTarget === expectedTarget) {
+				return true;
+			}
+			await rm(target, { force: true });
+		} else {
+			await rm(target, { recursive: true, force: true });
+		}
+	} catch {
+		// target does not exist
+	}
+
 	await mkdir(dirname(target), { recursive: true });
 	const sourceStat = await stat(source);
 	if (sourceStat.isDirectory()) {

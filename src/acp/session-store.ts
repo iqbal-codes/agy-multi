@@ -35,6 +35,20 @@ export async function loadAcpSessions(path = ACP_SESSIONS_PATH): Promise<AcpSess
 	return { version: 1, sessions: store.sessions ?? {} };
 }
 
-export async function saveAcpSessions(store: AcpSessionStore, path = ACP_SESSIONS_PATH): Promise<void> {
-	await writeJsonAtomic(path, store);
+export async function saveAcpSessions(
+	store: AcpSessionStore,
+	path = ACP_SESSIONS_PATH,
+	deletedIds?: Set<string>,
+): Promise<void> {
+	const onDisk = await loadAcpSessions(path).catch(() => EMPTY);
+	const mergedSessions: Record<string, AcpSessionRecord> = {
+		...onDisk.sessions,
+		...store.sessions,
+	};
+	if (deletedIds && deletedIds.size > 0) {
+		for (const id of deletedIds) {
+			delete mergedSessions[id];
+		}
+	}
+	await writeJsonAtomic(path, { version: 1, sessions: mergedSessions });
 }

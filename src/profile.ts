@@ -3,12 +3,12 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { AGY_BIN, profileDir, profileHome } from "./paths";
 import type { Profile } from "./types";
-import { ensureDir, exists, run, symlinkIfMissing } from "./fs-utils";
+import { ensureDir, exists, linkOrReplaceWithSymlink, run, symlinkIfMissing } from "./fs-utils";
 import { listProfiles, loadProfile, profileEnvOf, saveProfile } from "./registry";
 import { classifyRun } from "./classify";
 import { runTurn } from "./runner";
 
-/** Config that should be identical across accounts. */
+/** Config that should be identical across accounts and always shared from primary user home. */
 const SHARED_ENTRIES = [
 	".gemini/config",
 	".gemini/skills",
@@ -17,6 +17,9 @@ const SHARED_ENTRIES = [
 	".gemini/mcp-server-enablement.json",
 	".gemini/antigravity-cli/settings.json",
 	".gemini/antigravity-cli/keybindings.json",
+	".gemini/antigravity-cli/skills",
+	".gemini/antigravity-cli/builtin",
+	".gemini/antigravity-cli/mcp",
 ];
 
 /**
@@ -123,9 +126,16 @@ async function provisionShellBridge(home: string, sourceHome: string): Promise<v
 async function provision(home: string, clean = false): Promise<void> {
 	await ensureDir(join(home, ".gemini/antigravity-cli"));
 	await ensureKeychain(home);
-	const sourceHome = homedir();
+	const sourceHome = process.env.REAL_HOME || homedir();
 	if (!clean) {
-		for (const rel of [...SHARED_ENTRIES, ...TOOL_ENTRIES]) {
+		for (const rel of SHARED_ENTRIES) {
+			const src = join(sourceHome, rel);
+			if (rel.endsWith("/skills") || rel.endsWith("/mcp")) {
+				await ensureDir(src);
+			}
+			await linkOrReplaceWithSymlink(join(home, rel), src);
+		}
+		for (const rel of TOOL_ENTRIES) {
 			await symlinkIfMissing(join(home, rel), join(sourceHome, rel));
 		}
 	} else {

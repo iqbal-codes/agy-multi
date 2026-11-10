@@ -9,6 +9,99 @@ export interface ResolvedSkill {
 	content: string;
 }
 
+export interface DiscoveredSkill {
+	name: string;
+	description: string;
+	path: string;
+}
+
+/**
+ * Lists all available skills strictly from the primary user home directory
+ * (~/.gemini/skills, ~/.gemini/config/skills, ~/.gemini/antigravity-cli/skills,
+ * ~/.gemini/antigravity-cli/builtin/skills, plugins) and project roots.
+ * Never stores or scans from profile-specific isolated directories.
+ */
+export function listUserSkills(cwd?: string): DiscoveredSkill[] {
+	const home = process.env.REAL_HOME || homedir();
+	const roots = [
+		join(home, ".gemini", "skills"),
+		join(home, ".gemini", "config", "skills"),
+		join(home, ".gemini", "antigravity-cli", "skills"),
+		join(home, ".gemini", "antigravity-cli", "builtin", "skills"),
+	];
+
+	const pluginsDir = join(home, ".gemini", "config", "plugins");
+	if (existsSync(pluginsDir)) {
+		try {
+			const entries = readdirSync(pluginsDir, { withFileTypes: true });
+			for (const entry of entries) {
+				if (entry.isDirectory()) {
+					roots.push(join(pluginsDir, entry.name, "skills"));
+				}
+			}
+		} catch {
+			// ignore directory read issues
+		}
+	}
+
+	if (cwd) {
+		roots.push(
+			join(cwd, ".gemini", "skills"),
+			join(cwd, ".agents", "skills"),
+			join(cwd, ".agent", "skills"),
+			join(cwd, "skills"),
+		);
+	}
+
+	const skills = new Map<string, DiscoveredSkill>();
+
+	for (const root of roots) {
+		if (!existsSync(root)) continue;
+		try {
+			const entries = readdirSync(root, { withFileTypes: true });
+			for (const entry of entries) {
+				let skillPath: string | null = null;
+				let defaultName = entry.name;
+
+				if (entry.isDirectory()) {
+					const candidate = join(root, entry.name, "SKILL.md");
+					if (existsSync(candidate)) {
+						skillPath = candidate;
+					}
+				} else if (entry.name.endsWith(".md")) {
+					skillPath = join(root, entry.name);
+					defaultName = entry.name.slice(0, -3);
+				}
+
+				if (skillPath) {
+					try {
+						const raw = readFileSync(skillPath, "utf-8");
+						const { description } = parseSkillMarkdown(raw);
+						let skillName = defaultName;
+						const matchName = raw.match(/^---\r?\n[\s\S]*?\bname:\s*([^\r\n]+)/i);
+						if (matchName && matchName[1]) {
+							skillName = matchName[1].trim().replace(/^['"]|['"]$/g, "");
+						}
+						if (!skills.has(skillName)) {
+							skills.set(skillName, {
+								name: skillName,
+								description: description || `${skillName} skill`,
+								path: resolve(skillPath),
+							});
+						}
+					} catch {
+						// ignore single skill read issue
+					}
+				}
+			}
+		} catch {
+			// ignore directory read issues
+		}
+	}
+
+	return Array.from(skills.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
 /**
  * Resolves prompt text: if input matches an existing file, its content is read;
  * otherwise the literal string is used.
@@ -78,10 +171,12 @@ export function findSkill(identifier: string, searchRoots?: string[]): ResolvedS
 		}
 	}
 
-	// 2. Standard search directories
-	const home = homedir();
+	// 2. Standard search directories strictly from primary user home
+	const home = process.env.REAL_HOME || homedir();
 	const roots = searchRoots ?? [
 		join(home, ".gemini", "skills"),
+		join(home, ".gemini", "config", "skills"),
+		join(home, ".gemini", "antigravity-cli", "skills"),
 		join(home, ".gemini", "antigravity-cli", "builtin", "skills"),
 		join(process.cwd(), ".gemini", "skills"),
 		join(process.cwd(), "skills"),

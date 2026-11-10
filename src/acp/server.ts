@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { classifyAcpError } from "../classify";
-import { run } from "../fs-utils";
-import { AGY_BIN, ACP_SESSIONS_PATH, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, USAGE_TTL_MS } from "../paths";
+import { join } from "node:path";
+import { classifyAcpError, isSessionLostError } from "../classify";
+import { exists, run } from "../fs-utils";
+import { AGY_BIN, ACP_SESSIONS_PATH, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, USAGE_TTL_MS, profileHome } from "../paths";
 import { listProfiles, saveProfile } from "../registry";
 import { block, isBlocked, loadState, saveState } from "../state";
 import { rankProfiles } from "../select";
 import { syncProfiles } from "../profile";
+import { listUserSkills } from "../injection";
 import type { FailureKind, Family, Profile, UsageSnapshot, WrapperState } from "../types";
 import { blockingReset, familyForModel, fetchUsage, minRemaining } from "../usage";
 import { AcpChild, AcpRpcError } from "./child";
@@ -100,6 +102,7 @@ class AcpProxy {
 	private readonly unknownUpdates = new Map<string, JsonRpcMessage[]>();
 	private readonly usageCache = new Map<string, { snapshot: UsageSnapshot | null; at: number }>();
 	private readonly usageInflight = new Map<string, Promise<UsageSnapshot | null>>();
+	private readonly deletedSessionIds = new Set<string>();
 
 	private profiles = new Map<string, Profile>();
 	private state: WrapperState = { version: 1, pins: {}, blocks: {}, checkpoints: {} };
@@ -343,6 +346,13 @@ class AcpProxy {
 			deliver(outMessage);
 			return;
 		}
+		if (kind === "available_commands_update") {
+			const commands = Array.isArray(update.availableCommands) ? update.availableCommands : [];
+			const augmented = this.buildAvailableCommands(session.cwd, commands);
+			const augmentedUpdate = { ...update, availableCommands: augmented };
+			deliver({ ...outMessage, params: { ...outParams, update: augmentedUpdate } });
+			return;
+		}
 		deliver(outMessage);
 	}
 
@@ -367,6 +377,71 @@ class AcpProxy {
 			this.agentRequests.delete(proxyId);
 			this.sendToClient({ jsonrpc: "2.0", id: proxyId, error: { code: -32603, message: "agent exited" } });
 		}
+	}
+
+	private buildAvailableCommands(cwd?: string, childCommands: unknown[] = []): Array<{ name: string; description?: string; input?: { hint?: string } }> {
+		const seen = new Set<string>();
+		const result: Array<{ name: string; description?: string; input?: { hint?: string } }> = [];
+
+		const add = (name: string, description?: string, hint?: string) => {
+			const key = name.toLowerCase();
+			if (seen.has(key)) return;
+			seen.add(key);
+			result.push({
+				name,
+				...(description ? { description } : {}),
+				...(hint ? { input: { hint } } : {}),
+			});
+		};
+
+		// 1. All skills strictly from the primary user home directory (~/.gemini/...) prefixed with $
+		const skills = listUserSkills(cwd);
+		for (const skill of skills) {
+			add(`$${skill.name}`, skill.description);
+		}
+
+		// 2. Child commands (if child process published any)
+		for (const cmd of childCommands) {
+			if (isRecord(cmd) && typeof cmd.name === "string") {
+				const desc = typeof cmd.description === "string" ? cmd.description : undefined;
+				const hint = isRecord(cmd.input) && typeof cmd.input.hint === "string" ? cmd.input.hint : undefined;
+				add(cmd.name, desc, hint);
+			}
+		}
+
+		// 3. Essential slash commands
+		const STANDARD_COMMANDS = [
+			{ name: "plan", description: "Switch this thread into plan mode" },
+			{ name: "default", description: "Switch this thread back to normal build mode" },
+			{ name: "compact", description: "Compact conversation history to free context window" },
+			{ name: "clear", description: "Start a fresh session; earlier messages stay visible" },
+			{ name: "goal", description: "Run a long-running task until goal is fully achieved" },
+			{ name: "learn", description: "Save persistent learnings into memory/rules" },
+			{ name: "browser", description: "Web browsing and web application interaction mode" },
+			{ name: "teamwork", description: "Team of autonomous agents working together" },
+			{ name: "boost", description: "Deep thinking, strategic planning, and rigorous verification" },
+			{ name: "grill-me", description: "Interactive interview to resolve design decisions" },
+		];
+		for (const std of STANDARD_COMMANDS) {
+			add(std.name, std.description);
+		}
+
+		return result;
+	}
+
+	private broadcastAvailableCommands(session: SessionState): void {
+		const commands = this.buildAvailableCommands(session.cwd);
+		this.sendToClient({
+			jsonrpc: "2.0",
+			method: "session/update",
+			params: {
+				sessionId: session.id,
+				update: {
+					sessionUpdate: "available_commands_update",
+					availableCommands: commands,
+				},
+			},
+		});
 	}
 
 	// ---------------------------------------------------------------------
@@ -630,6 +705,7 @@ class AcpProxy {
 				}
 				this.respond(request.id, { ...result, sessionId: proxySessionId });
 				this.drainPendingOut(session);
+				this.broadcastAvailableCommands(session);
 				return;
 			} catch (error) {
 				lastError = error;
@@ -650,7 +726,12 @@ class AcpProxy {
 
 		let session = this.sessions.get(requestedId);
 		if (!session) {
-			const record = this.store.sessions[requestedId];
+			let record = this.store.sessions[requestedId];
+			if (!record) {
+				// Re-read latest store from disk in case another process created it
+				this.store = await loadAcpSessions(this.sessionsPath);
+				record = this.store.sessions[requestedId];
+			}
 			if (record) {
 				session = { ...record, mcpServers: record.mcpServers ?? [], history: [...(record.history ?? [])], record };
 				this.sessions.set(record.id, session);
@@ -659,8 +740,9 @@ class AcpProxy {
 		}
 
 		if (!session) {
+			const owningProfile = await this.findProfileForSessionDb(requestedId);
 			const candidates = await this.rankCandidates({ allowBlocked: true });
-			const profile = candidates[0];
+			const profile = owningProfile ?? candidates[0];
 			if (!profile) throw new Error("no profiles configured");
 			const cwd = readString(params.cwd);
 			if (!cwd) throw new Error(`${resume ? "session/resume" : "session/load"} requires cwd for an unknown session`);
@@ -694,6 +776,15 @@ class AcpProxy {
 			const response = await child.request(resume ? "session/resume" : "session/load", payload);
 			createdSession.loading = false;
 			if (response.error) {
+				if (isSessionLostError(response.error)) {
+					this.log(`child has no session ${requestedId} on ${profile.slug}; preparing fresh handoff`);
+					createdSession.needsHandoff = true;
+					createdSession.handoffSessionReady = false;
+					this.respond(request.id, { sessionId: requestedId });
+					this.broadcastAvailableCommands(createdSession);
+					await this.saveStore();
+					return;
+				}
 				createdSession.loadBuffers = undefined;
 				this.sessions.delete(requestedId);
 				this.sessionsByChild.delete(this.childKey(profile.slug, requestedId));
@@ -710,6 +801,7 @@ class AcpProxy {
 				request.id,
 				typeof result.sessionId === "string" ? { ...result, sessionId: requestedId } : result,
 			);
+			this.broadcastAvailableCommands(createdSession);
 			return;
 		}
 
@@ -739,6 +831,17 @@ class AcpProxy {
 		}
 		if (response.error) {
 			session.loadBuffers = undefined;
+			if (isSessionLostError(response.error)) {
+				this.log(`child lost session ${session.childSessionId} on ${session.profile} during load/resume; preparing handoff`);
+				session.needsHandoff = true;
+				session.handoffSessionReady = false;
+				this.respond(
+					request.id,
+					typeof response.result === "object" && response.result ? response.result : { sessionId: requestedId },
+				);
+				this.broadcastAvailableCommands(session);
+				return;
+			}
 			throw new AcpRpcError(response.error);
 		}
 		child.loadedSessions.add(session.childSessionId);
@@ -762,6 +865,7 @@ class AcpProxy {
 			request.id,
 			typeof result.sessionId === "string" ? { ...result, sessionId: requestedId } : result,
 		);
+		this.broadcastAvailableCommands(session);
 	}
 
 	private onSessionList(request: JsonRpcRequest): void {
@@ -806,6 +910,7 @@ class AcpProxy {
 			child.loadedSessions.delete(record.childSessionId);
 		}
 		if (remove) {
+			this.deletedSessionIds.add(record.id);
 			delete this.store.sessions[record.id];
 			this.sessions.delete(record.id);
 			this.sessionsByChild.delete(this.childKey(record.profile, record.childSessionId));
@@ -1061,11 +1166,22 @@ class AcpProxy {
 			session.activeTurn = undefined;
 
 			if (response.error) {
+				const isLost = isSessionLostError(response.error);
 				const kind = classifyAcpError(response.error);
-				this.log(`prompt failed on ${profile.slug}: ${kind}: ${response.error.message}`);
-				await this.recordFailure(profile, session, kind);
-				const switchable = kind === "quota" || kind === "banned" || kind === "auth";
+				this.log(`prompt failed on ${profile.slug}: ${isLost ? "session_lost" : kind}: ${response.error.message}`);
+				if (!isLost) {
+					await this.recordFailure(profile, session, kind);
+				}
+				const switchable = isLost || kind === "quota" || kind === "banned" || kind === "auth";
 				if (switchable && !turn.forwardedOutput && switches < this.maxSwitches) {
+					if (isLost) {
+						this.log(`recovering lost trajectory ${session.childSessionId} on ${profile.slug} via handoff`);
+						child.loadedSessions.delete(session.childSessionId);
+						session.needsHandoff = true;
+						session.handoffSessionReady = false;
+						await this.runPrompt(clientId, session, originalText, profile, true, switches + 1);
+						return;
+					}
 					const candidates = await this.rankCandidates({
 						modelId: session.modelId,
 						exclude: [profile.slug],
@@ -1170,6 +1286,16 @@ class AcpProxy {
 		return `${profile}\u0000${childSessionId}`;
 	}
 
+	private async findProfileForSessionDb(sessionId: string): Promise<Profile | undefined> {
+		for (const profile of this.profiles.values()) {
+			const dbPath = join(profileHome(profile.slug), ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
+			if (await exists(dbPath)) {
+				return profile;
+			}
+		}
+		return undefined;
+	}
+
 	private saveStore(): Promise<void> {
 		for (const session of this.sessions.values()) {
 			session.record.history = [...session.history];
@@ -1178,7 +1304,8 @@ class AcpProxy {
 			session.record.handoffSessionReady = session.handoffSessionReady;
 		}
 		const snapshot = structuredClone(this.store);
-		const next = this.saveChain.then(() => saveAcpSessions(snapshot, this.sessionsPath));
+		const deleted = new Set(this.deletedSessionIds);
+		const next = this.saveChain.then(() => saveAcpSessions(snapshot, this.sessionsPath, deleted));
 		// The caller sees this write's failure; the queue remains usable.
 		this.saveChain = next.catch(() => {});
 		return next;

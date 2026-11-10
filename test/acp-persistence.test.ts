@@ -58,6 +58,11 @@ createInterface({ input: process.stdin }).on("line", line => {
     }
     const text = p.prompt[0].text;
     if (text === "EXIT_CHILD") process.exit(0);
+    if (control.trajectoryNotFound && !text.includes("taking over")) {
+      delete control.trajectoryNotFound;
+      writeFileSync(root + "/control.json", JSON.stringify(control));
+      return error("Failed to send user message: not_found: trajectory not found: " + p.sessionId + ": not found");
+    }
     if (!sessions.has(p.sessionId)) return error("unknown session");
     if (control.quota && home.includes("/acct-a/")) return error("RESOURCE_EXHAUSTED: quota exceeded");
     if (control.partial && home.includes("/acct-a/")) {
@@ -256,6 +261,22 @@ test("lost child session creates one replacement with prior history and selected
 		expect(last.params.prompt![0]!.text).toContain("User:\nFIRST");
 		expect(last.params.prompt![0]!.text).toContain("User:\nRECOVER");
 		expect(requests.some(r => r.pid === last.pid && r.method === "session/set_model")).toBe(true);
+	} finally { await f.cleanup(); }
+});
+
+test("prompt failing with trajectory not found recovers seamlessly via fresh session and handoff", async () => {
+	const f = await fixture();
+	try {
+		const c = await f.start(); const id = await c.newSession();
+		await c.prompt(id, "FIRST");
+		await f.control({ trajectoryNotFound: true });
+		const reply = await c.prompt(id, "RETRY_AFTER_TRAJECTORY_LOST");
+		expect(reply.error).toBeUndefined();
+		const requests = await f.requests();
+		expect(requests.filter(r => r.method === "session/new")).toHaveLength(2);
+		const last = requests.filter(r => r.method === "session/prompt").at(-1)!;
+		expect(last.params.prompt![0]!.text).toContain("User:\nFIRST");
+		expect(last.params.prompt![0]!.text).toContain("User:\nRETRY_AFTER_TRAJECTORY_LOST");
 	} finally { await f.cleanup(); }
 });
 

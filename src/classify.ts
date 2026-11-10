@@ -42,3 +42,19 @@ export function classifyAcpError(error: unknown): FailureKind {
 	if (/not authenticated|unauthorized|login required|\b401\b/i.test(text)) return "auth";
 	return "error";
 }
+
+/**
+ * Detect whether an error indicates that the underlying agent lost
+ * the conversation trajectory (e.g. trajectory not found, session not found).
+ */
+export function isSessionLostError(error: unknown): boolean {
+	let text: string;
+	try {
+		text = typeof error === "string" ? error : JSON.stringify(error ?? "");
+	} catch {
+		text = String(error);
+	}
+	return /trajectory not found|session not found|unknown session|no such session|conversation not found|not_found:\s*trajectory/i.test(
+		text,
+	);
+}

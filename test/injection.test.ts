@@ -6,6 +6,7 @@ import {
 	buildInjectedPrompt,
 	buildSkillsBlock,
 	findSkill,
+	listUserSkills,
 	parseSkillMarkdown,
 	resolvePromptText,
 } from "../src/injection";
@@ -96,5 +97,30 @@ Check for style and correctness.`;
 		expect(customPrompt).toContain("<system_instruction>\nYou are a senior reviewer\n</system_instruction>");
 		expect(customPrompt).toContain("Inspect code");
 		expect(customPrompt).toContain("<additional_instructions>\nOutput JSON only\n</additional_instructions>");
+	});
+
+	it("lists user skills from workspace and primary directories", () => {
+		const testDir = join(tmpdir(), `user-skills-test-${Date.now()}`);
+		const wsSkillDir = join(testDir, ".gemini", "skills", "custom-ws-skill");
+		mkdirSync(wsSkillDir, { recursive: true });
+		writeFileSync(
+			join(wsSkillDir, "SKILL.md"),
+			`---
+name: custom-ws-skill
+description: Workspace-specific skill
+---
+# Instructions
+Do something in workspace.`,
+		);
+
+		try {
+			const skills = listUserSkills(testDir);
+			const found = skills.find(s => s.name === "custom-ws-skill");
+			expect(found).toBeDefined();
+			expect(found!.description).toBe("Workspace-specific skill");
+			expect(found!.path).toBe(join(wsSkillDir, "SKILL.md"));
+		} finally {
+			rmSync(testDir, { recursive: true, force: true });
+		}
 	});
 });
