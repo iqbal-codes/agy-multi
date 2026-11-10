@@ -197,8 +197,8 @@ agy-multi profile remove work
 # Check quota percentage (rolling 5h & weekly remaining)
 agy-multi quota [--profile <slug>]
 
-# Check token usage & Gemini 3.8 Flash cost analytics (alias: agy-multi usage)
-agy-multi tokens [--daily | --weekly | --monthly] [--profile <slug>] [--json]
+# Check token usage & Gemini 3.8 Flash cost analytics
+agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
 
 # Start ACP proxy server for t3code, Zed, OMP, or any ACP orchestrator
 agy-multi acp [--clean] [-- agy acp args...]
@@ -214,9 +214,9 @@ agy-multi run --conversation <id> --prompt "continue"
 agy-multi state
 ```
 
-### Token Usage & Cost Analytics (`tokens`)
+### Token Usage & Cost Analytics (`usage`)
 
-While `agy-multi quota` queries the real-time remaining quota percentages from Google's `/usage` API, `agy-multi tokens` (or `agy-multi usage`) aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
+While `agy-multi quota` queries the real-time remaining quota percentages from Google's `/usage` API, `agy-multi usage` (or `agy-multi tokens`) aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
 
 Rates are calculated based on **Gemini 3.8 Flash** pricing:
 - **Input Tokens**: `$1.50` / 1M tokens
@@ -225,18 +225,18 @@ Rates are calculated based on **Gemini 3.8 Flash** pricing:
 
 ```bash
 # Full dashboard table (Today, This Week, This Month, All Time + By Profile)
-agy-multi tokens
+agy-multi usage
 
 # Filter by time period
-agy-multi tokens --daily
-agy-multi tokens --weekly
-agy-multi tokens --monthly
+agy-multi usage --daily
+agy-multi usage --weekly
+agy-multi usage --monthly
 
 # Filter by profile
-agy-multi tokens --profile account-2
+agy-multi usage --profile account-2
 
 # Machine-readable JSON output (ideal for dashboards or agent tooling)
-agy-multi tokens --daily --json
+agy-multi usage --daily --json
 ```
 
 **Sample Output:**

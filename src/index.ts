@@ -20,7 +20,7 @@ Usage:
   agy-multi profile sync [<slug>]
   agy-multi profile remove <slug>
   agy-multi quota [--profile <slug>]
-  agy-multi tokens [--daily | --weekly | --monthly] [--profile <slug>] [--json]
+  agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
   agy-multi acp [--clean] [-- agy acp args...]
   agy-multi run --prompt <text> [--clean] [--no-skills] [--skills <list>]
                  [--system-prompt <text|file>] [--append-system-prompt <text|file>]
@@ -200,7 +200,7 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	if (command === "tokens" || command === "usage") {
+	if (command === "usage" || command === "tokens") {
 		const turns = await collectAllTurns(values.profile);
 		const stats = aggregateTokens(turns);
 
