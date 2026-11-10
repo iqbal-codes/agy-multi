@@ -111,7 +111,64 @@ if ! command -v agy >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/agy" ] && [ ! -x
     fi
 fi
 
-# 8. Verify
+# 8. Ensure T3 Code & ACP rules exist in ~/.gemini/GEMINI.md
+GEMINI_DIR="$HOME/.gemini"
+GEMINI_MD="$GEMINI_DIR/GEMINI.md"
+if [ ! -f "$GEMINI_MD" ]; then
+    mkdir -p "$GEMINI_DIR"
+    cat << 'EOF' > "$GEMINI_MD"
+# T3 Code & Subagent Orchestration Rules
+
+When running inside T3 Code (`T3_ACP_MCP_NODE` is present in the environment or host is T3 Code):
+1. **Do not use internal `invoke_subagent` for user-facing multi-agent work.**
+   Antigravity's internal `invoke_subagent` runs exclusively within the local Antigravity CLI daemon and does not create child task cards or threads in the T3 Code UI.
+2. **Use T3 Code's `delegate_task` via the ACP MCP bridge:**
+   ```bash
+   ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" "$T3_ACP_MCP_ENTRYPOINT" acp-mcp-call delegate_task '{"task":"<task description>","target":{"providerInstanceId":"antigravity-acp","model":"gemini-3.8-flash"},"mode":"async","clientRequestId":"<unique-id>"}'
+   ```
+   This spawns a first-class subagent thread directly inside T3 Code, complete with a UI progress card, live status, and a verbatim thread link (`<t3-thread://...>`).
+3. **Handle Background Processes & Long Commands Explicitly:**
+   - In ACP clients like T3 Code, T3 Code cannot track Antigravity's internal daemon tasks (`manage_task`), and `t3_background_wait` is unsupported for this provider. Furthermore, ACP is turn-based, so Antigravity cannot proactively wake up the client when a background task completes.
+   - **For commands expected to finish (builds, tests, linters, scripts):**
+     - Always set `WaitMsBeforeAsync: 10000` (the maximum allowed) to avoid premature backgrounding.
+     - Never end a turn with a generic "I launched it in background" message if the command was supposed to finish. If a command is backgrounded unexpectedly, check `manage_task(Action='status')` or inspect the task log before returning, or inform the user clearly with the exact log path.
+   - **For true background daemons (e.g., dev servers, file watchers, background services):**
+     - Explicitly state:
+       1. The command running and service/port.
+       2. The Antigravity Task ID (e.g., `task-XX`).
+       3. The full log file link (`file:///.../task-XX.log`).
+       4. How to check or terminate it (`manage_task`).
+EOF
+    info "Provisioned T3 Code & ACP orchestration rules in $GEMINI_MD"
+elif ! grep -q "T3_ACP_MCP_NODE" "$GEMINI_MD" 2>/dev/null; then
+    printf "\n" >> "$GEMINI_MD"
+    cat << 'EOF' >> "$GEMINI_MD"
+# T3 Code & Subagent Orchestration Rules
+
+When running inside T3 Code (`T3_ACP_MCP_NODE` is present in the environment or host is T3 Code):
+1. **Do not use internal `invoke_subagent` for user-facing multi-agent work.**
+   Antigravity's internal `invoke_subagent` runs exclusively within the local Antigravity CLI daemon and does not create child task cards or threads in the T3 Code UI.
+2. **Use T3 Code's `delegate_task` via the ACP MCP bridge:**
+   ```bash
+   ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" "$T3_ACP_MCP_ENTRYPOINT" acp-mcp-call delegate_task '{"task":"<task description>","target":{"providerInstanceId":"antigravity-acp","model":"gemini-3.8-flash"},"mode":"async","clientRequestId":"<unique-id>"}'
+   ```
+   This spawns a first-class subagent thread directly inside T3 Code, complete with a UI progress card, live status, and a verbatim thread link (`<t3-thread://...>`).
+3. **Handle Background Processes & Long Commands Explicitly:**
+   - In ACP clients like T3 Code, T3 Code cannot track Antigravity's internal daemon tasks (`manage_task`), and `t3_background_wait` is unsupported for this provider. Furthermore, ACP is turn-based, so Antigravity cannot proactively wake up the client when a background task completes.
+   - **For commands expected to finish (builds, tests, linters, scripts):**
+     - Always set `WaitMsBeforeAsync: 10000` (the maximum allowed) to avoid premature backgrounding.
+     - Never end a turn with a generic "I launched it in background" message if the command was supposed to finish. If a command is backgrounded unexpectedly, check `manage_task(Action='status')` or inspect the task log before returning, or inform the user clearly with the exact log path.
+   - **For true background daemons (e.g., dev servers, file watchers, background services):**
+     - Explicitly state:
+       1. The command running and service/port.
+       2. The Antigravity Task ID (e.g., `task-XX`).
+       3. The full log file link (`file:///.../task-XX.log`).
+       4. How to check or terminate it (`manage_task`).
+EOF
+    info "Appended T3 Code & ACP orchestration rules to $GEMINI_MD"
+fi
+
+# 9. Verify
 if [ -x "$INSTALL_DIR/agy-multi" ]; then
     printf "\n${GREEN}${BOLD}Installation complete!${NC}\n\n"
     printf "Quick start:\n"

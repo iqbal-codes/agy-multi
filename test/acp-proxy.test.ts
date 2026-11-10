@@ -17,8 +17,10 @@ import { createInterface } from "node:readline";
 const argv = Bun.argv.slice(2);
 const home = process.env.HOME ?? "";
 const promptLog = process.env.FAKE_AGY_LOG;
+const usageLog = process.env.FAKE_AGY_USAGE_LOG;
 
 if (argv.includes("/usage")) {
+  if (usageLog) appendFileSync(usageLog, home + "\\n");
   process.stdout.write(JSON.stringify({
     status: "SUCCESS",
     response: [
@@ -194,5 +196,91 @@ describe("agy-multi ACP proxy", () => {
 			}
 		},
 		30_000,
+	);
+
+	test(
+		"initialize handshake does not invoke blocking /usage preflight",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "agy-multi-acp-fast-"));
+			const projectRoot = join(import.meta.dir, "..");
+			const fake = join(root, "fake-agy");
+			const usageLog = join(root, "usage.log");
+
+			for (const slug of ["acct-1", "acct-2", "acct-3"]) {
+				const dir = join(root, "profiles", slug);
+				await mkdir(dir, { recursive: true });
+				await writeFile(
+					join(dir, "profile.json"),
+					JSON.stringify({ slug, createdAt: new Date().toISOString() }),
+				);
+			}
+
+			await writeFile(fake, FAKE_AGY);
+			await chmod(fake, 0o755);
+
+			const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src", "index.ts"), "acp"], {
+				env: {
+					...process.env,
+					AGY_MULTI_ROOT: root,
+					AGY_BIN: fake,
+					FAKE_AGY_USAGE_LOG: usageLog,
+				},
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+
+			const stdin = proxy.stdin;
+			const stdout = proxy.stdout;
+			if (!stdin || !stdout) throw new Error("no stdio");
+
+			let seq = 0;
+			const pending = new Map<number, (res: unknown) => void>();
+
+			new LineReader(stdout, line => {
+				let parsed: unknown;
+				try { parsed = JSON.parse(line); } catch { return; }
+				if (isRecord(parsed) && typeof parsed.id === "number") {
+					const cb = pending.get(parsed.id);
+					if (cb) {
+						pending.delete(parsed.id);
+						cb(parsed);
+					}
+				}
+			});
+
+			function send<T>(method: string, params: unknown): Promise<T> {
+				const id = ++seq;
+				return new Promise(resolve => {
+					pending.set(id, resolve as (res: unknown) => void);
+					stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+					stdin.flush();
+				});
+			}
+
+			try {
+				const res = await send<{ result: { protocolVersion: number } }>("initialize", {
+					protocolVersion: 1,
+					clientCapabilities: {},
+				});
+				expect(res.result.protocolVersion).toBe(1);
+
+				// Verify usage was never invoked during initialize handshake
+				let usageCalls = 0;
+				try {
+					const usageContent = await readFile(usageLog, "utf8");
+					usageCalls = usageContent.trim().split("\n").filter(Boolean).length;
+				} catch {
+					// File does not exist because no /usage was executed
+					usageCalls = 0;
+				}
+				expect(usageCalls).toBe(0);
+			} finally {
+				proxy.kill();
+				await proxy.exited.catch(() => {});
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+		10_000,
 	);
 });

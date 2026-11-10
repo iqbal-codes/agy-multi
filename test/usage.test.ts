@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { blockingReset, familyForModel, minRemaining, parseUsageTable, windowRemaining, windowReset } from "../src/usage";
+import { blockingReset, familyForModel, minRemaining, parseUsageTable, profileUsagePath, readCachedUsage, windowRemaining, windowReset, writeCachedUsage } from "../src/usage";
 import type { UsageSnapshot } from "../src/types";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const TABLE = [
 	"Gemini Models\tWeekly Limit Remaining\t99%\t2026-11-15T23:41:21Z",
@@ -51,6 +54,34 @@ describe("usage parsing", () => {
 		expect(familyForModel("claude-sonnet-4.5")).toBe("claude-gpt");
 		expect(familyForModel("gpt-5.1")).toBe("claude-gpt");
 		expect(familyForModel(undefined)).toBe("gemini");
+	});
+
+	test("persists and loads cached usage snapshots to disk atomically", async () => {
+		const tempRoot = await mkdtemp(join(tmpdir(), "agy-multi-usage-"));
+		const prevRoot = process.env.AGY_MULTI_ROOT;
+		process.env.AGY_MULTI_ROOT = tempRoot;
+		try {
+			const initial = await readCachedUsage("test-profile");
+			expect(initial).toBeNull();
+
+			const snapshot: UsageSnapshot = {
+				profile: "test-profile",
+				fetchedAt: Date.now(),
+				windows: parseUsageTable(TABLE),
+				raw: TABLE,
+			};
+			await writeCachedUsage(snapshot);
+
+			const loaded = await readCachedUsage("test-profile");
+			expect(loaded).not.toBeNull();
+			expect(loaded?.profile).toBe("test-profile");
+			expect(loaded?.windows).toHaveLength(4);
+			expect(loaded?.windows[0]?.remainingPct).toBe(99);
+		} finally {
+			if (prevRoot !== undefined) process.env.AGY_MULTI_ROOT = prevRoot;
+			else delete process.env.AGY_MULTI_ROOT;
+			await rm(tempRoot, { recursive: true, force: true });
+		}
 	});
 });
 

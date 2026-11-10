@@ -9,7 +9,7 @@ import { rankProfiles } from "../select";
 import { syncProfiles } from "../profile";
 import { listUserSkills } from "../injection";
 import type { FailureKind, Family, Profile, UsageSnapshot, WrapperState } from "../types";
-import { blockingReset, familyForModel, fetchUsage, minRemaining } from "../usage";
+import { blockingReset, familyForModel, fetchUsage, minRemaining, readCachedUsage } from "../usage";
 import { AcpChild, AcpRpcError } from "./child";
 import { isRecord } from "./guards";
 import { buildHandoffPrompt, promptToText, toolTitle, type HistoryEntry } from "./prompt";
@@ -127,6 +127,14 @@ class AcpProxy {
 		this.profiles = new Map((await listProfiles()).map(profile => [profile.slug, profile]));
 		this.state = await loadState();
 		this.store = await loadAcpSessions(this.sessionsPath);
+		await Promise.all(
+			[...this.profiles.values()].map(async profile => {
+				const diskCached = await readCachedUsage(profile.slug);
+				if (diskCached) {
+					this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
+				}
+			}),
+		);
 		this.log(`ready — ${this.profiles.size} profile(s), ${Object.keys(this.store.sessions).length} stored session(s)`);
 
 		new LineReader(
@@ -394,22 +402,24 @@ class AcpProxy {
 			});
 		};
 
-		// 1. All skills strictly from the primary user home directory (~/.gemini/...) prefixed with $
-		const skills = listUserSkills(cwd);
-		for (const skill of skills) {
-			add(`$${skill.name}`, skill.description);
-		}
+		// Recognized system slash commands (these must remain slash commands without $)
+		const SYSTEM_SLASH_COMMANDS = new Set([
+			"plan",
+			"default",
+			"compact",
+			"clear",
+			"goal",
+			"learn",
+			"browser",
+			"teamwork",
+			"boost",
+			"grill-me",
+			"schedule",
+			"side",
+			"btw",
+		]);
 
-		// 2. Child commands (if child process published any)
-		for (const cmd of childCommands) {
-			if (isRecord(cmd) && typeof cmd.name === "string") {
-				const desc = typeof cmd.description === "string" ? cmd.description : undefined;
-				const hint = isRecord(cmd.input) && typeof cmd.input.hint === "string" ? cmd.input.hint : undefined;
-				add(cmd.name, desc, hint);
-			}
-		}
-
-		// 3. Essential slash commands
+		// Standard system commands with descriptions
 		const STANDARD_COMMANDS = [
 			{ name: "plan", description: "Switch this thread into plan mode" },
 			{ name: "default", description: "Switch this thread back to normal build mode" },
@@ -421,9 +431,40 @@ class AcpProxy {
 			{ name: "teamwork", description: "Team of autonomous agents working together" },
 			{ name: "boost", description: "Deep thinking, strategic planning, and rigorous verification" },
 			{ name: "grill-me", description: "Interactive interview to resolve design decisions" },
+			{ name: "schedule", description: "Run an instruction on a recurring schedule or as a timer" },
 		];
+
+		// 1. Prioritize adding essential system slash commands first (so they are never truncated)
 		for (const std of STANDARD_COMMANDS) {
 			add(std.name, std.description);
+		}
+
+		// 2. All skills strictly from the primary user home directory (~/.gemini/...) prefixed with $
+		const skills = listUserSkills(cwd);
+		for (const skill of skills) {
+			add(`$${skill.name}`, skill.description);
+		}
+
+		// 3. Child commands (from agy acp)
+		// Note: agy acp sends skills as bare names without $. If a child command is NOT a system slash command,
+		// it is a skill and MUST be prefixed with $ so T3 Code maps it to skills ($), not slash commands (/).
+		for (const cmd of childCommands) {
+			if (isRecord(cmd) && typeof cmd.name === "string") {
+				const name = cmd.name.trim();
+				if (!name) continue;
+				const desc = typeof cmd.description === "string" ? cmd.description : undefined;
+				const hint = isRecord(cmd.input) && typeof cmd.input.hint === "string" ? cmd.input.hint : undefined;
+
+				const lower = name.toLowerCase();
+				if (name.startsWith("$")) {
+					add(name, desc, hint);
+				} else if (SYSTEM_SLASH_COMMANDS.has(lower)) {
+					add(name, desc, hint);
+				} else {
+					// It's a skill published by agy acp without $ -> add as skill with $
+					add(`$${name}`, desc, hint);
+				}
+			}
 		}
 
 		return result;
@@ -468,9 +509,32 @@ class AcpProxy {
 		return child;
 	}
 
+	private getHealthyProfiles(preferred?: string[]): Profile[] {
+		const now = Date.now();
+		const candidates = [...this.profiles.values()].filter(
+			p => !p.bannedAt && !p.authRequiredAt && !p.disabled,
+		);
+		candidates.sort((a, b) => {
+			if (preferred?.length) {
+				const aPref = preferred.includes(a.slug);
+				const bPref = preferred.includes(b.slug);
+				if (aPref !== bPref) return aPref ? -1 : 1;
+			}
+			const aBlocked = isBlocked(this.state, a.slug, "gemini", now);
+			const bBlocked = isBlocked(this.state, b.slug, "gemini", now);
+			if (aBlocked !== bBlocked) return aBlocked ? 1 : -1;
+			if (a.slug === "main") return -1;
+			if (b.slug === "main") return 1;
+			const aOk = a.lastGenerationOkAt ? Date.parse(a.lastGenerationOkAt) : 0;
+			const bOk = b.lastGenerationOkAt ? Date.parse(b.lastGenerationOkAt) : 0;
+			return bOk - aOk;
+		});
+		return candidates;
+	}
+
 	private async ensureControlChild(): Promise<AcpChild> {
 		if (this.controlChild?.alive) return this.controlChild;
-		const candidates = await this.rankCandidates({ allowBlocked: true });
+		const candidates = this.getHealthyProfiles();
 		const profile = candidates[0];
 		if (!profile) throw new Error("no profiles configured; add one with `agy-multi profile add <slug>`");
 		const child = await this.ensureChild(profile);
@@ -571,15 +635,48 @@ class AcpProxy {
 		return family === "gemini" ? this.state.blocks[slug]?.["claude-gpt"] : this.state.blocks[slug]?.gemini;
 	}
 
-	private async getUsage(profile: Profile, force = false): Promise<UsageSnapshot | null> {
-		const cached = this.usageCache.get(profile.slug);
-		if (!force && cached && Date.now() - cached.at < USAGE_TTL_MS) return cached.snapshot;
-		const inflight = this.usageInflight.get(profile.slug);
-		if (inflight) return inflight;
+	private refreshUsageInBackground(profile: Profile): void {
+		if (profile.authRequiredAt || profile.bannedAt || profile.disabled) return;
+		if (this.usageInflight.has(profile.slug)) return;
 		const promise = fetchUsage(profile)
 			.catch(() => null)
 			.then(snapshot => {
-				this.usageCache.set(profile.slug, { snapshot, at: Date.now() });
+				if (snapshot) {
+					this.usageCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
+				}
+				this.usageInflight.delete(profile.slug);
+				return snapshot;
+			});
+		this.usageInflight.set(profile.slug, promise);
+	}
+
+	private async getUsage(profile: Profile, force = false): Promise<UsageSnapshot | null> {
+		const now = Date.now();
+		const cached = this.usageCache.get(profile.slug);
+		if (!force && cached && now - cached.at < USAGE_TTL_MS) return cached.snapshot;
+
+		if (!force) {
+			const diskCached = await readCachedUsage(profile.slug);
+			if (diskCached) {
+				this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
+				if (now - diskCached.fetchedAt < USAGE_TTL_MS) {
+					return diskCached;
+				}
+				this.refreshUsageInBackground(profile);
+				return diskCached;
+			}
+			this.refreshUsageInBackground(profile);
+			return null;
+		}
+
+		const inflight = this.usageInflight.get(profile.slug);
+		if (inflight && !force) return inflight;
+		const promise = fetchUsage(profile)
+			.catch(() => null)
+			.then(snapshot => {
+				if (snapshot) {
+					this.usageCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
+				}
 				this.usageInflight.delete(profile.slug);
 				return snapshot;
 			});
@@ -620,7 +717,7 @@ class AcpProxy {
 
 	private async onInitialize(request: JsonRpcRequest): Promise<void> {
 		this.clientInitialize = request.params;
-		const candidates = await this.rankCandidates({ allowBlocked: true });
+		const candidates = this.getHealthyProfiles();
 		if (!candidates.length) throw new Error("no profiles configured; add one with `agy-multi profile add <slug>`");
 		let lastError: unknown;
 		for (const profile of candidates.slice(0, Math.min(candidates.length, 3))) {

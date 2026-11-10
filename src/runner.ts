@@ -1,11 +1,11 @@
 import { join } from "node:path";
-import { AGY_BIN, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, profileDir } from "./paths";
+import { AGY_BIN, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, profileDir, USAGE_TTL_MS } from "./paths";
 import type { AgyResultEvent, Checkpoint, FailureKind, Profile, RunOutcome, UsageSnapshot } from "./types";
 import { classifyRun } from "./classify";
 import { ensureDir, run } from "./fs-utils";
 import { listProfiles, profileEnvOf, profileHomeOf, saveProfile } from "./registry";
 import { block, getCheckpoint, loadState, pin, pinnedProfile, saveState, setCheckpoint } from "./state";
-import { blockingReset, familyForModel, fetchUsage } from "./usage";
+import { blockingReset, familyForModel, fetchUsage, readCachedUsage } from "./usage";
 import { rankProfiles } from "./select";
 import { buildInjectedPrompt } from "./injection";
 
@@ -139,7 +139,13 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 	const usage = new Map<string, UsageSnapshot | null>();
 	await Promise.all(
 		candidates.map(async profile => {
-			usage.set(profile.slug, await fetchUsage(profile).catch(() => null));
+			const disk = await readCachedUsage(profile.slug);
+			if (disk && now - disk.fetchedAt < USAGE_TTL_MS) {
+				usage.set(profile.slug, disk);
+			} else {
+				const snapshot = await fetchUsage(profile).catch(() => null);
+				usage.set(profile.slug, snapshot ?? disk ?? null);
+			}
 		}),
 	);
 

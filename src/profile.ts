@@ -123,11 +123,58 @@ async function provisionShellBridge(home: string, sourceHome: string): Promise<v
 	}
 }
 
+export const T3_ACP_RULES = `# T3 Code & Subagent Orchestration Rules
+
+When running inside T3 Code (\`T3_ACP_MCP_NODE\` is present in the environment or host is T3 Code):
+1. **Do not use internal \`invoke_subagent\` for user-facing multi-agent work.**
+   Antigravity's internal \`invoke_subagent\` runs exclusively within the local Antigravity CLI daemon and does not create child task cards or threads in the T3 Code UI.
+2. **Use T3 Code's \`delegate_task\` via the ACP MCP bridge:**
+   \`\`\`bash
+   ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" "$T3_ACP_MCP_ENTRYPOINT" acp-mcp-call delegate_task '{"task":"<task description>","target":{"providerInstanceId":"antigravity-acp","model":"gemini-3.8-flash"},"mode":"async","clientRequestId":"<unique-id>"}'
+   \`\`\`
+   This spawns a first-class subagent thread directly inside T3 Code, complete with a UI progress card, live status, and a verbatim thread link (\`<t3-thread://...>\`).
+3. **Handle Background Processes & Long Commands Explicitly:**
+   - In ACP clients like T3 Code, T3 Code cannot track Antigravity's internal daemon tasks (\`manage_task\`), and \`t3_background_wait\` is unsupported for this provider. Furthermore, ACP is turn-based, so Antigravity cannot proactively wake up the client when a background task completes.
+   - **For commands expected to finish (builds, tests, linters, scripts):**
+     - Always set \`WaitMsBeforeAsync: 10000\` (the maximum allowed) to avoid premature backgrounding.
+     - Never end a turn with a generic "I launched it in background" message if the command was supposed to finish. If a command is backgrounded unexpectedly, check \`manage_task(Action='status')\` or inspect the task log before returning, or inform the user clearly with the exact log path.
+   - **For true background daemons (e.g., dev servers, file watchers, background services):**
+     - Explicitly state:
+       1. The command running and service/port.
+       2. The Antigravity Task ID (e.g., \`task-XX\`).
+       3. The full log file link (\`file:///.../task-XX.log\`).
+       4. How to check or terminate it (\`manage_task\`).
+`;
+
+/**
+ * Ensures primary user home has ~/.gemini/GEMINI.md with T3 Code and ACP rules.
+ * This guarantees that when SHARED_ENTRIES links GEMINI.md, the file exists
+ * and all profiles inherit proper turn and background task handling in ACP clients.
+ */
+export async function ensureGlobalGeminiRules(sourceHome: string): Promise<void> {
+	try {
+		const geminiDir = join(sourceHome, ".gemini");
+		const target = join(geminiDir, "GEMINI.md");
+		if (await exists(target)) {
+			const content = await Bun.file(target).text();
+			if (!content.includes("T3_ACP_MCP_NODE")) {
+				await Bun.write(target, `${content.trimEnd()}\n\n${T3_ACP_RULES.trim()}\n`);
+			}
+		} else {
+			await ensureDir(geminiDir);
+			await Bun.write(target, `${T3_ACP_RULES.trim()}\n`);
+		}
+	} catch {
+		// Non-blocking if directory or file is unwritable
+	}
+}
+
 async function provision(home: string, clean = false): Promise<void> {
 	await ensureDir(join(home, ".gemini/antigravity-cli"));
 	await ensureKeychain(home);
 	const sourceHome = process.env.REAL_HOME || homedir();
 	if (!clean) {
+		await ensureGlobalGeminiRules(sourceHome);
 		for (const rel of SHARED_ENTRIES) {
 			const src = join(sourceHome, rel);
 			if (rel.endsWith("/skills") || rel.endsWith("/mcp")) {

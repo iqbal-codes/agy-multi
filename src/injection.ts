@@ -25,6 +25,7 @@ export function listUserSkills(cwd?: string): DiscoveredSkill[] {
 	const home = process.env.REAL_HOME || homedir();
 	const roots = [
 		join(home, ".gemini", "skills"),
+		join(home, ".agents", "skills"),
 		join(home, ".gemini", "config", "skills"),
 		join(home, ".gemini", "antigravity-cli", "skills"),
 		join(home, ".gemini", "antigravity-cli", "builtin", "skills"),
@@ -33,10 +34,11 @@ export function listUserSkills(cwd?: string): DiscoveredSkill[] {
 	const pluginsDir = join(home, ".gemini", "config", "plugins");
 	if (existsSync(pluginsDir)) {
 		try {
-			const entries = readdirSync(pluginsDir, { withFileTypes: true });
+			const entries = readdirSync(pluginsDir);
 			for (const entry of entries) {
-				if (entry.isDirectory()) {
-					roots.push(join(pluginsDir, entry.name, "skills"));
+				const pluginSkills = join(pluginsDir, entry, "skills");
+				if (existsSync(pluginSkills)) {
+					roots.push(pluginSkills);
 				}
 			}
 		} catch {
@@ -58,40 +60,46 @@ export function listUserSkills(cwd?: string): DiscoveredSkill[] {
 	for (const root of roots) {
 		if (!existsSync(root)) continue;
 		try {
-			const entries = readdirSync(root, { withFileTypes: true });
-			for (const entry of entries) {
-				let skillPath: string | null = null;
-				let defaultName = entry.name;
+			const entries = readdirSync(root);
+			for (const entryName of entries) {
+				const full = join(root, entryName);
+				try {
+					const st = statSync(full); // follows symlinks!
+					let skillPath: string | null = null;
+					let defaultName = entryName;
 
-				if (entry.isDirectory()) {
-					const candidate = join(root, entry.name, "SKILL.md");
-					if (existsSync(candidate)) {
-						skillPath = candidate;
+					if (st.isDirectory()) {
+						const candidate = join(full, "SKILL.md");
+						if (existsSync(candidate)) {
+							skillPath = candidate;
+						}
+					} else if (entryName.endsWith(".md")) {
+						skillPath = full;
+						defaultName = entryName.slice(0, -3);
 					}
-				} else if (entry.name.endsWith(".md")) {
-					skillPath = join(root, entry.name);
-					defaultName = entry.name.slice(0, -3);
-				}
 
-				if (skillPath) {
-					try {
-						const raw = readFileSync(skillPath, "utf-8");
-						const { description } = parseSkillMarkdown(raw);
-						let skillName = defaultName;
-						const matchName = raw.match(/^---\r?\n[\s\S]*?\bname:\s*([^\r\n]+)/i);
-						if (matchName && matchName[1]) {
-							skillName = matchName[1].trim().replace(/^['"]|['"]$/g, "");
+					if (skillPath) {
+						try {
+							const raw = readFileSync(skillPath, "utf-8");
+							const { description } = parseSkillMarkdown(raw);
+							let skillName = defaultName;
+							const matchName = raw.match(/^---\r?\n[\s\S]*?\bname:\s*([^\r\n]+)/i);
+							if (matchName && matchName[1]) {
+								skillName = matchName[1].trim().replace(/^['"]|['"]$/g, "");
+							}
+							if (!skills.has(skillName)) {
+								skills.set(skillName, {
+									name: skillName,
+									description: description || `${skillName} skill`,
+									path: resolve(skillPath),
+								});
+							}
+						} catch {
+							// ignore single skill read issue
 						}
-						if (!skills.has(skillName)) {
-							skills.set(skillName, {
-								name: skillName,
-								description: description || `${skillName} skill`,
-								path: resolve(skillPath),
-							});
-						}
-					} catch {
-						// ignore single skill read issue
 					}
+				} catch {
+					// broken symlink or inaccessible file
 				}
 			}
 		} catch {
@@ -175,10 +183,12 @@ export function findSkill(identifier: string, searchRoots?: string[]): ResolvedS
 	const home = process.env.REAL_HOME || homedir();
 	const roots = searchRoots ?? [
 		join(home, ".gemini", "skills"),
+		join(home, ".agents", "skills"),
 		join(home, ".gemini", "config", "skills"),
 		join(home, ".gemini", "antigravity-cli", "skills"),
 		join(home, ".gemini", "antigravity-cli", "builtin", "skills"),
 		join(process.cwd(), ".gemini", "skills"),
+		join(process.cwd(), ".agents", "skills"),
 		join(process.cwd(), "skills"),
 	];
 

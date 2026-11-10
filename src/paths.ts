@@ -56,11 +56,12 @@ export const DEFAULT_RESERVE_PCT = 10;
 /** Default block duration when a quota error carries no usable reset. */
 export const DEFAULT_BLOCK_MS = 5 * 60 * 60 * 1000;
 
-/** Usage preflight cache TTL. */
-export const USAGE_TTL_MS = 60_000;
+/** Usage preflight cache TTL (5 minutes). */
+export const USAGE_TTL_MS = 5 * 60_000;
 
 export function profileDir(slug: string): string {
-	return join(PROFILES_DIR, slug);
+	const root = process.env.AGY_MULTI_ROOT ?? ROOT;
+	return join(root, "profiles", slug);
 }
 
 export function profileHome(slug: string): string {

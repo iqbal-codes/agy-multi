@@ -2,8 +2,20 @@ import { join } from "node:path";
 import { AGY_BIN, profileDir } from "./paths";
 import { profileEnvOf, profileHomeOf } from "./registry";
 import type { Family, Profile, UsageSnapshot, UsageWindow, WindowId } from "./types";
-import { run } from "./fs-utils";
+import { readJson, run, writeJsonAtomic } from "./fs-utils";
 import { hasValidAuth } from "./profile";
+
+export function profileUsagePath(slug: string): string {
+	return join(profileDir(slug), "usage.json");
+}
+
+export async function readCachedUsage(slug: string): Promise<UsageSnapshot | null> {
+	return await readJson<UsageSnapshot | null>(profileUsagePath(slug), null);
+}
+
+export async function writeCachedUsage(snapshot: UsageSnapshot): Promise<void> {
+	await writeJsonAtomic(profileUsagePath(snapshot.profile), snapshot);
+}
 
 /** Which backend quota counter a model consumes. */
 export function familyForModel(modelId?: string): Family {
@@ -112,12 +124,14 @@ export async function fetchUsage(profile: Profile, timeoutMs = 30_000): Promise<
 			return null;
 		}
 		if (parsed.status !== "SUCCESS" || !parsed.response) return null;
-		return {
+		const snapshot: UsageSnapshot = {
 			profile: profile.slug,
 			fetchedAt: Date.now(),
 			windows: parseUsageTable(parsed.response),
 			raw: parsed.response,
 		};
+		void writeCachedUsage(snapshot).catch(() => {});
+		return snapshot;
 	} finally {
 		clearTimeout(timer);
 	}
