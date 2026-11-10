@@ -84,6 +84,9 @@ mkdir -p "$INSTALL_DIR"
 cp -f dist/agy-multi "$INSTALL_DIR/agy-multi"
 cp -f dist/agy-multi-acp "$INSTALL_DIR/agy-multi-acp"
 chmod +x "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp"
+if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+    codesign -s - -f "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp" >/dev/null 2>&1 || true
+fi
 
 success "Installed agy-multi and agy-multi-acp to $INSTALL_DIR"
 
