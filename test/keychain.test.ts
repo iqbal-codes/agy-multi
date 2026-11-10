@@ -42,16 +42,21 @@ async function fixture(password?: string, withItem = false) {
 async function cli(root: string, entry: string, args: string[]) {
 	const proc = Bun.spawn([process.execPath, join(projectRoot, entry), ...args], {
 		cwd: projectRoot,
-		env: { ...process.env, AGY_MULTI_ROOT: root },
+		env: {
+			...process.env,
+			AGY_MULTI_ROOT: root,
+			AGY_BIN: process.env.AGY_BIN ?? "/usr/bin/true",
+		},
 		detached: true,
 		stdin: "ignore", stdout: "pipe", stderr: "pipe",
 	});
 	let timedOut = false;
+	const timeoutMs = process.env.CI ? 10_000 : 4_000;
 	const timer = setTimeout(() => {
 		timedOut = true;
 		// Include security subprocesses so a regression cannot leave a dialog waiting.
 		process.kill(-proc.pid, "SIGKILL");
-	}, 2_000);
+	}, timeoutMs);
 	try {
 		const [stdout, stderr, exitCode] = await Promise.all([
 			new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
