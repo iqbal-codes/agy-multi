@@ -28,6 +28,9 @@ export interface Profile {
 	bannedAt?: string;
 	bannedReason?: string;
 	authRequiredAt?: string;
+	disabled?: boolean;
+	disabledAt?: string;
+	clean?: boolean;
 }
 
 export interface Checkpoint {

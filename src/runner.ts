@@ -7,6 +7,7 @@ import { listProfiles, profileEnvOf, profileHomeOf, saveProfile } from "./regist
 import { block, getCheckpoint, loadState, pin, pinnedProfile, saveState, setCheckpoint } from "./state";
 import { blockingReset, familyForModel, fetchUsage } from "./usage";
 import { rankProfiles } from "./select";
+import { buildInjectedPrompt } from "./injection";
 
 export function parseResult(stdout: string): AgyResultEvent | undefined {
 	let last: AgyResultEvent | undefined;
@@ -30,12 +31,14 @@ export interface TurnOptions {
 	cwd?: string;
 	logPath?: string;
 	timeoutMs?: number;
+	clean?: boolean;
 }
 
 export async function runTurn(profile: Profile, opts: TurnOptions): Promise<RunOutcome> {
 	const logPath = opts.logPath ?? join(profileDir(profile.slug), "runs", `${Date.now()}.log`);
 	await ensureDir(join(profileDir(profile.slug), "runs"));
 	const args = [AGY_BIN, "-p", opts.prompt, "--output-format", "stream-json", "--log-file", logPath];
+	if (opts.clean || profile.clean) args.push("--disable-slash-commands");
 	if (opts.conversationId) args.push("--conversation", opts.conversationId);
 	if (opts.model) args.push("--model", opts.model);
 	const proc = Bun.spawn(args, {
@@ -68,6 +71,10 @@ export interface FailoverOptions {
 	cwd?: string;
 	maxSwitches?: number;
 	onlyProfile?: string;
+	clean?: boolean;
+	systemPrompt?: string;
+	appendSystemPrompt?: string;
+	skills?: string[];
 }
 
 export interface RunAttempt {
@@ -124,7 +131,7 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 	const state = await loadState();
 	const all = await listProfiles();
 	if (!all.length) throw new Error("no profiles; add one with `agy-multi profile add <slug>`");
-	const candidates = opts.onlyProfile ? all.filter(p => p.slug === opts.onlyProfile) : all;
+	const candidates = opts.onlyProfile ? all.filter(p => p.slug === opts.onlyProfile) : all.filter(p => !p.disabled);
 	if (!candidates.length) throw new Error(`unknown profile: ${opts.onlyProfile}`);
 
 	const family = familyForModel(opts.model);
@@ -151,6 +158,15 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 	const attempts: RunAttempt[] = [];
 	let last: { outcome: RunOutcome; profile: Profile; kind: FailureKind } | undefined;
 
+	const isClean = Boolean(opts.clean);
+	const basePrompt = buildInjectedPrompt({
+		prompt: opts.prompt,
+		systemPrompt: opts.systemPrompt,
+		appendSystemPrompt: opts.appendSystemPrompt,
+		skills: opts.skills,
+		clean: isClean,
+	});
+
 	for (const slug of ordered.slice(0, maxSwitches + 1)) {
 		const profile = candidates.find(p => p.slug === slug);
 		if (!profile) continue;
@@ -160,14 +176,15 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 		const canResume = Boolean(opts.conversationId && assumedOwner === slug);
 		const prompt =
 			opts.conversationId && !canResume
-				? buildHandoffPrompt(getCheckpoint(state, opts.conversationId), opts.prompt)
-				: opts.prompt;
+				? buildHandoffPrompt(getCheckpoint(state, opts.conversationId), basePrompt)
+				: basePrompt;
 
 		const outcome = await runTurn(profile, {
 			prompt,
 			conversationId: canResume ? opts.conversationId : undefined,
 			model: opts.model,
 			cwd: opts.cwd,
+			clean: isClean || profile.clean,
 		});
 		const kind = classifyRun(outcome.result?.status, outcome.stdout, outcome.stderr);
 		attempts.push({ slug, kind, conversationId: outcome.result?.conversation_id });

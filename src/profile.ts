@@ -120,12 +120,18 @@ async function provisionShellBridge(home: string, sourceHome: string): Promise<v
 	}
 }
 
-async function provision(home: string): Promise<void> {
+async function provision(home: string, clean = false): Promise<void> {
 	await ensureDir(join(home, ".gemini/antigravity-cli"));
 	await ensureKeychain(home);
 	const sourceHome = homedir();
-	for (const rel of [...SHARED_ENTRIES, ...TOOL_ENTRIES]) {
-		await symlinkIfMissing(join(home, rel), join(sourceHome, rel));
+	if (!clean) {
+		for (const rel of [...SHARED_ENTRIES, ...TOOL_ENTRIES]) {
+			await symlinkIfMissing(join(home, rel), join(sourceHome, rel));
+		}
+	} else {
+		for (const rel of TOOL_ENTRIES) {
+			await symlinkIfMissing(join(home, rel), join(sourceHome, rel));
+		}
 	}
 	await provisionShellBridge(home, sourceHome);
 }
@@ -144,6 +150,8 @@ export interface AddProfileOptions {
 	canary?: boolean;
 	/** Print terminal OAuth link instead of opening default browser (ideal for remote/SSH). */
 	remote?: boolean;
+	/** Provision clean environment without global skills, rules, or MCP servers. */
+	clean?: boolean;
 }
 
 export async function addProfile(slug: string, opts: AddProfileOptions = {}): Promise<Profile> {
@@ -161,9 +169,10 @@ export async function addProfile(slug: string, opts: AddProfileOptions = {}): Pr
 		slug,
 		createdAt: new Date().toISOString(),
 		...(adopted ? { home } : {}),
+		...(opts.clean ? { clean: true } : {}),
 	};
 
-	if (!adopted) await provision(home);
+	if (!adopted) await provision(home, Boolean(opts.clean));
 	await ensureDir(profileDir(slug));
 
 	if (opts.login !== false) {
@@ -295,4 +304,24 @@ export async function syncProfiles(): Promise<string[]> {
 		synced.push(p.slug);
 	}
 	return synced;
+}
+
+/** Temporarily disable a profile from candidate selection and failover. */
+export async function disableProfile(slug: string): Promise<Profile> {
+	const profile = await loadProfile(slug);
+	if (!profile) throw new Error(`profile does not exist: ${slug}`);
+	profile.disabled = true;
+	profile.disabledAt = new Date().toISOString();
+	await saveProfile(profile);
+	return profile;
+}
+
+/** Re-enable a disabled profile. */
+export async function enableProfile(slug: string): Promise<Profile> {
+	const profile = await loadProfile(slug);
+	if (!profile) throw new Error(`profile does not exist: ${slug}`);
+	delete profile.disabled;
+	delete profile.disabledAt;
+	await saveProfile(profile);
+	return profile;
 }

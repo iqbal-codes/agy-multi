@@ -48,7 +48,7 @@ export function rankProfiles(
 	const expiringThreshold = opts.expiringThresholdMs ?? DEFAULT_EXPIRING_THRESHOLD_MS;
 
 	const candidates: Candidate[] = profiles
-		.filter(p => !p.bannedAt && !p.authRequiredAt && !isBlocked(state, p.slug, family, opts.now))
+		.filter(p => !p.bannedAt && !p.authRequiredAt && !p.disabled && !isBlocked(state, p.slug, family, opts.now))
 		.map(p => {
 			const snapshot = usage.get(p.slug) ?? null;
 			const remaining = minRemaining(snapshot, family);

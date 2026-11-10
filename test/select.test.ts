@@ -48,6 +48,22 @@ describe("profile ranking", () => {
 		).toEqual(["b", "c"]);
 	});
 
+	test("disabled profiles are excluded", () => {
+		const usage = new Map<string, UsageSnapshot | null>([
+			["a", snapshot("a", 20)],
+			["b", snapshot("b", 80)],
+			["c", null],
+		]);
+		const disabledProfiles: Profile[] = [
+			{ slug: "a", createdAt: "", disabled: true },
+			{ slug: "b", createdAt: "" },
+			{ slug: "c", createdAt: "" },
+		];
+		expect(
+			rankProfiles(disabledProfiles, usage, state(), { now: 0, reservePct: 10, modelId: "gemini-3.8-flash" }),
+		).toEqual(["b", "c"]);
+	});
+
 	test("banned profiles are excluded", () => {
 		const usage = new Map<string, UsageSnapshot | null>([
 			["a", snapshot("a", 20)],

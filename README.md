@@ -177,6 +177,10 @@ agy-multi profile add work
 # Re-authenticate or login to an existing profile
 agy-multi profile login work
 
+# Temporarily disable / enable a profile from rotation
+agy-multi profile disable work
+agy-multi profile enable work
+
 # Remote / SSH login (prints OAuth URL in terminal to copy-paste):
 agy-multi profile add work --remote
 agy-multi profile login work --remote
@@ -189,12 +193,100 @@ agy-multi profile sync
 
 agy-multi profile list
 agy-multi profile remove work
-agy-multi usage
-agy-multi acp                   # ACP server for t3code / any ACP host
+
+# Check quota percentage (rolling 5h & weekly remaining)
+agy-multi usage [--profile <slug>]
+
+# Check token usage & Gemini 3.8 Flash cost analytics
+agy-multi tokens [--daily | --weekly | --monthly] [--profile <slug>] [--json]
+agy-multi usage stats [--daily | --weekly | --monthly] [--profile <slug>] [--json]
+
+# Start ACP proxy server for t3code, Zed, OMP, or any ACP orchestrator
+agy-multi acp [--clean] [-- agy acp args...]
+
+# Run non-interactive prompt with failover
 agy-multi run --prompt "fix the failing test" --model gemini-3.8-flash
+
+# Run in clean subagent mode with manual injections (ala Pi Agent)
+agy-multi run --prompt "review this diff" --clean --skills "git,diagnosing-bugs" \
+              --system-prompt "You are a code reviewer"
+
 agy-multi run --conversation <id> --prompt "continue"
 agy-multi state
 ```
+
+### Token Usage & Cost Analytics (`tokens` / `usage stats`)
+
+While `agy-multi usage` queries the real-time remaining quota percentages from Google's `/usage` API, `agy-multi tokens` aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
+
+Rates are calculated based on **Gemini 3.8 Flash** pricing:
+- **Input Tokens**: `$1.50` / 1M tokens
+- **Output Tokens**: `$7.50` / 1M tokens
+- **Cache Read Tokens**: `$0.15` / 1M tokens
+
+```bash
+# Full dashboard table (Today, This Week, This Month, All Time + By Profile)
+agy-multi tokens
+
+# Filter by time period
+agy-multi tokens --daily
+agy-multi tokens --weekly
+agy-multi tokens --monthly
+
+# Filter by profile
+agy-multi tokens --profile account-2
+
+# Machine-readable JSON output (ideal for dashboards or agent tooling)
+agy-multi tokens --daily --json
+```
+
+**Sample Output:**
+```
+=== Gemini 3.8 Flash Token Usage & Cost Analytics ===
+Rates: Input: $1.5/M | Output: $7.5/M | Cache Read: $0.15/M
+
+Period         Input Tokens  Output Tokens      Cache Read    Total Tokens   Est. Value   Turns
+-----------------------------------------------------------------------------------------------
+Today             3,619,652        268,056      72,360,580      76,248,288       $18.29     508
+This Week        14,177,801      1,078,742     292,567,912     307,824,455       $73.24   2,592
+This Month       14,177,801      1,078,742     292,567,912     307,824,455       $73.24   2,592
+All Time         16,514,743      1,160,330     320,259,304     337,934,377       $81.51   2,878
+
+--- By Profile Breakdown (All Time) ---
+Profile          Input Tokens  Output Tokens      Cache Read    Total Tokens   Est. Value   Turns
+-------------------------------------------------------------------------------------------------
+main               10,845,836        759,895     222,852,580     234,458,311       $55.40   1,983
+account-2           1,245,581         79,414      13,478,655      14,803,650        $4.49     239
+account-4           4,334,199        321,000      83,928,069      88,583,268       $21.50     651
+```
+
+### Subagent Clean Mode & Manual Injections (ala Pi Agent)
+
+When using `agy-multi` as a subagent worker for orchestrators (like Claude Code, Codex, or T3 Code), background skills, MCP tools, and default instructions can cause severe **context bloat** and slow down execution.
+
+`agy-multi` adopts the clean injection pattern popularized by **Pi Agent (`omp`)**:
+
+| Flag | Purpose |
+|---|---|
+| `--clean` / `--no-skills` | Bypasses all default skills, plugins, rules bloat, and disables slash commands. |
+| `--skills <list>` | Whitelists only specific skills (e.g. `git,chrome-devtools` or path to custom skill folder). |
+| `--system-prompt <text\|file>` | Replaces base system instructions with custom text or instructions from a file. |
+| `--append-system-prompt <file>` | Appends additional instructions to the prompt. |
+
+#### In CLI Mode (`run`):
+```bash
+agy-multi run --prompt "Verify the fix for issue #42" \
+              --clean \
+              --skills "git,diagnosing-bugs" \
+              --system-prompt "./prompts/code-reviewer.txt"
+```
+
+#### In ACP Server Mode (`acp`):
+Pass `--clean` when configuring the ACP command in your orchestrator or IDE:
+```bash
+agy-multi acp --clean
+```
+This automatically instructs `agy acp` to launch with `--include-default-customizations=false --disable-slash-commands`.
 
 ### Remote / Headless / SSH Login
 

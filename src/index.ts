@@ -2,25 +2,38 @@
 import { parseArgs } from "node:util";
 import { runAcpProxy } from "./acp/server";
 import { ensureAgy } from "./setup";
-import { addProfile, loginProfile, syncProfile, syncProfiles } from "./profile";
+import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, syncProfiles } from "./profile";
 import { listProfiles, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
 import { loadState } from "./state";
 import { fetchUsage } from "./usage";
+import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
 
 Usage:
-  agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary]
+  agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary] [--clean]
   agy-multi profile login <slug> [--remote] [--no-canary]
   agy-multi profile list
+  agy-multi profile disable <slug>
+  agy-multi profile enable <slug>
   agy-multi profile sync [<slug>]
   agy-multi profile remove <slug>
   agy-multi usage [--profile <slug>]
-  agy-multi acp [-- agy acp args...]
-  agy-multi run --prompt <text> [--conversation <id>] [--model <id>]
-                 [--profile <slug>] [--max-switches <n>] [--cwd <dir>] [--json]
+  agy-multi usage stats [--daily | --weekly | --monthly] [--profile <slug>] [--json]
+  agy-multi tokens [--daily | --weekly | --monthly] [--profile <slug>] [--json]
+  agy-multi acp [--clean] [-- agy acp args...]
+  agy-multi run --prompt <text> [--clean] [--no-skills] [--skills <list>]
+                 [--system-prompt <text|file>] [--append-system-prompt <text|file>]
+                 [--conversation <id>] [--model <id>] [--profile <slug>]
+                 [--max-switches <n>] [--cwd <dir>] [--json]
   agy-multi state
+
+Subagent Clean Mode & Manual Injections (ala Pi Agent):
+  --clean / --no-skills          Bypasses default skills, plugins, rules bloat and slash commands.
+  --skills <list>                Comma-separated skill names or directories to inject.
+  --system-prompt <text|file>    Custom system prompt (text or file path).
+  --append-system-prompt <file>  Additional instructions appended to prompt.
 
 Each profile is a separate HOME; the official agy binary and its OAuth client
 are never modified. Failover is handoff-only: a conversation is never replayed
@@ -31,7 +44,11 @@ async function main(): Promise<void> {
 	const rawArgs = Bun.argv.slice(2);
 	if (rawArgs[0] === "acp" && rawArgs[1] !== "--help" && rawArgs[1] !== "-h") {
 		await ensureAgy({ autoInstall: true });
-		const extraArgs = rawArgs.slice(1).filter((arg: string) => arg !== "--");
+		const clean = rawArgs.includes("--clean");
+		const filteredArgs = rawArgs.slice(1).filter((arg: string) => arg !== "--" && arg !== "--clean");
+		const extraArgs = clean
+			? ["--include-default-customizations=false", "--disable-slash-commands", ...filteredArgs]
+			: filteredArgs;
 		await runAcpProxy({ extraArgs });
 		return;
 	}
@@ -51,6 +68,14 @@ async function main(): Promise<void> {
 			"no-login": { type: "boolean" },
 			remote: { type: "boolean" },
 			home: { type: "string" },
+			clean: { type: "boolean" },
+			"no-skills": { type: "boolean" },
+			skills: { type: "string" },
+			"system-prompt": { type: "string" },
+			"append-system-prompt": { type: "string" },
+			daily: { type: "boolean" },
+			weekly: { type: "boolean" },
+			monthly: { type: "boolean" },
 			help: { type: "boolean", short: "h" },
 		},
 	});
@@ -64,7 +89,7 @@ async function main(): Promise<void> {
 	if (command === "profile") {
 		if (subcommand === "add") {
 			const slug = rest[0];
-			if (!slug) throw new Error("usage: agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary]");
+			if (!slug) throw new Error("usage: agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary] [--clean]");
 			if (!values["no-login"] || !values["no-canary"]) {
 				await ensureAgy();
 			}
@@ -73,6 +98,7 @@ async function main(): Promise<void> {
 				login: !values["no-login"],
 				canary: !values["no-canary"],
 				remote: Boolean(values.remote),
+				clean: Boolean(values.clean),
 			});
 			const status = profile.bannedAt
 				? "banned"
@@ -102,17 +128,33 @@ async function main(): Promise<void> {
 				return;
 			}
 			for (const profile of profiles) {
-				const status = profile.bannedAt
-					? "banned"
-					: profile.authRequiredAt
-						? "auth-required"
-						: profile.lastGenerationOkAt
-							? "ok"
-							: "unknown";
+				const status = profile.disabled
+					? "disabled"
+					: profile.bannedAt
+						? "banned"
+						: profile.authRequiredAt
+							? "auth-required"
+							: profile.lastGenerationOkAt
+								? "ok"
+								: "unknown";
 				console.log(
 					`${profile.slug}\t${profile.email ?? "(no email)"}\t${status}\tlastOk=${profile.lastGenerationOkAt ?? "-"}`,
 				);
 			}
+			return;
+		}
+		if (subcommand === "disable") {
+			const slug = rest[0];
+			if (!slug) throw new Error("usage: agy-multi profile disable <slug>");
+			const profile = await disableProfile(slug);
+			console.log(`disabled ${profile.slug}`);
+			return;
+		}
+		if (subcommand === "enable") {
+			const slug = rest[0];
+			if (!slug) throw new Error("usage: agy-multi profile enable <slug>");
+			const profile = await enableProfile(slug);
+			console.log(`enabled ${profile.slug}`);
 			return;
 		}
 		if (subcommand === "sync") {
@@ -135,6 +177,30 @@ async function main(): Promise<void> {
 			return;
 		}
 		throw new Error(`unknown profile command: ${subcommand ?? "(none)"}`);
+	}
+
+	if (command === "tokens" || (command === "usage" && subcommand === "stats")) {
+		const turns = await collectAllTurns(values.profile);
+		const stats = aggregateTokens(turns);
+
+		if (values.json) {
+			if (values.daily) console.log(JSON.stringify(stats.today, null, 2));
+			else if (values.weekly) console.log(JSON.stringify(stats.thisWeek, null, 2));
+			else if (values.monthly) console.log(JSON.stringify(stats.thisMonth, null, 2));
+			else console.log(JSON.stringify(stats, null, 2));
+			return;
+		}
+
+		if (values.daily) {
+			console.log(renderPeriodTable(stats.today));
+		} else if (values.weekly) {
+			console.log(renderPeriodTable(stats.thisWeek));
+		} else if (values.monthly) {
+			console.log(renderPeriodTable(stats.thisMonth));
+		} else {
+			console.log(renderStatsTable(stats));
+		}
+		return;
 	}
 
 	if (command === "usage") {
@@ -163,6 +229,13 @@ async function main(): Promise<void> {
 		if (!values.prompt) throw new Error("usage: agy-multi run --prompt <text>");
 		await ensureAgy();
 		try {
+			const skills = values.skills
+				? values.skills
+						.split(",")
+						.map(s => s.trim())
+						.filter(Boolean)
+				: undefined;
+
 			const report = await runWithFailover({
 				prompt: values.prompt,
 				conversationId: values.conversation,
@@ -170,6 +243,10 @@ async function main(): Promise<void> {
 				cwd: values.cwd,
 				maxSwitches: values["max-switches"] ? Number(values["max-switches"]) : undefined,
 				onlyProfile: values.profile,
+				clean: Boolean(values.clean || values["no-skills"]),
+				systemPrompt: values["system-prompt"],
+				appendSystemPrompt: values["append-system-prompt"],
+				skills,
 			});
 			if (values.json) {
 				console.log(

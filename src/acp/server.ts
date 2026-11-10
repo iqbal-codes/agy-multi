@@ -500,7 +500,7 @@ class AcpProxy {
 
 		if (!ranked.length && options.allowBlocked) {
 			ranked = candidates
-				.filter(profile => !profile.bannedAt && !profile.authRequiredAt)
+				.filter(profile => !profile.bannedAt && !profile.authRequiredAt && !profile.disabled)
 				.sort(
 					(a, b) =>
 						(this.blockReset(a.slug, options.modelId) ?? Number.POSITIVE_INFINITY) -
