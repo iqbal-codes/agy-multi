@@ -13,7 +13,7 @@ describe("ensureGlobalGeminiRules helper", () => {
 			expect(existsSync(targetPath)).toBe(true);
 
 			const content = readFileSync(targetPath, "utf-8");
-			expect(content).toContain("# T3 Code & Subagent Orchestration Rules");
+			expect(content).toContain("# ACP & Multi-Agent Orchestration Rules");
 			expect(content).toContain("T3_ACP_MCP_NODE");
 			expect(content).toContain("WaitMsBeforeAsync: 10000");
 		} finally {
@@ -33,7 +33,7 @@ describe("ensureGlobalGeminiRules helper", () => {
 
 			const content = readFileSync(targetPath, "utf-8");
 			expect(content).toContain("# Custom Instructions");
-			expect(content).toContain("# T3 Code & Subagent Orchestration Rules");
+			expect(content).toContain("# ACP & Multi-Agent Orchestration Rules");
 			expect(content).toContain("T3_ACP_MCP_NODE");
 		} finally {
 			rmSync(tempHome, { recursive: true, force: true });
@@ -48,7 +48,7 @@ describe("ensureGlobalGeminiRules helper", () => {
 
 			const targetPath = join(tempHome, ".gemini", "GEMINI.md");
 			const content = readFileSync(targetPath, "utf-8");
-			const titleMatches = content.match(/# T3 Code & Subagent Orchestration Rules/g) || [];
+			const titleMatches = content.match(/# ACP & Multi-Agent Orchestration Rules/g) || [];
 			expect(titleMatches.length).toBe(1);
 			const nodeMatches = content.match(/T3_ACP_MCP_NODE/g) || [];
 			expect(nodeMatches.length).toBe(2); // Occurs twice within the single template block

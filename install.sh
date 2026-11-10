@@ -111,61 +111,71 @@ if ! command -v agy >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/agy" ] && [ ! -x
     fi
 fi
 
-# 8. Ensure T3 Code & ACP rules exist in ~/.gemini/GEMINI.md
+# 8. Ensure ACP orchestration rules exist in ~/.gemini/GEMINI.md
 GEMINI_DIR="$HOME/.gemini"
 GEMINI_MD="$GEMINI_DIR/GEMINI.md"
 if [ ! -f "$GEMINI_MD" ]; then
     mkdir -p "$GEMINI_DIR"
     cat << 'EOF' > "$GEMINI_MD"
-# T3 Code & Subagent Orchestration Rules
+# ACP & Multi-Agent Orchestration Rules
 
-When running inside T3 Code (`T3_ACP_MCP_NODE` is present in the environment or host is T3 Code):
-1. **Do not use internal `invoke_subagent` for user-facing multi-agent work.**
-   Antigravity's internal `invoke_subagent` runs exclusively within the local Antigravity CLI daemon and does not create child task cards or threads in the T3 Code UI.
-2. **Use T3 Code's `delegate_task` via the ACP MCP bridge:**
-   ```bash
-   ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" "$T3_ACP_MCP_ENTRYPOINT" acp-mcp-call delegate_task '{"task":"<task description>","target":{"providerInstanceId":"antigravity-acp","model":"gemini-3.8-flash"},"mode":"async","clientRequestId":"<unique-id>"}'
-   ```
-   This spawns a first-class subagent thread directly inside T3 Code, complete with a UI progress card, live status, and a verbatim thread link (`<t3-thread://...>`).
-3. **Handle Background Processes & Long Commands Explicitly:**
-   - In ACP clients like T3 Code, T3 Code cannot track Antigravity's internal daemon tasks (`manage_task`), and `t3_background_wait` is unsupported for this provider. Furthermore, ACP is turn-based, so Antigravity cannot proactively wake up the client when a background task completes.
+These rules apply when running under an ACP (Agent Client Protocol) host (such as T3 Code, Zed, or other ACP editor clients):
+
+1. **Synchronous Execution & Command Handling (All ACP Clients):**
+   - ACP is turn-based. ACP client editors cannot track or display Antigravity's internal daemon tasks (`manage_task`), nor can background tasks unilaterally notify the client outside an active turn.
    - **For commands expected to finish (builds, tests, linters, scripts):**
-     - Always set `WaitMsBeforeAsync: 10000` (the maximum allowed) to avoid premature backgrounding.
-     - Never end a turn with a generic "I launched it in background" message if the command was supposed to finish. If a command is backgrounded unexpectedly, check `manage_task(Action='status')` or inspect the task log before returning, or inform the user clearly with the exact log path.
-   - **For true background daemons (e.g., dev servers, file watchers, background services):**
+     - Always set `WaitMsBeforeAsync: 10000` (the maximum allowed) to ensure synchronous execution and prevent premature backgrounding.
+     - Never finish a turn claiming a task was launched in the background if it was supposed to finish. Inspect the status or logs before concluding the turn.
+   - **For long-running background daemons (e.g., dev servers, watchers):**
      - Explicitly state:
-       1. The command running and service/port.
-       2. The Antigravity Task ID (e.g., `task-XX`).
-       3. The full log file link (`file:///.../task-XX.log`).
-       4. How to check or terminate it (`manage_task`).
+       1. The running command, service name, and port.
+       2. The task ID (e.g., `task-XX`).
+       3. The full absolute log file path (`file:///.../task-XX.log`).
+       4. How to inspect or terminate it (`manage_task`).
+
+2. **Subagents & Multi-Agent Work (Agnostic vs T3 Code):**
+   - **Do not use internal `invoke_subagent` for user-facing tasks:** Antigravity's internal `invoke_subagent` runs exclusively inside the local daemon and is invisible to ACP client interfaces.
+   - **When running inside T3 Code (`T3_ACP_MCP_NODE` is present or host is T3 Code):**
+     - Delegate subagents using T3 Code's ACP MCP bridge:
+       ```bash
+       ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" "$T3_ACP_MCP_ENTRYPOINT" acp-mcp-call delegate_task '{"task":"<task description>","target":{"providerInstanceId":"antigravity-acp","model":"gemini-3.8-flash"},"mode":"async","clientRequestId":"<unique-id>"}'
+       ```
+       This spawns a first-class child thread and progress card directly in T3 Code.
+   - **When running in other ACP clients (e.g. Zed, Neovim, generic ACP):**
+     - Execute the task directly within the active thread rather than spawning hidden background subagents, unless the host provides a client-specific delegation tool.
 EOF
-    info "Provisioned T3 Code & ACP orchestration rules in $GEMINI_MD"
-elif ! grep -q "T3_ACP_MCP_NODE" "$GEMINI_MD" 2>/dev/null; then
+    info "Provisioned ACP orchestration rules in $GEMINI_MD"
+elif ! grep -q "ACP & Multi-Agent Orchestration Rules\|T3_ACP_MCP_NODE" "$GEMINI_MD" 2>/dev/null; then
     printf "\n" >> "$GEMINI_MD"
     cat << 'EOF' >> "$GEMINI_MD"
-# T3 Code & Subagent Orchestration Rules
+# ACP & Multi-Agent Orchestration Rules
 
-When running inside T3 Code (`T3_ACP_MCP_NODE` is present in the environment or host is T3 Code):
-1. **Do not use internal `invoke_subagent` for user-facing multi-agent work.**
-   Antigravity's internal `invoke_subagent` runs exclusively within the local Antigravity CLI daemon and does not create child task cards or threads in the T3 Code UI.
-2. **Use T3 Code's `delegate_task` via the ACP MCP bridge:**
-   ```bash
-   ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" "$T3_ACP_MCP_ENTRYPOINT" acp-mcp-call delegate_task '{"task":"<task description>","target":{"providerInstanceId":"antigravity-acp","model":"gemini-3.8-flash"},"mode":"async","clientRequestId":"<unique-id>"}'
-   ```
-   This spawns a first-class subagent thread directly inside T3 Code, complete with a UI progress card, live status, and a verbatim thread link (`<t3-thread://...>`).
-3. **Handle Background Processes & Long Commands Explicitly:**
-   - In ACP clients like T3 Code, T3 Code cannot track Antigravity's internal daemon tasks (`manage_task`), and `t3_background_wait` is unsupported for this provider. Furthermore, ACP is turn-based, so Antigravity cannot proactively wake up the client when a background task completes.
+These rules apply when running under an ACP (Agent Client Protocol) host (such as T3 Code, Zed, or other ACP editor clients):
+
+1. **Synchronous Execution & Command Handling (All ACP Clients):**
+   - ACP is turn-based. ACP client editors cannot track or display Antigravity's internal daemon tasks (`manage_task`), nor can background tasks unilaterally notify the client outside an active turn.
    - **For commands expected to finish (builds, tests, linters, scripts):**
-     - Always set `WaitMsBeforeAsync: 10000` (the maximum allowed) to avoid premature backgrounding.
-     - Never end a turn with a generic "I launched it in background" message if the command was supposed to finish. If a command is backgrounded unexpectedly, check `manage_task(Action='status')` or inspect the task log before returning, or inform the user clearly with the exact log path.
-   - **For true background daemons (e.g., dev servers, file watchers, background services):**
+     - Always set `WaitMsBeforeAsync: 10000` (the maximum allowed) to ensure synchronous execution and prevent premature backgrounding.
+     - Never finish a turn claiming a task was launched in the background if it was supposed to finish. Inspect the status or logs before concluding the turn.
+   - **For long-running background daemons (e.g., dev servers, watchers):**
      - Explicitly state:
-       1. The command running and service/port.
-       2. The Antigravity Task ID (e.g., `task-XX`).
-       3. The full log file link (`file:///.../task-XX.log`).
-       4. How to check or terminate it (`manage_task`).
+       1. The running command, service name, and port.
+       2. The task ID (e.g., `task-XX`).
+       3. The full absolute log file path (`file:///.../task-XX.log`).
+       4. How to inspect or terminate it (`manage_task`).
+
+2. **Subagents & Multi-Agent Work (Agnostic vs T3 Code):**
+   - **Do not use internal `invoke_subagent` for user-facing tasks:** Antigravity's internal `invoke_subagent` runs exclusively inside the local daemon and is invisible to ACP client interfaces.
+   - **When running inside T3 Code (`T3_ACP_MCP_NODE` is present or host is T3 Code):**
+     - Delegate subagents using T3 Code's ACP MCP bridge:
+       ```bash
+       ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" "$T3_ACP_MCP_ENTRYPOINT" acp-mcp-call delegate_task '{"task":"<task description>","target":{"providerInstanceId":"antigravity-acp","model":"gemini-3.8-flash"},"mode":"async","clientRequestId":"<unique-id>"}'
+       ```
+       This spawns a first-class child thread and progress card directly in T3 Code.
+   - **When running in other ACP clients (e.g. Zed, Neovim, generic ACP):**
+     - Execute the task directly within the active thread rather than spawning hidden background subagents, unless the host provides a client-specific delegation tool.
 EOF
-    info "Appended T3 Code & ACP orchestration rules to $GEMINI_MD"
+    info "Appended ACP orchestration rules to $GEMINI_MD"
 fi
 
 # 9. Verify
