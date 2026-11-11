@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import { runAcpProxy } from "./acp/server";
+import { extractCompactionThresholdArg } from "./acp/token-usage";
 import { ensureAgy } from "./setup";
 import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, syncProfiles } from "./profile";
 import { listProfiles, removeProfile } from "./registry";
@@ -21,12 +22,16 @@ Usage:
   agy-multi profile remove <slug>
   agy-multi quota [--profile <slug>]
   agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
-  agy-multi acp [--clean] [-- agy acp args...]
+  agy-multi acp [--clean] [--compaction-threshold <tokens>] [-- agy acp args...]
   agy-multi run --prompt <text> [--clean] [--no-skills] [--skills <list>]
                  [--system-prompt <text|file>] [--append-system-prompt <text|file>]
                  [--conversation <id>] [--model <id>] [--profile <slug>]
                  [--max-switches <n>] [--cwd <dir>] [--json]
   agy-multi state
+
+ACP Options:
+  --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
+  --compaction-threshold <tokens> Auto-compacts conversation when context reaches this limit (default: 300000, 0 to disable).
 
 Subagent Clean Mode & Manual Injections (ala Pi Agent):
   --clean / --no-skills          Bypasses default skills, plugins, rules bloat and slash commands.
@@ -45,10 +50,11 @@ async function main(): Promise<void> {
 		await ensureAgy({ autoInstall: true });
 		const clean = rawArgs.includes("--clean");
 		const filteredArgs = rawArgs.slice(1).filter((arg: string) => arg !== "--" && arg !== "--clean");
+		const { threshold, remainingArgs } = extractCompactionThresholdArg(filteredArgs);
 		const extraArgs = clean
-			? ["--include-default-customizations=false", "--disable-slash-commands", ...filteredArgs]
-			: filteredArgs;
-		await runAcpProxy({ extraArgs });
+			? ["--include-default-customizations=false", "--disable-slash-commands", ...remainingArgs]
+			: remainingArgs;
+		await runAcpProxy({ compactionThreshold: threshold, extraArgs });
 		return;
 	}
 

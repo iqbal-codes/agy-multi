@@ -1,5 +1,7 @@
-import { existsSync, openSync, readSync, statSync, closeSync } from "node:fs";
+import { existsSync, openSync, readSync, readFileSync, statSync, closeSync } from "node:fs";
 import { join } from "node:path";
+
+export const DEFAULT_COMPACTION_THRESHOLD = 300_000;
 
 export interface TokenUsageResult {
 	usedTokens: number;
@@ -59,14 +61,19 @@ export function readLatestTokenUsage(filePath: string): TokenUsageResult | null 
  * Searches common locations where Antigravity stores conversation transcripts.
  */
 export function findSessionTranscript(profileHomeDir: string, childSessionId: string): string | null {
-	const candidatePaths = [
-		join(profileHomeDir, ".gemini", "antigravity-cli", "brain", childSessionId, ".system_generated", "logs", "transcript.jsonl"),
-		join(profileHomeDir, ".gemini", "brain", childSessionId, ".system_generated", "logs", "transcript.jsonl"),
-		join(profileHomeDir, "brain", childSessionId, ".system_generated", "logs", "transcript.jsonl"),
-	];
-
-	for (const path of candidatePaths) {
-		if (existsSync(path)) return path;
+	const candidateHomes = [profileHomeDir];
+	if (process.env.HOME && process.env.HOME !== profileHomeDir) {
+		candidateHomes.push(process.env.HOME);
+	}
+	for (const home of candidateHomes) {
+		const candidatePaths = [
+			join(home, ".gemini", "antigravity-cli", "brain", childSessionId, ".system_generated", "logs", "transcript.jsonl"),
+			join(home, ".gemini", "brain", childSessionId, ".system_generated", "logs", "transcript.jsonl"),
+			join(home, "brain", childSessionId, ".system_generated", "logs", "transcript.jsonl"),
+		];
+		for (const path of candidatePaths) {
+			if (existsSync(path)) return path;
+		}
 	}
 	return null;
 }
@@ -79,4 +86,76 @@ export function resolveSessionTokenUsage(
 	if (!profileHomeDir) return null;
 	const transcript = findSessionTranscript(profileHomeDir, childSessionId);
 	return transcript ? readLatestTokenUsage(transcript) : null;
+}
+
+/**
+ * Resolves the token threshold for auto-compaction.
+ * Precedence:
+ * 1. Explicit option passed via code or CLI flag (--compaction-threshold)
+ * 2. AGY_COMPACTION_THRESHOLD or AGY_MULTI_COMPACTION_THRESHOLD environment variable
+ * 3. compactionThreshold or compaction_threshold in settings.json
+ * 4. DEFAULT_COMPACTION_THRESHOLD (300,000 tokens)
+ * Set to 0 to disable auto-compaction.
+ */
+export function resolveCompactionThreshold(
+	optionValue?: number,
+	env: Record<string, string | undefined> = process.env,
+	homeDir: string = process.env.HOME ?? "",
+): number {
+	if (typeof optionValue === "number" && Number.isFinite(optionValue) && optionValue >= 0) {
+		return optionValue;
+	}
+	const envVal = env.AGY_COMPACTION_THRESHOLD ?? env.AGY_MULTI_COMPACTION_THRESHOLD;
+	if (envVal !== undefined && envVal.trim() !== "") {
+		const parsed = Number.parseInt(envVal.trim(), 10);
+		if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+	}
+	if (homeDir) {
+		const candidateSettingsPaths = [
+			join(homeDir, ".gemini", "antigravity-cli", "settings.json"),
+			join(homeDir, ".gemini", "settings.json"),
+		];
+		for (const settingsPath of candidateSettingsPaths) {
+			try {
+				if (existsSync(settingsPath)) {
+					const text = readFileSync(settingsPath, "utf8");
+					const parsed = JSON.parse(text);
+					if (parsed && typeof parsed === "object") {
+						const threshold = parsed.compactionThreshold ?? parsed.compaction_threshold;
+						if (typeof threshold === "number" && Number.isFinite(threshold) && threshold >= 0) {
+							return threshold;
+						}
+					}
+				}
+			} catch {
+				// Ignore file read or parse error
+			}
+		}
+	}
+	return DEFAULT_COMPACTION_THRESHOLD;
+}
+
+/**
+ * Extracts --compaction-threshold from argv and returns remaining args.
+ */
+export function extractCompactionThresholdArg(args: string[]): {
+	threshold?: number;
+	remainingArgs: string[];
+} {
+	let threshold: number | undefined;
+	const remainingArgs: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--compaction-threshold" && i + 1 < args.length) {
+			const parsed = Number.parseInt(args[++i], 10);
+			if (Number.isFinite(parsed) && parsed >= 0) threshold = parsed;
+		} else if (arg.startsWith("--compaction-threshold=")) {
+			const val = arg.slice("--compaction-threshold=".length);
+			const parsed = Number.parseInt(val, 10);
+			if (Number.isFinite(parsed) && parsed >= 0) threshold = parsed;
+		} else {
+			remainingArgs.push(arg);
+		}
+	}
+	return { threshold, remainingArgs };
 }

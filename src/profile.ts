@@ -130,8 +130,11 @@ These rules apply when running under an ACP (Agent Client Protocol) host (such a
 1. **Synchronous Execution & Command Handling (All ACP Clients):**
    - ACP is turn-based. ACP client editors cannot track or display Antigravity's internal daemon tasks (\`manage_task\`), nor can background tasks unilaterally notify the client outside an active turn.
    - **For commands expected to finish (builds, tests, linters, scripts):**
-     - Always set \`WaitMsBeforeAsync: 10000\` (the maximum allowed) to ensure synchronous execution and prevent premature backgrounding.
+     - Set \`WaitMsBeforeAsync: 10000\`. That is the **maximum** the runtime accepts and it only covers the first 10 seconds — it is not a completion guarantee. Assume any \`cargo xtask ci\`, full test suite, or clean build will outlive it and be backgrounded as a daemon task.
      - Never finish a turn claiming a task was launched in the background if it was supposed to finish. Inspect the status or logs before concluding the turn.
+     - **A \`schedule\` call is a sleep, not a completion signal.** Setting \`DurationSeconds\` does not prove anything finished, and it does not survive the turn closing.
+     - **Never end a turn while a \`manage_task\` task is still running.** ACP cannot wake you after the turn closes, so the work is abandoned and the host marks the run complete with no result. Keep polling (\`manage_task\` with Action \`status\`, short \`schedule\` timers) until the task finishes, then continue the work. Only Action \`kill\` or a finished task releases the turn.
+     - Before your final message, call \`manage_task\` with Action \`list\` and confirm no task is still running. State the task id and log path if anything is left running.
    - **For long-running background daemons (e.g., dev servers, watchers):**
      - Explicitly state:
        1. The running command, service name, and port.
@@ -151,6 +154,37 @@ These rules apply when running under an ACP (Agent Client Protocol) host (such a
      - Execute the task directly within the active thread rather than spawning hidden background subagents, unless the host provides a client-specific delegation tool.
 `;
 
+/** Bumped whenever `T3_ACP_RULES` changes so installed copies get replaced. */
+const T3_ACP_RULES_VERSION = "2";
+const T3_ACP_RULES_START = "<!-- agy-multi:acp-rules:start -->";
+const T3_ACP_RULES_END = "<!-- agy-multi:acp-rules:end -->";
+
+function managedRulesBlock(): string {
+	return `${T3_ACP_RULES_START}\n<!-- version: ${T3_ACP_RULES_VERSION} -->\n${T3_ACP_RULES.trim()}\n${T3_ACP_RULES_END}`;
+}
+
+// The pre-versioning rules always ended with this line, so text after it survives.
+const LEGACY_RULES_END = "unless the host provides a client-specific delegation tool.";
+
+/** Rewrites the managed block, leaving the user's own instructions untouched. */
+function withManagedRules(content: string): string {
+	const block = managedRulesBlock();
+	const start = content.indexOf(T3_ACP_RULES_START);
+	const end = content.indexOf(T3_ACP_RULES_END);
+	if (start !== -1 && end > start) {
+		return `${content.slice(0, start)}${block}${content.slice(end + T3_ACP_RULES_END.length)}`;
+	}
+	// Legacy installs appended the rules (unmarked) at the end of the file.
+	const legacyStart = content.indexOf("# ACP & Multi-Agent Orchestration Rules");
+	if (legacyStart !== -1) {
+		const legacyEnd = content.indexOf(LEGACY_RULES_END, legacyStart);
+		const tail = legacyEnd === -1 ? "" : content.slice(legacyEnd + LEGACY_RULES_END.length);
+		const head = content.slice(0, legacyStart).trimEnd();
+		return `${head ? `${head}\n\n` : ""}${block}${tail}`;
+	}
+	return `${content.trimEnd()}\n\n${block}\n`;
+}
+
 /**
  * Ensures primary user home has ~/.gemini/GEMINI.md with T3 Code and ACP rules.
  * This guarantees that when SHARED_ENTRIES links GEMINI.md, the file exists
@@ -162,12 +196,11 @@ export async function ensureGlobalGeminiRules(sourceHome: string): Promise<void>
 		const target = join(geminiDir, "GEMINI.md");
 		if (await exists(target)) {
 			const content = await Bun.file(target).text();
-			if (!content.includes("T3_ACP_MCP_NODE")) {
-				await Bun.write(target, `${content.trimEnd()}\n\n${T3_ACP_RULES.trim()}\n`);
-			}
+			const current = content.includes(`<!-- version: ${T3_ACP_RULES_VERSION} -->`);
+			if (!current) await Bun.write(target, withManagedRules(content));
 		} else {
 			await ensureDir(geminiDir);
-			await Bun.write(target, `${T3_ACP_RULES.trim()}\n`);
+			await Bun.write(target, `${managedRulesBlock()}\n`);
 		}
 	} catch {
 		// Non-blocking if directory or file is unwritable

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { classifyAcpError, isSessionLostError } from "../classify";
 import { exists, run } from "../fs-utils";
 import { AGY_BIN, ACP_SESSIONS_PATH, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, USAGE_TTL_MS, profileHome } from "../paths";
-import { listProfiles, saveProfile } from "../registry";
+import { listProfiles, profileHomeOf, saveProfile } from "../registry";
 import { block, isBlocked, loadState, saveState } from "../state";
 import { rankProfiles } from "../select";
 import { syncProfiles } from "../profile";
@@ -11,6 +11,14 @@ import { listUserSkills } from "../injection";
 import type { FailureKind, Family, Profile, UsageSnapshot, WrapperState } from "../types";
 import { blockingReset, familyForModel, fetchUsage, minRemaining, readCachedUsage } from "../usage";
 import { AcpChild, AcpRpcError } from "./child";
+import {
+	DAEMON_HOLD_MAX_CONTINUATIONS,
+	DAEMON_HOLD_MAX_MS,
+	applyDaemonSignal,
+	daemonHoldPrompt,
+	daemonTaskSignal,
+	nextWaitMs,
+} from "./daemon-tasks";
 import { isRecord } from "./guards";
 import { buildHandoffPrompt, promptToText, toolTitle, type HistoryEntry } from "./prompt";
 import {
@@ -27,12 +35,14 @@ import {
 	type JsonRpcResponse,
 } from "./rpc";
 import { loadAcpSessions, saveAcpSessions, type AcpSessionRecord, type AcpSessionStore } from "./session-store";
+import { resolveCompactionThreshold, resolveSessionTokenUsage, DEFAULT_COMPACTION_THRESHOLD } from "./token-usage";
 
 export interface AcpProxyOptions {
 	agyBin?: string;
 	extraArgs?: string[];
 	maxSwitches?: number;
 	reservePct?: number;
+	compactionThreshold?: number;
 	sessionsPath?: string;
 	log?: (line: string) => void;
 }
@@ -42,6 +52,9 @@ interface TurnState {
 	toolTitles: string[];
 	forwardedOutput: boolean;
 	suppressUserChunk: boolean;
+	suppressOutput?: boolean;
+	/** Daemon tasks the mirrored tool calls referenced; the turn is held while any still runs. */
+	daemonTasks: Map<string, { waitUntil?: number }>;
 }
 
 interface SessionState {
@@ -58,6 +71,7 @@ interface SessionState {
 	handoffSessionReady?: boolean;
 	loading?: boolean;
 	suppressReplay?: boolean;
+	cancelled?: boolean;
 	loadBuffers?: { user: string; assistant: string; history: HistoryEntry[] };
 	/** Updates received before the client saw `session/new`; flushed after it. */
 	pendingOut?: unknown[];
@@ -91,6 +105,7 @@ class AcpProxy {
 	private readonly extraArgs: string[];
 	private readonly maxSwitches: number;
 	private readonly reservePct: number;
+	private readonly compactionThreshold: number;
 	private readonly sessionsPath: string;
 	private readonly log: (line: string) => void;
 	private readonly out: LineWriter;
@@ -119,6 +134,7 @@ class AcpProxy {
 		this.extraArgs = options.extraArgs ?? [];
 		this.maxSwitches = options.maxSwitches ?? 3;
 		this.reservePct = options.reservePct ?? DEFAULT_RESERVE_PCT;
+		this.compactionThreshold = resolveCompactionThreshold(options.compactionThreshold);
 		this.sessionsPath = options.sessionsPath ?? ACP_SESSIONS_PATH;
 		this.log = options.log ?? (line => process.stderr.write(`[agy-multi acp] ${line}\n`));
 		this.out = new LineWriter({ write: line => process.stdout.write(line) });
@@ -136,7 +152,9 @@ class AcpProxy {
 				}
 			}),
 		);
-		this.log(`ready — ${this.profiles.size} profile(s), ${Object.keys(this.store.sessions).length} stored session(s)`);
+		this.log(
+			`ready — ${this.profiles.size} profile(s), ${Object.keys(this.store.sessions).length} stored session(s), auto-compaction threshold: ${this.compactionThreshold > 0 ? `${this.compactionThreshold} tokens` : "disabled"}`,
+		);
 
 		new LineReader(
 			Bun.stdin.stream(),
@@ -252,6 +270,7 @@ class AcpProxy {
 			const sessionId = params ? readString(params.sessionId) : undefined;
 			const session = sessionId ? this.sessions.get(sessionId) : undefined;
 			if (!session) return;
+			session.cancelled = true;
 			const child = this.children.get(session.profile);
 			if (child?.alive) child.notify("session/cancel", { sessionId: session.childSessionId });
 			return;
@@ -316,17 +335,19 @@ class AcpProxy {
 			} else if (session.loading) {
 				this.trackLoadChunk(session, "assistant", text);
 			}
+			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
 			return;
 		}
 		if (kind === "agent_thought_chunk") {
 			if (session.activeTurn) session.activeTurn.forwardedOutput = true;
+			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
 			return;
 		}
 		if (kind === "user_message_chunk") {
 			if (session.loading) this.trackLoadChunk(session, "user", text);
-			if (session.activeTurn?.suppressUserChunk) return;
+			if (session.activeTurn?.suppressUserChunk || session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
 			return;
 		}
@@ -337,12 +358,16 @@ class AcpProxy {
 					const title = toolTitle(update);
 					if (title) session.activeTurn.toolTitles.push(title);
 				}
+				const signal = daemonTaskSignal(update, Date.now());
+				applyDaemonSignal(session.activeTurn.daemonTasks, signal);
 			}
+			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
 			return;
 		}
 		if (kind === "plan") {
 			if (session.activeTurn) session.activeTurn.forwardedOutput = true;
+			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
 			return;
 		}
@@ -1253,16 +1278,67 @@ class AcpProxy {
 				toolTitles: [],
 				forwardedOutput: false,
 				suppressUserChunk: handoff,
+				daemonTasks: new Map(),
 			};
+			session.cancelled = false;
 			session.activeTurn = turn;
 			await this.saveStore();
 			this.log(`prompt on ${profile.slug}${handoff ? " (handoff)" : ""} session=${session.id}`);
 
-			const response = await child.request("session/prompt", {
+			let response = await child.request("session/prompt", {
 				sessionId: session.childSessionId,
 				prompt: [{ type: "text", text }],
 			});
+
+			const holdStartedAt = Date.now();
+			let continuations = 0;
+			while (!response.error && !session.cancelled && turn.daemonTasks.size > 0) {
+				const taskIds = [...turn.daemonTasks.keys()];
+				if (
+					continuations >= DAEMON_HOLD_MAX_CONTINUATIONS ||
+					Date.now() - holdStartedAt >= DAEMON_HOLD_MAX_MS
+				) {
+					session.activeTurn = undefined;
+					this.log(
+						`daemon tasks still running after ${continuations} continuation(s): ${taskIds.join(", ")}`,
+					);
+					this.respondError(
+						clientId,
+						-32000,
+						`turn ended with unconfirmed background tasks: ${taskIds.join(", ")}. ` +
+							"The work may still be running; no verified result was produced.",
+					);
+					return;
+				}
+
+				const waitMs = nextWaitMs(
+					[...turn.daemonTasks.values()].flatMap(task =>
+						task.waitUntil === undefined ? [] : [task.waitUntil],
+					),
+					Date.now(),
+				);
+				this.log(
+					`turn ended with ${taskIds.length} background task(s) still running (${taskIds.join(", ")}); holding ${waitMs}ms before resuming`,
+				);
+				await this.waitForDaemon(waitMs, session);
+				if (session.cancelled) break;
+
+				continuations += 1;
+				turn.daemonTasks.clear();
+				// The hold prompt is proxy-owned; the client must not see it as a user turn.
+				turn.suppressUserChunk = true;
+				response = await child.request("session/prompt", {
+					sessionId: session.childSessionId,
+					prompt: [{ type: "text", text: daemonHoldPrompt(taskIds) }],
+				});
+			}
 			session.activeTurn = undefined;
+
+			if (session.cancelled && !response.error) {
+				this.log(`prompt cancelled on ${profile.slug} session=${session.id}`);
+				this.respond(clientId, { stopReason: "cancelled" });
+				return;
+			}
 
 			if (response.error) {
 				const isLost = isSessionLostError(response.error);
@@ -1327,6 +1403,9 @@ class AcpProxy {
 			if (profile.authRequiredAt) delete profile.authRequiredAt;
 			await saveProfile(profile);
 			await this.saveStore();
+
+			await this.maybeAutoCompact(child, session, profile);
+
 			this.respond(clientId, response.result ?? { stopReason });
 		} catch (error) {
 			session.activeTurn = undefined;
@@ -1334,8 +1413,72 @@ class AcpProxy {
 		}
 	}
 
-	private async gitHead(cwd: string): Promise<string | undefined> {
-		const result = await run(["git", "rev-parse", "HEAD"], { cwd }).catch(() => null);
+	/**
+	 * Automatically triggers compaction via "/compact" if measured token usage
+	 * reaches or exceeds the compaction threshold (default: 300,000 tokens).
+	 * Maintenance output is suppressed so the client's conversation view is unaffected.
+	 */
+	private async maybeAutoCompact(
+		child: AcpChild,
+		session: SessionState,
+		profile: Profile,
+	): Promise<void> {
+		if (this.compactionThreshold <= 0 || session.cancelled) return;
+		const profileHome = profileHomeOf(profile);
+		const usage = resolveSessionTokenUsage(profileHome, session.childSessionId);
+		if (!usage || usage.usedTokens < this.compactionThreshold) return;
+
+		this.log(
+			`token usage (${usage.usedTokens}) reached threshold (${this.compactionThreshold}) on ${profile.slug} session=${session.id}; triggering auto-compaction`,
+		);
+
+		const compactionTurn: TurnState = {
+			assistantText: "",
+			toolTitles: [],
+			forwardedOutput: false,
+			suppressUserChunk: true,
+			suppressOutput: true,
+			daemonTasks: new Map(),
+		};
+		session.activeTurn = compactionTurn;
+
+		try {
+			const compactPromise = child.request("session/prompt", {
+				sessionId: session.childSessionId,
+				prompt: [{ type: "text", text: "/compact" }],
+			});
+			const timeoutPromise = new Promise<never>((_, reject) =>
+				setTimeout(() => reject(new Error("auto-compaction timed out after 30s")), 30_000),
+			);
+			const compactResponse = await Promise.race([compactPromise, timeoutPromise]);
+			if (compactResponse.error) {
+				this.log(
+					`auto-compaction prompt failed on ${profile.slug} session=${session.id}: ${compactResponse.error.message}`,
+				);
+			} else {
+				const afterUsage = resolveSessionTokenUsage(profileHome, session.childSessionId);
+				this.log(
+					`auto-compaction completed on ${profile.slug} session=${session.id}: ${usage.usedTokens} -> ${afterUsage?.usedTokens ?? "unknown"} tokens`,
+				);
+			}
+		} catch (error) {
+			this.log(`auto-compaction error on ${profile.slug} session=${session.id}: ${errorMessage(error)}`);
+		} finally {
+			if (session.activeTurn === compactionTurn) {
+				session.activeTurn = undefined;
+			}
+		}
+	}
+
+	/** Waits for a daemon wake-up, staying responsive to `session/cancel`. */
+	private async waitForDaemon(ms: number, session: SessionState): Promise<void> {
+		const deadline = Date.now() + Math.max(0, ms);
+		while (!session.cancelled && Date.now() < deadline) {
+			await new Promise(resolve => setTimeout(resolve, Math.min(250, deadline - Date.now())));
+		}
+	}
+
+	private async gitHead(cwd: string): Promise<string | undefined> {		const result = await run(["git", "rev-parse", "HEAD"], { cwd }).catch(() => null);
 		if (!result || result.exitCode !== 0) return undefined;
 		return result.stdout.trim() || undefined;
 	}

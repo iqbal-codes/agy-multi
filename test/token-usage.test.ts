@@ -1,5 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { resolveSessionTokenUsage, readLatestTokenUsage } from "../src/acp/token-usage";
+import {
+	resolveSessionTokenUsage,
+	readLatestTokenUsage,
+	resolveCompactionThreshold,
+	extractCompactionThresholdArg,
+	DEFAULT_COMPACTION_THRESHOLD,
+} from "../src/acp/token-usage";
 import { join } from "node:path";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -65,5 +71,50 @@ describe("token usage helper", () => {
 		expect(usage?.outputTokens).toBe(50);
 
 		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("resolves compaction threshold with proper precedence and fallback", async () => {
+		expect(DEFAULT_COMPACTION_THRESHOLD).toBe(300_000);
+		expect(resolveCompactionThreshold(undefined, {}, "")).toBe(300_000);
+		expect(resolveCompactionThreshold(50_000, {}, "")).toBe(50_000);
+		expect(resolveCompactionThreshold(0, {}, "")).toBe(0);
+
+		// Environment variable
+		expect(resolveCompactionThreshold(undefined, { AGY_COMPACTION_THRESHOLD: "200000" }, "")).toBe(200_000);
+		expect(resolveCompactionThreshold(undefined, { AGY_MULTI_COMPACTION_THRESHOLD: "150000" }, "")).toBe(150_000);
+		// Explicit option overrides env
+		expect(resolveCompactionThreshold(100_000, { AGY_COMPACTION_THRESHOLD: "200000" }, "")).toBe(100_000);
+
+		// Settings file
+		const dir = await mkdtemp(join(tmpdir(), "agy-settings-test-"));
+		try {
+			const geminiDir = join(dir, ".gemini", "antigravity-cli");
+			await mkdir(geminiDir, { recursive: true });
+			await writeFile(join(geminiDir, "settings.json"), JSON.stringify({ compactionThreshold: 220_000 }));
+			expect(resolveCompactionThreshold(undefined, {}, dir)).toBe(220_000);
+			// Env overrides settings
+			expect(resolveCompactionThreshold(undefined, { AGY_COMPACTION_THRESHOLD: "180000" }, dir)).toBe(180_000);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("extracts --compaction-threshold argument cleanly from argv", () => {
+		expect(extractCompactionThresholdArg(["--foo", "bar"])).toEqual({
+			threshold: undefined,
+			remainingArgs: ["--foo", "bar"],
+		});
+		expect(extractCompactionThresholdArg(["--compaction-threshold", "250000", "--clean"])).toEqual({
+			threshold: 250_000,
+			remainingArgs: ["--clean"],
+		});
+		expect(extractCompactionThresholdArg(["--foo", "--compaction-threshold=400000", "--bar"])).toEqual({
+			threshold: 400_000,
+			remainingArgs: ["--foo", "--bar"],
+		});
+		expect(extractCompactionThresholdArg(["--compaction-threshold", "0"])).toEqual({
+			threshold: 0,
+			remainingArgs: [],
+		});
 	});
 });
