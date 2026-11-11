@@ -102,6 +102,7 @@ class AcpProxy {
 	private readonly unknownUpdates = new Map<string, JsonRpcMessage[]>();
 	private readonly usageCache = new Map<string, { snapshot: UsageSnapshot | null; at: number }>();
 	private readonly usageInflight = new Map<string, Promise<UsageSnapshot | null>>();
+	private readonly usageAbort = new AbortController();
 	private readonly deletedSessionIds = new Set<string>();
 
 	private profiles = new Map<string, Profile>();
@@ -156,6 +157,7 @@ class AcpProxy {
 	private shutdown(): void {
 		if (this.shuttingDown) return;
 		this.shuttingDown = true;
+		this.usageAbort.abort();
 		for (const child of this.children.values()) child.kill();
 		this.children.clear();
 		process.exit(0);
@@ -638,7 +640,7 @@ class AcpProxy {
 	private refreshUsageInBackground(profile: Profile): void {
 		if (profile.authRequiredAt || profile.bannedAt || profile.disabled) return;
 		if (this.usageInflight.has(profile.slug)) return;
-		const promise = fetchUsage(profile)
+		const promise = fetchUsage(profile, undefined, this.usageAbort.signal)
 			.catch(() => null)
 			.then(snapshot => {
 				if (snapshot) {
@@ -671,7 +673,7 @@ class AcpProxy {
 
 		const inflight = this.usageInflight.get(profile.slug);
 		if (inflight && !force) return inflight;
-		const promise = fetchUsage(profile)
+		const promise = fetchUsage(profile, undefined, this.usageAbort.signal)
 			.catch(() => null)
 			.then(snapshot => {
 				if (snapshot) {

@@ -1,8 +1,8 @@
 import { join } from "node:path";
 import { AGY_BIN, profileDir } from "./paths";
-import { profileEnvOf, profileHomeOf } from "./registry";
+import { profileEnvOf } from "./registry";
 import type { Family, Profile, UsageSnapshot, UsageWindow, WindowId } from "./types";
-import { readJson, run, writeJsonAtomic } from "./fs-utils";
+import { readJson, writeJsonAtomic } from "./fs-utils";
 import { hasValidAuth } from "./profile";
 
 export function profileUsagePath(slug: string): string {
@@ -90,32 +90,56 @@ export function blockingReset(snapshot: UsageSnapshot | null, family: Family, no
 	return resets.length ? Math.min(...resets) : undefined;
 }
 
-export async function fetchUsage(profile: Profile, timeoutMs = 30_000): Promise<UsageSnapshot | null> {
-	if (profile.authRequiredAt || profile.bannedAt) return null;
+export async function fetchUsage(profile: Profile, timeoutMs = 30_000, signal?: AbortSignal): Promise<UsageSnapshot | null> {
+	if (signal?.aborted || profile.authRequiredAt || profile.bannedAt || profile.disabled) return null;
 	// Do not run interactive agy usage check if account has no credentials (avoids unexpected browser popups)
 	if (!(await hasValidAuth(profile))) {
 		return null;
 	}
+	// Shutdown can happen while the credential-presence check is pending.
+	if (signal?.aborted) return null;
 	const logPath = join(profileDir(profile.slug), "usage.log");
 	const proc = Bun.spawn(
 		[AGY_BIN, "-p", "/usage", "--output-format", "json", "--log-file", logPath],
 		{
+			// Host ACP probes terminate their process group after session/new.
+			// Keep that SIGTERM away from the CLI's credential-reader subprocess:
+			// the official CLI treats an interrupted read as a request to log in.
+			detached: process.platform !== "win32",
 			env: {
 				...profileEnvOf(profile),
-				BROWSER: "/usr/bin/true", // Safety: never spawn browser tabs during background usage checks
+				BROWSER: "/usr/bin/true", // Best effort only: macOS CLI can invoke open directly.
 			},
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
 		},
 	);
-	const timer = setTimeout(() => proc.kill(), timeoutMs);
+	let cancelled = false;
+	const cancel = () => {
+		cancelled = true;
+		// SIGTERM can run the CLI's interactive OAuth fallback. Kill the owned
+		// process group atomically, including credential readers and MCP children.
+		if (process.platform === "win32") {
+			proc.kill("SIGKILL");
+		} else {
+			try {
+				process.kill(-proc.pid, "SIGKILL");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			}
+		}
+	};
+	const timer = setTimeout(cancel, timeoutMs);
+	signal?.addEventListener("abort", cancel, { once: true });
+	if (signal?.aborted) cancel();
 	try {
 		const [stdout, stderr] = await Promise.all([
 			new Response(proc.stdout).text(),
 			new Response(proc.stderr).text(),
 		]);
-		await proc.exited;
+		const exitCode = await proc.exited;
+		if (cancelled || exitCode !== 0) return null;
 		if (stderr.trim() && !stdout.trim()) return null;
 		let parsed: { status?: string; response?: string };
 		try {
@@ -130,9 +154,10 @@ export async function fetchUsage(profile: Profile, timeoutMs = 30_000): Promise<
 			windows: parseUsageTable(parsed.response),
 			raw: parsed.response,
 		};
-		void writeCachedUsage(snapshot).catch(() => {});
+		await writeCachedUsage(snapshot).catch(() => {});
 		return snapshot;
 	} finally {
 		clearTimeout(timer);
+		signal?.removeEventListener("abort", cancel);
 	}
 }
