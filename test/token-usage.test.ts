@@ -3,8 +3,10 @@ import {
 	resolveSessionTokenUsage,
 	readLatestTokenUsage,
 	resolveCompactionThreshold,
+	resolveModelContextWindow,
 	extractCompactionThresholdArg,
 	DEFAULT_COMPACTION_THRESHOLD,
+	DEFAULT_MODEL_CONTEXT_WINDOW,
 } from "../src/acp/token-usage";
 import { join } from "node:path";
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
@@ -116,5 +118,15 @@ describe("token usage helper", () => {
 			threshold: 0,
 			remainingArgs: [],
 		});
+	});
+
+	it("resolves model context window based on modelId", () => {
+		expect(DEFAULT_MODEL_CONTEXT_WINDOW).toBe(1_048_576);
+		expect(resolveModelContextWindow(undefined)).toBe(1_048_576);
+		expect(resolveModelContextWindow("gemini-3.8-flash")).toBe(1_048_576);
+		expect(resolveModelContextWindow("gemini-3.8-flash-high")).toBe(1_048_576);
+		expect(resolveModelContextWindow("gemini-2.5-pro")).toBe(2_097_152);
+		expect(resolveModelContextWindow("claude-3-7-sonnet")).toBe(200_000);
+		expect(resolveModelContextWindow("gpt-4o")).toBe(128_000);
 	});
 });

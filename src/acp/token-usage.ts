@@ -2,6 +2,21 @@ import { existsSync, openSync, readSync, readFileSync, statSync, closeSync } fro
 import { join } from "node:path";
 
 export const DEFAULT_COMPACTION_THRESHOLD = 300_000;
+export const DEFAULT_MODEL_CONTEXT_WINDOW = 1_048_576;
+
+/**
+ * Resolves model context window capacity (in tokens) based on model identifier.
+ * Defaults to 1,048,576 (1M tokens) for Gemini Flash, 2,097,152 for Pro,
+ * 200,000 for Claude, and 128,000 for GPT models.
+ */
+export function resolveModelContextWindow(modelId?: string): number {
+	if (!modelId) return DEFAULT_MODEL_CONTEXT_WINDOW;
+	const id = modelId.toLowerCase();
+	if (id.includes("pro")) return 2_097_152;
+	if (id.includes("claude")) return 200_000;
+	if (id.includes("gpt") || id.includes("o1") || id.includes("o3")) return 128_000;
+	return DEFAULT_MODEL_CONTEXT_WINDOW;
+}
 
 export interface TokenUsageResult {
 	usedTokens: number;
