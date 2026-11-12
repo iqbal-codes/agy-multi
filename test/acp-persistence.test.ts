@@ -50,6 +50,14 @@ createInterface({ input: process.stdin }).on("line", line => {
     }
     return ok({});
   }
+  if (m.method === "session/test_tool_call") {
+    update({ sessionUpdate: "tool_call", title: "read_file" });
+    if (p.finish) {
+      send({ jsonrpc: "2.0", id: heldPrompts.get(p.sessionId), result: { stopReason: "end_turn" } });
+      heldPrompts.delete(p.sessionId);
+    }
+    return ok({});
+  }
   if (m.method === "session/prompt") {
     if (control.hold) {
       heldPrompts.set(p.sessionId, m.id);
@@ -211,6 +219,65 @@ test("unknown model capacity does not produce a fabricated context meter", async
 	try {
 		const c = await f.start(); const id = await c.newSession(); await c.prompt(id, "FIRST");
 		expect(c.notifications.filter(n => n.params?.update.sessionUpdate === "usage_update")).toEqual([]);
+	} finally { await f.cleanup(); }
+});
+
+test("transcript token usage broadcasts usage_update when child emits no native usage", async () => {
+	const f = await fixture();
+	try {
+		const c = await f.start(); const id = await c.newSession();
+		const store = await f.store();
+		const childId = store[id].childSessionId;
+		const profile = store[id].profile;
+		const targetDir = join(f.root, "profiles", profile, "home", ".gemini", "antigravity-cli", "brain", childId, ".system_generated", "logs");
+		await mkdir(targetDir, { recursive: true });
+		await writeFile(join(targetDir, "transcript.jsonl"), JSON.stringify({ input_tokens: 1500, cache_read_tokens: 3500, output_tokens: 200 }) + "\n");
+
+		await c.prompt(id, "FIRST");
+		const updates = c.notifications.filter(n => n.params?.update.sessionUpdate === "usage_update");
+		expect(updates.length).toBeGreaterThanOrEqual(1);
+		expect(updates.at(-1)?.params).toEqual({
+			sessionId: id,
+			update: { sessionUpdate: "usage_update", used: 5200, size: 1048576 },
+		});
+	} finally { await f.cleanup(); }
+});
+
+test("transcript token usage broadcasts realtime usage_update during active turn on tool calls", async () => {
+	const f = await fixture();
+	try {
+		await f.control({ hold: true });
+		const c = await f.start(); const id = await c.newSession();
+		const store = await f.store();
+		const childId = store[id].childSessionId;
+		const profile = store[id].profile;
+		const targetDir = join(f.root, "profiles", profile, "home", ".gemini", "antigravity-cli", "brain", childId, ".system_generated", "logs");
+		await mkdir(targetDir, { recursive: true });
+		await writeFile(join(targetDir, "transcript.jsonl"), JSON.stringify({ input_tokens: 1000, cache_read_tokens: 2000, output_tokens: 100 }) + "\n");
+
+		let finished = false;
+		const started = c.waitForUpdate("agent_message_chunk");
+		const prompt = c.prompt(id, "LONG_RUNNING").then(reply => { finished = true; return reply; });
+		await started;
+
+		// Write new step to transcript while prompt is in-flight
+		await writeFile(join(targetDir, "transcript.jsonl"), [
+			JSON.stringify({ input_tokens: 1000, cache_read_tokens: 2000, output_tokens: 100 }),
+			JSON.stringify({ input_tokens: 2000, cache_read_tokens: 4000, output_tokens: 250 }),
+		].join("\n") + "\n");
+
+		const usagePromise = c.waitForUpdate("usage_update");
+		expect((await c.request("session/test_tool_call", { sessionId: id })).error).toBeUndefined();
+		const update = await usagePromise;
+		expect(update.params).toEqual({
+			sessionId: id,
+			update: { sessionUpdate: "usage_update", used: 6250, size: 1048576 },
+		});
+		expect(finished).toBe(false);
+
+		await c.request("session/test_tool_call", { sessionId: id, finish: true });
+		expect((await prompt).error).toBeUndefined();
+		expect(finished).toBe(true);
 	} finally { await f.cleanup(); }
 });
 

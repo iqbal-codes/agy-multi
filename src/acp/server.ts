@@ -35,7 +35,12 @@ import {
 	type JsonRpcResponse,
 } from "./rpc";
 import { loadAcpSessions, saveAcpSessions, type AcpSessionRecord, type AcpSessionStore } from "./session-store";
-import { resolveCompactionThreshold, resolveSessionTokenUsage, DEFAULT_COMPACTION_THRESHOLD } from "./token-usage";
+import {
+	resolveCompactionThreshold,
+	resolveSessionTokenUsage,
+	resolveModelContextWindow,
+	DEFAULT_COMPACTION_THRESHOLD,
+} from "./token-usage";
 
 export interface AcpProxyOptions {
 	agyBin?: string;
@@ -53,6 +58,7 @@ interface TurnState {
 	forwardedOutput: boolean;
 	suppressUserChunk: boolean;
 	suppressOutput?: boolean;
+	seenUsageUpdate?: boolean;
 	/** Daemon tasks the mirrored tool calls referenced; the turn is held while any still runs. */
 	daemonTasks: Map<string, { waitUntil?: number }>;
 }
@@ -76,6 +82,8 @@ interface SessionState {
 	/** Updates received before the client saw `session/new`; flushed after it. */
 	pendingOut?: unknown[];
 	closed?: boolean;
+	lastBroadcastedUsedTokens?: number;
+	lastBroadcastCheckAt?: number;
 	record: AcpSessionRecord;
 }
 
@@ -337,12 +345,14 @@ class AcpProxy {
 			}
 			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
+			this.maybeBroadcastRealtimeUsage(session);
 			return;
 		}
 		if (kind === "agent_thought_chunk") {
 			if (session.activeTurn) session.activeTurn.forwardedOutput = true;
 			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
+			this.maybeBroadcastRealtimeUsage(session);
 			return;
 		}
 		if (kind === "user_message_chunk") {
@@ -363,12 +373,14 @@ class AcpProxy {
 			}
 			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
+			this.maybeBroadcastRealtimeUsage(session, true);
 			return;
 		}
 		if (kind === "plan") {
 			if (session.activeTurn) session.activeTurn.forwardedOutput = true;
 			if (session.activeTurn?.suppressOutput) return;
 			deliver(outMessage);
+			this.maybeBroadcastRealtimeUsage(session, true);
 			return;
 		}
 		if (kind === "session_info_update") {
@@ -378,6 +390,11 @@ class AcpProxy {
 				session.record.updatedAt = new Date().toISOString();
 				void this.saveStore().catch(error => this.log(`failed to persist session title: ${errorMessage(error)}`));
 			}
+			deliver(outMessage);
+			return;
+		}
+		if (kind === "usage_update") {
+			if (session.activeTurn) session.activeTurn.seenUsageUpdate = true;
 			deliver(outMessage);
 			return;
 		}
@@ -507,6 +524,39 @@ class AcpProxy {
 				update: {
 					sessionUpdate: "available_commands_update",
 					availableCommands: commands,
+				},
+			},
+		});
+	}
+
+	private maybeBroadcastRealtimeUsage(session: SessionState, immediate = false): void {
+		if (session.loading || session.activeTurn?.suppressOutput || session.activeTurn?.seenUsageUpdate) return;
+		const now = Date.now();
+		if (!immediate && now - (session.lastBroadcastCheckAt ?? 0) < 500) {
+			return;
+		}
+		session.lastBroadcastCheckAt = now;
+		this.broadcastUsageUpdate(session);
+	}
+
+	private broadcastUsageUpdate(session: SessionState, profile?: Profile): void {
+		const targetProfile = profile ?? this.profiles.get(session.profile);
+		if (!targetProfile) return;
+		const profileHome = profileHomeOf(targetProfile);
+		const usage = resolveSessionTokenUsage(profileHome, session.childSessionId);
+		if (!usage) return;
+		if (usage.usedTokens === session.lastBroadcastedUsedTokens) return;
+		session.lastBroadcastedUsedTokens = usage.usedTokens;
+		const maxTokens = resolveModelContextWindow(session.modelId);
+		this.sendToClient({
+			jsonrpc: "2.0",
+			method: "session/update",
+			params: {
+				sessionId: session.id,
+				update: {
+					sessionUpdate: "usage_update",
+					used: usage.usedTokens,
+					size: maxTokens,
 				},
 			},
 		});
@@ -926,6 +976,7 @@ class AcpProxy {
 				typeof result.sessionId === "string" ? { ...result, sessionId: requestedId } : result,
 			);
 			this.broadcastAvailableCommands(createdSession);
+			this.broadcastUsageUpdate(createdSession, profile);
 			return;
 		}
 
@@ -990,6 +1041,7 @@ class AcpProxy {
 			typeof result.sessionId === "string" ? { ...result, sessionId: requestedId } : result,
 		);
 		this.broadcastAvailableCommands(session);
+		this.broadcastUsageUpdate(session, profile);
 	}
 
 	private onSessionList(request: JsonRpcRequest): void {
@@ -1404,7 +1456,11 @@ class AcpProxy {
 			await saveProfile(profile);
 			await this.saveStore();
 
-			await this.maybeAutoCompact(child, session, profile);
+			const autoCompacted = await this.maybeAutoCompact(child, session, profile);
+
+			if (!turn.seenUsageUpdate || autoCompacted) {
+				this.broadcastUsageUpdate(session, profile);
+			}
 
 			this.respond(clientId, response.result ?? { stopReason });
 		} catch (error) {
@@ -1422,11 +1478,11 @@ class AcpProxy {
 		child: AcpChild,
 		session: SessionState,
 		profile: Profile,
-	): Promise<void> {
-		if (this.compactionThreshold <= 0 || session.cancelled) return;
+	): Promise<boolean> {
+		if (this.compactionThreshold <= 0 || session.cancelled) return false;
 		const profileHome = profileHomeOf(profile);
 		const usage = resolveSessionTokenUsage(profileHome, session.childSessionId);
-		if (!usage || usage.usedTokens < this.compactionThreshold) return;
+		if (!usage || usage.usedTokens < this.compactionThreshold) return false;
 
 		this.log(
 			`token usage (${usage.usedTokens}) reached threshold (${this.compactionThreshold}) on ${profile.slug} session=${session.id}; triggering auto-compaction`,
@@ -1455,14 +1511,17 @@ class AcpProxy {
 				this.log(
 					`auto-compaction prompt failed on ${profile.slug} session=${session.id}: ${compactResponse.error.message}`,
 				);
+				return false;
 			} else {
 				const afterUsage = resolveSessionTokenUsage(profileHome, session.childSessionId);
 				this.log(
 					`auto-compaction completed on ${profile.slug} session=${session.id}: ${usage.usedTokens} -> ${afterUsage?.usedTokens ?? "unknown"} tokens`,
 				);
+				return true;
 			}
 		} catch (error) {
 			this.log(`auto-compaction error on ${profile.slug} session=${session.id}: ${errorMessage(error)}`);
+			return false;
 		} finally {
 			if (session.activeTurn === compactionTurn) {
 				session.activeTurn = undefined;
