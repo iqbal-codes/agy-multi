@@ -1,15 +1,34 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { classifyAcpError, isSessionLostError } from "../classify";
+import { classifyAcpError, isModelUnsupportedError, isSessionLostError } from "../classify";
 import { exists, run } from "../fs-utils";
-import { AGY_BIN, ACP_SESSIONS_PATH, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, USAGE_TTL_MS, profileHome } from "../paths";
+import {
+	AGY_BIN,
+	ACP_SESSIONS_PATH,
+	DEFAULT_BLOCK_MS,
+	DEFAULT_RESERVE_PCT,
+	MODELS_TTL_MS,
+	USAGE_TTL_MS,
+	profileHome,
+} from "../paths";
 import { listProfiles, profileHomeOf, saveProfile } from "../registry";
 import { block, isBlocked, loadState, saveState } from "../state";
 import { rankProfiles } from "../select";
 import { syncProfiles } from "../profile";
 import { listUserSkills } from "../injection";
-import type { FailureKind, Family, Profile, UsageSnapshot, WrapperState } from "../types";
+import type { FailureKind, Family, ModelsSnapshot, Profile, UsageSnapshot, WrapperState } from "../types";
 import { blockingReset, familyForModel, fetchUsage, minRemaining, readCachedUsage } from "../usage";
+import {
+	deriveBaseConfigOptions,
+	extractAcpModelsFromResult,
+	fetchModels,
+	isModelKnownUnsupported,
+	mergeConfigOptionLists,
+	mergeModelLists,
+	readCachedModels,
+	withoutUnsupportedModel,
+	writeCachedModels,
+} from "../models";
 import { AcpChild, AcpRpcError } from "./child";
 import {
 	DAEMON_HOLD_MAX_CONTINUATIONS,
@@ -125,6 +144,8 @@ class AcpProxy {
 	private readonly unknownUpdates = new Map<string, JsonRpcMessage[]>();
 	private readonly usageCache = new Map<string, { snapshot: UsageSnapshot | null; at: number }>();
 	private readonly usageInflight = new Map<string, Promise<UsageSnapshot | null>>();
+	private readonly modelsCache = new Map<string, { snapshot: ModelsSnapshot | null; at: number }>();
+	private readonly modelsInflight = new Map<string, Promise<ModelsSnapshot | null>>();
 	private readonly usageAbort = new AbortController();
 	private readonly deletedSessionIds = new Set<string>();
 
@@ -154,9 +175,15 @@ class AcpProxy {
 		this.store = await loadAcpSessions(this.sessionsPath);
 		await Promise.all(
 			[...this.profiles.values()].map(async profile => {
-				const diskCached = await readCachedUsage(profile.slug);
+				const [diskCached, diskModels] = await Promise.all([
+					readCachedUsage(profile.slug),
+					readCachedModels(profile.slug),
+				]);
 				if (diskCached) {
 					this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
+				}
+				if (diskModels) {
+					this.modelsCache.set(profile.slug, { snapshot: diskModels, at: diskModels.fetchedAt });
 				}
 			}),
 		);
@@ -673,22 +700,32 @@ class AcpProxy {
 	): Promise<Profile[]> {
 		const candidates = [...this.profiles.values()].filter(profile => !options.exclude?.includes(profile.slug));
 		const usage = new Map<string, UsageSnapshot | null>();
+		const models = new Map<string, ModelsSnapshot | null>();
 		await Promise.all(
 			candidates.map(async profile => {
-				usage.set(profile.slug, await this.getUsage(profile));
+				const [u, m] = await Promise.all([this.getUsage(profile), this.getModels(profile)]);
+				usage.set(profile.slug, u);
+				models.set(profile.slug, m);
 			}),
 		);
 		const slugs = rankProfiles(candidates, usage, this.state, {
 			modelId: options.modelId,
 			now: Date.now(),
 			reservePct: this.reservePct,
+			...(options.modelId ? { models } : {}),
 		});
 		const bySlug = new Map(candidates.map(profile => [profile.slug, profile]));
 		let ranked = slugs.map(slug => bySlug.get(slug)).filter((profile): profile is Profile => Boolean(profile));
 
 		if (!ranked.length && options.allowBlocked) {
 			ranked = candidates
-				.filter(profile => !profile.bannedAt && !profile.authRequiredAt && !profile.disabled)
+				.filter(
+					profile =>
+						!profile.bannedAt &&
+						!profile.authRequiredAt &&
+						!profile.disabled &&
+						!isModelKnownUnsupported(models.get(profile.slug), options.modelId),
+				)
 				.sort(
 					(a, b) =>
 						(this.blockReset(a.slug, options.modelId) ?? Number.POSITIVE_INFINITY) -
@@ -759,6 +796,97 @@ class AcpProxy {
 			});
 		this.usageInflight.set(profile.slug, promise);
 		return promise;
+	}
+
+	private refreshModelsInBackground(profile: Profile): void {
+		if (profile.authRequiredAt || profile.bannedAt || profile.disabled) return;
+		if (this.modelsInflight.has(profile.slug)) return;
+		const promise = fetchModels(profile, undefined, this.usageAbort.signal)
+			.catch(() => null)
+			.then(snapshot => {
+				if (snapshot) {
+					this.modelsCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
+				}
+				this.modelsInflight.delete(profile.slug);
+				return snapshot;
+			});
+		this.modelsInflight.set(profile.slug, promise);
+	}
+
+	private async getModels(profile: Profile): Promise<ModelsSnapshot | null> {
+		const now = Date.now();
+		const cached = this.modelsCache.get(profile.slug);
+		if (cached && now - cached.at < MODELS_TTL_MS) return cached.snapshot;
+
+		const diskCached = await readCachedModels(profile.slug);
+		if (diskCached) {
+			this.modelsCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
+			if (now - diskCached.fetchedAt < MODELS_TTL_MS) {
+				return diskCached;
+			}
+			this.refreshModelsInBackground(profile);
+			return diskCached;
+		}
+		this.refreshModelsInBackground(profile);
+		return null;
+	}
+
+	private recordDiscoveredModels(profile: Profile, result: Record<string, unknown>): void {
+		const { models, configOptions } = extractAcpModelsFromResult(result);
+		if (models.length === 0) return;
+		const snapshot: ModelsSnapshot = {
+			profile: profile.slug,
+			fetchedAt: Date.now(),
+			models,
+			configOptions: configOptions.length > 0 ? configOptions : deriveBaseConfigOptions(models),
+		};
+		this.modelsCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
+		void writeCachedModels(snapshot).catch(() => {});
+	}
+
+	private async markModelUnsupported(profile: Profile, modelId: string): Promise<void> {
+		const existing = this.modelsCache.get(profile.slug)?.snapshot ?? (await readCachedModels(profile.slug));
+		const updated = withoutUnsupportedModel(existing, modelId);
+		if (updated) {
+			this.modelsCache.set(profile.slug, { snapshot: updated, at: updated.fetchedAt });
+			await writeCachedModels(updated).catch(() => {});
+		}
+		this.refreshModelsInBackground(profile);
+	}
+
+	private mergeSessionModelsResult(result: Record<string, unknown>): Record<string, unknown> {
+		const healthySnapshots = [...this.profiles.values()]
+			.filter(p => !p.bannedAt && !p.authRequiredAt && !p.disabled)
+			.map(p => this.modelsCache.get(p.slug)?.snapshot)
+			.filter((s): s is ModelsSnapshot => Boolean(s && s.models.length > 0));
+		if (healthySnapshots.length === 0) return result;
+
+		const extracted = extractAcpModelsFromResult(result);
+		const mergedAvailable = mergeModelLists([
+			...healthySnapshots.map(s => s.models),
+			extracted.models,
+		]);
+		const mergedConfigChoices = mergeConfigOptionLists([
+			...healthySnapshots.map(s => s.configOptions ?? deriveBaseConfigOptions(s.models)),
+			extracted.configOptions,
+		]);
+
+		let nextResult: Record<string, unknown> = result;
+		if (mergedAvailable.length > 0 && isRecord(result.models)) {
+			nextResult = {
+				...nextResult,
+				models: { ...result.models, availableModels: mergedAvailable },
+			};
+		}
+		if (mergedConfigChoices.length > 0 && Array.isArray(result.configOptions)) {
+			nextResult = {
+				...nextResult,
+				configOptions: result.configOptions.map(opt =>
+					isRecord(opt) && opt.id === "model" ? { ...opt, options: mergedConfigChoices } : opt,
+				),
+			};
+		}
+		return nextResult;
 	}
 
 	private async isLowQuota(profile: Profile, family: Family): Promise<boolean> {
@@ -850,6 +978,7 @@ class AcpProxy {
 				const childSessionId = readString(result.sessionId);
 				if (!childSessionId) throw new Error("agent returned no sessionId for session/new");
 
+				this.recordDiscoveredModels(profile, result);
 				const proxySessionId = randomUUID();
 				const now = new Date().toISOString();
 				const record: AcpSessionRecord = {
@@ -877,7 +1006,7 @@ class AcpProxy {
 					this.unknownUpdates.delete(key);
 					for (const message of buffered) this.handleAgentNotification(child, message);
 				}
-				this.respond(request.id, { ...result, sessionId: proxySessionId });
+				this.respond(request.id, { ...this.mergeSessionModelsResult(result), sessionId: proxySessionId });
 				this.drainPendingOut(session);
 				this.broadcastAvailableCommands(session);
 				return;
@@ -1031,6 +1160,7 @@ class AcpProxy {
 			session.record.additionalDirectories = additionalDirectories;
 		}
 		const result = isRecord(response.result) ? response.result : {};
+		this.recordDiscoveredModels(profile, result);
 		const models = isRecord(result.models) ? result.models : undefined;
 		if (models && typeof models.currentModelId === "string") session.modelId = models.currentModelId;
 		session.record.cwd = cwd;
@@ -1109,6 +1239,8 @@ class AcpProxy {
 		const response = await child.request("session/fork", { ...params, sessionId: session.childSessionId });
 		if (response.error) throw new AcpRpcError(response.error);
 		const result = isRecord(response.result) ? response.result : {};
+		const forkProfile = this.profiles.get(session.profile);
+		if (forkProfile) this.recordDiscoveredModels(forkProfile, result);
 		const childSessionId = readString(result.sessionId);
 		if (!childSessionId) throw new Error("agent returned no sessionId for session/fork");
 
@@ -1139,40 +1271,143 @@ class AcpProxy {
 		const params = isRecord(request.params) ? request.params : {};
 		const sessionId = readString(params.sessionId);
 		const session = sessionId ? this.sessions.get(sessionId) : undefined;
-		const child = session ? await this.ensureSessionChild(session) : await this.ensureControlChild();
-		const payload = session ? { ...params, sessionId: session.childSessionId } : params;
-		const response = await child.request(request.method, payload);
-		if (response.error) throw new AcpRpcError(response.error);
-
 		if (session && request.method === "session/set_model") {
 			const modelId = readString(params.modelId);
 			if (modelId) {
-				session.modelId = modelId;
-				session.record.updatedAt = new Date().toISOString();
-				const profile = this.profiles.get(session.profile);
-				if (profile) {
-					const family = familyForModel(modelId);
-					if (
-						isBlocked(this.state, profile.slug, family, Date.now()) ||
-						(await this.isLowQuota(profile, family))
-					) {
-						session.needsHandoff = true;
-						session.handoffSessionReady = false;
-					}
-				}
-				await this.saveStore();
+				await this.handleModelChangeRequest(request, session, modelId, params);
+				return;
 			}
 		}
 		if (session && request.method === "session/set_config_option") {
 			const configId = readString(params.configId);
 			const value = params.value;
 			if (configId === "model" && typeof value === "string") {
-				session.modelId = value;
-				session.record.updatedAt = new Date().toISOString();
-				await this.saveStore();
+				await this.handleModelChangeRequest(request, session, value, params);
+				return;
 			}
 		}
+
+		const child = session ? await this.ensureSessionChild(session) : await this.ensureControlChild();
+		const payload = session ? { ...params, sessionId: session.childSessionId } : params;
+		const response = await child.request(request.method, payload);
+		if (response.error) throw new AcpRpcError(response.error);
 		this.respond(request.id, response.result ?? {});
+	}
+
+	private async handleModelChangeRequest(
+		request: JsonRpcRequest,
+		session: SessionState,
+		modelId: string,
+		params: Record<string, unknown>,
+	): Promise<void> {
+		session.modelId = modelId;
+		session.record.updatedAt = new Date().toISOString();
+		const currentProfile = this.profiles.get(session.profile);
+		const family = familyForModel(modelId);
+
+		let unsupportedOnCurrent = false;
+		let lastUnsupportedError: AcpRpcError | undefined;
+		if (currentProfile) {
+			const currentModels = await this.getModels(currentProfile);
+			unsupportedOnCurrent = isModelKnownUnsupported(currentModels, modelId);
+		}
+
+		if (currentProfile && !unsupportedOnCurrent) {
+			const child = await this.ensureSessionChild(session);
+			const response = await child.request(request.method, { ...params, sessionId: session.childSessionId });
+			if (!response.error) {
+				if (
+					isBlocked(this.state, currentProfile.slug, family, Date.now()) ||
+					(await this.isLowQuota(currentProfile, family))
+				) {
+					session.needsHandoff = true;
+					session.handoffSessionReady = false;
+				}
+				await this.saveStore();
+				this.respond(request.id, response.result ?? {});
+				return;
+			}
+			if (!isModelUnsupportedError(response.error)) {
+				throw new AcpRpcError(response.error);
+			}
+			unsupportedOnCurrent = true;
+			lastUnsupportedError = new AcpRpcError(response.error);
+			await this.markModelUnsupported(currentProfile, modelId);
+		}
+
+		const exclude = currentProfile ? [currentProfile.slug] : undefined;
+		const candidates = await this.rankCandidates({ modelId, exclude, allowBlocked: false });
+
+		if (session.history.length === 0) {
+			for (const candidate of candidates.slice(0, Math.min(candidates.length, 3))) {
+				try {
+					const nextChild = await this.ensureChild(candidate);
+					await nextChild.initialize(this.clientInitialize);
+					const created = await nextChild.request("session/new", {
+						cwd: session.cwd,
+						mcpServers: session.mcpServers,
+						...(session.additionalDirectories ? { additionalDirectories: session.additionalDirectories } : {}),
+					});
+					if (created.error) throw new AcpRpcError(created.error);
+					const createdResult = isRecord(created.result) ? created.result : {};
+					const createdId = readString(createdResult.sessionId);
+					if (!createdId) throw new Error("agent returned no sessionId for session/new");
+					this.recordDiscoveredModels(candidate, createdResult);
+
+					const apply = await nextChild.request(request.method, { ...params, sessionId: createdId });
+					if (apply.error) {
+						nextChild.loadedSessions.delete(createdId);
+						void nextChild.request("session/close", { sessionId: createdId }).catch(() => {});
+						if (isModelUnsupportedError(apply.error)) {
+							lastUnsupportedError = new AcpRpcError(apply.error);
+							await this.markModelUnsupported(candidate, modelId);
+							continue;
+						}
+						throw new AcpRpcError(apply.error);
+					}
+
+					const previousProfile = session.profile;
+					const previousId = session.childSessionId;
+					this.sessionsByChild.delete(this.childKey(previousProfile, previousId));
+					session.childSessionId = createdId;
+					session.profile = candidate.slug;
+					session.record.childSessionId = createdId;
+					session.record.profile = candidate.slug;
+					session.needsHandoff = false;
+					session.handoffSessionReady = false;
+					nextChild.loadedSessions.add(createdId);
+					this.sessionsByChild.set(this.childKey(candidate.slug, createdId), session);
+
+					const oldChild = this.children.get(previousProfile);
+					if (oldChild?.alive) {
+						oldChild.loadedSessions.delete(previousId);
+						void oldChild.request("session/close", { sessionId: previousId }).catch(() => {});
+					}
+					this.log(`switched session ${session.id} to ${candidate.slug} for model ${modelId}`);
+					await this.saveStore();
+					this.respond(request.id, apply.result ?? {});
+					return;
+				} catch (error) {
+					if (error instanceof AcpRpcError && !isModelUnsupportedError(error.rpcError)) {
+						throw error;
+					}
+					lastUnsupportedError = error instanceof AcpRpcError ? error : lastUnsupportedError;
+				}
+			}
+			if (lastUnsupportedError) throw lastUnsupportedError;
+			throw new Error(`no available account supports model ${modelId}`);
+		}
+
+		if (candidates.length > 0) {
+			session.needsHandoff = true;
+			session.handoffSessionReady = false;
+			await this.saveStore();
+			this.log(`deferred model switch for ${session.id} (${modelId}) to next handoff`);
+			this.respond(request.id, {});
+			return;
+		}
+		if (lastUnsupportedError) throw lastUnsupportedError;
+		throw new Error(`no available account supports model ${modelId}`);
 	}
 
 	// ---------------------------------------------------------------------
@@ -1222,7 +1457,8 @@ class AcpProxy {
 		} else {
 			const blocked = isBlocked(this.state, current.slug, family, Date.now());
 			const low = await this.isLowQuota(current, family);
-			const unhealthy = Boolean(current.bannedAt || current.authRequiredAt) || blocked;
+			const unsupported = isModelKnownUnsupported(await this.getModels(current), session.modelId);
+			const unhealthy = Boolean(current.bannedAt || current.authRequiredAt) || blocked || unsupported;
 			if (unhealthy || low) {
 				const candidates = await this.rankCandidates({
 					modelId: session.modelId,
@@ -1241,7 +1477,9 @@ class AcpProxy {
 						-32000,
 						current.bannedAt
 							? "all accounts are banned or unavailable"
-							: `all accounts are quota-blocked${until ? ` until ${new Date(until).toISOString()}` : ""}`,
+							: unsupported
+								? `no available account supports model ${session.modelId}`
+								: `all accounts are quota-blocked${until ? ` until ${new Date(until).toISOString()}` : ""}`,
 					);
 					return;
 				}
@@ -1288,6 +1526,7 @@ class AcpProxy {
 					const createdResult = isRecord(created.result) ? created.result : {};
 					const createdId = readString(createdResult.sessionId);
 					if (!createdId) throw new Error("agent returned no sessionId for handoff session/new");
+					this.recordDiscoveredModels(profile, createdResult);
 
 					const previousProfile = session.profile;
 					const previousId = session.childSessionId;
@@ -1319,7 +1558,22 @@ class AcpProxy {
 						sessionId: session.childSessionId,
 						modelId: session.modelId,
 					});
-					if (setModel.error) throw new AcpRpcError(setModel.error);
+					if (setModel.error) {
+						if (isModelUnsupportedError(setModel.error) && switches < this.maxSwitches) {
+							await this.markModelUnsupported(profile, session.modelId);
+							const candidates = await this.rankCandidates({
+								modelId: session.modelId,
+								exclude: [profile.slug],
+								allowBlocked: false,
+							});
+							const next = candidates[0];
+							if (next) {
+								await this.runPrompt(clientId, session, originalText, next, true, switches + 1);
+								return;
+							}
+						}
+						throw new AcpRpcError(setModel.error);
+					}
 				}
 				const gitHead = await this.gitHead(session.cwd);
 				text = buildHandoffPrompt({ history: session.history, cwd: session.cwd, gitHead });
@@ -1394,12 +1648,18 @@ class AcpProxy {
 
 			if (response.error) {
 				const isLost = isSessionLostError(response.error);
+				const isUnsupportedModel = Boolean(session.modelId) && isModelUnsupportedError(response.error);
 				const kind = classifyAcpError(response.error);
-				this.log(`prompt failed on ${profile.slug}: ${isLost ? "session_lost" : kind}: ${response.error.message}`);
-				if (!isLost) {
+				this.log(
+					`prompt failed on ${profile.slug}: ${isLost ? "session_lost" : isUnsupportedModel ? "model_unsupported" : kind}: ${response.error.message}`,
+				);
+				if (!isLost && !isUnsupportedModel) {
 					await this.recordFailure(profile, session, kind);
 				}
-				const switchable = isLost || kind === "quota" || kind === "banned" || kind === "auth";
+				if (isUnsupportedModel && session.modelId) {
+					await this.markModelUnsupported(profile, session.modelId);
+				}
+				const switchable = isLost || isUnsupportedModel || kind === "quota" || kind === "banned" || kind === "auth";
 				if (switchable && !turn.forwardedOutput && switches < this.maxSwitches) {
 					if (isLost) {
 						this.log(`recovering lost trajectory ${session.childSessionId} on ${profile.slug} via handoff`);

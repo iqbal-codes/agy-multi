@@ -1,11 +1,12 @@
 import { join } from "node:path";
-import { AGY_BIN, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, profileDir, USAGE_TTL_MS } from "./paths";
-import type { AgyResultEvent, Checkpoint, FailureKind, Profile, RunOutcome, UsageSnapshot } from "./types";
-import { classifyRun } from "./classify";
+import { AGY_BIN, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, MODELS_TTL_MS, profileDir, USAGE_TTL_MS } from "./paths";
+import type { AgyResultEvent, Checkpoint, FailureKind, ModelsSnapshot, Profile, RunOutcome, UsageSnapshot } from "./types";
+import { classifyRun, isModelUnsupportedError } from "./classify";
 import { ensureDir, run } from "./fs-utils";
 import { listProfiles, profileEnvOf, profileHomeOf, saveProfile } from "./registry";
 import { block, getCheckpoint, loadState, pin, pinnedProfile, saveState, setCheckpoint } from "./state";
 import { blockingReset, familyForModel, fetchUsage, readCachedUsage } from "./usage";
+import { fetchModels, readCachedModels, withoutUnsupportedModel, writeCachedModels } from "./models";
 import { rankProfiles } from "./select";
 import { buildInjectedPrompt } from "./injection";
 
@@ -137,6 +138,7 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 	const family = familyForModel(opts.model);
 	const now = Date.now();
 	const usage = new Map<string, UsageSnapshot | null>();
+	const models = new Map<string, ModelsSnapshot | null>();
 	await Promise.all(
 		candidates.map(async profile => {
 			const disk = await readCachedUsage(profile.slug);
@@ -146,6 +148,16 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 				const snapshot = await fetchUsage(profile).catch(() => null);
 				usage.set(profile.slug, snapshot ?? disk ?? null);
 			}
+
+			if (opts.model && !opts.onlyProfile) {
+				const cachedModels = await readCachedModels(profile.slug);
+				if (cachedModels && now - cachedModels.fetchedAt < MODELS_TTL_MS) {
+					models.set(profile.slug, cachedModels);
+				} else {
+					const fresh = await fetchModels(profile).catch(() => null);
+					models.set(profile.slug, fresh ?? cachedModels ?? null);
+				}
+			}
 		}),
 	);
 
@@ -153,7 +165,18 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 		modelId: opts.model,
 		now,
 		reservePct: DEFAULT_RESERVE_PCT,
+		...(opts.model && !opts.onlyProfile ? { models } : {}),
 	});
+	if (opts.model && !opts.onlyProfile && ranked.length === 0) {
+		const withoutModelFilter = rankProfiles(candidates, usage, state, {
+			modelId: opts.model,
+			now,
+			reservePct: DEFAULT_RESERVE_PCT,
+		});
+		if (withoutModelFilter.length > 0) {
+			throw new Error(`no available account supports model ${opts.model}`);
+		}
+	}
 	const owner = pinnedProfile(state, opts.conversationId);
 	const ordered = owner && ranked.includes(owner) ? [owner, ...ranked.filter(slug => slug !== owner)] : ranked;
 	// Unknown owner (conversation created outside the wrapper): assume the first
@@ -237,6 +260,14 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 				blockingReset(usage.get(slug) ?? null, family, Date.now()) ?? Date.now() + DEFAULT_BLOCK_MS;
 			block(state, slug, family, until);
 			await saveState(state);
+			continue;
+		}
+		if (opts.model && isModelUnsupportedError(`${outcome.stdout}\n${outcome.stderr}`)) {
+			const updated = withoutUnsupportedModel(models.get(slug) ?? (await readCachedModels(slug)), opts.model);
+			if (updated) {
+				models.set(slug, updated);
+				await writeCachedModels(updated).catch(() => {});
+			}
 			continue;
 		}
 		// transient/error: another account will not fix it.

@@ -58,3 +58,19 @@ export function isSessionLostError(error: unknown): boolean {
 		text,
 	);
 }
+
+/**
+ * Detect whether an error indicates the selected account/endpoint does not
+ * support or recognize the requested model ID.
+ */
+export function isModelUnsupportedError(error: unknown): boolean {
+	let text: string;
+	try {
+		text = typeof error === "string" ? error : JSON.stringify(error ?? "");
+	} catch {
+		text = String(error);
+	}
+	return /unknown model id|unsupported model|model\b[^.\n]*\bnot (?:found|supported|available)|does not support(?: the)? model/i.test(
+		text,
+	);
+}

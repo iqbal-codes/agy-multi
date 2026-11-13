@@ -15,6 +15,23 @@ export interface UsageSnapshot {
 	raw: string;
 }
 
+export interface ModelInfo {
+	modelId: string;
+	name?: string;
+}
+
+export interface ModelsSnapshot {
+	profile: string;
+	fetchedAt: number;
+	models: ModelInfo[];
+	configOptions?: ModelConfigOption[];
+}
+
+export interface ModelConfigOption {
+	value: string;
+	name?: string;
+}
+
 export type FailureKind = "ok" | "banned" | "quota" | "auth" | "transient" | "error";
 
 export interface Profile {

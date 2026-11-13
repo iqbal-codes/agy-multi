@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { classifyAcpError, isSessionLostError } from "../src/classify";
+import { classifyAcpError, isModelUnsupportedError, isSessionLostError } from "../src/classify";
 
 describe("ACP error classification", () => {
 	test("recognizes quota, ban and auth wording", () => {
@@ -31,5 +31,13 @@ describe("ACP error classification", () => {
 
 	test("leaves unrelated failures alone", () => {
 		expect(classifyAcpError({ message: "invalid params" })).toBe("error");
+	});
+
+	test("recognizes unsupported or unknown model errors", () => {
+		expect(isModelUnsupportedError({ code: -32602, message: "Unknown model ID: gemini-4-hydrogen-high" })).toBe(true);
+		expect(isModelUnsupportedError({ message: "Model gemini-4-argon is not supported for this account" })).toBe(true);
+		expect(isModelUnsupportedError("model not found: gemini-4-hydrogen")).toBe(true);
+		expect(isModelUnsupportedError({ message: "RESOURCE_EXHAUSTED: quota exceeded" })).toBe(false);
+		expect(isModelUnsupportedError({ message: "invalid params" })).toBe(false);
 	});
 });

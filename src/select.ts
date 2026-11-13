@@ -1,6 +1,7 @@
-import type { Profile, UsageSnapshot, WrapperState } from "./types";
+import type { ModelsSnapshot, Profile, UsageSnapshot, WrapperState } from "./types";
 import { blockingReset, familyForModel, minRemaining, windowRemaining, windowReset } from "./usage";
 import { isBlocked } from "./state";
+import { isModelConfirmed, isModelKnownUnsupported } from "./models";
 
 export interface RankOptions {
 	modelId?: string;
@@ -11,10 +12,13 @@ export interface RankOptions {
 	 * urgent to drain before it resets and goes to waste. Default: 48 hours.
 	 */
 	expiringThresholdMs?: number;
+	/** Optional per-profile model capability snapshots. */
+	models?: Map<string, ModelsSnapshot | null>;
 }
 
 interface Candidate {
 	slug: string;
+	modelConfirmed: boolean;
 	measured: boolean;
 	minRemaining: number;
 	fiveHourRemaining?: number;
@@ -29,14 +33,15 @@ const DEFAULT_EXPIRING_THRESHOLD_MS = 48 * 60 * 60 * 1000; // 48 hours
 /**
  * Order candidate profiles for a turn.
  *
- * 1. Drop banned / auth-required / currently blocked profiles.
- * 2. Prefer usage-backed profiles; unmeasured ones rank last.
- * 3. Prioritize draining profiles whose weekly quota is expiring soon (anti-mubazir),
+ * 1. Drop banned / auth-required / currently blocked profiles, and profiles known not to support `modelId`.
+ * 2. Prefer profiles confirmed to support `modelId` when `models` metadata is present.
+ * 3. Prefer usage-backed profiles; unmeasured ones rank last.
+ * 4. Prioritize draining profiles whose weekly quota is expiring soon (anti-mubazir),
  *    as long as they have healthy quota remaining and are above the reserve.
- * 4. For profiles outside the urgent window with comparable quota (within 25%),
+ * 5. For profiles outside the urgent window with comparable quota (within 25%),
  *    prefer the one whose weekly quota resets sooner in the week.
- * 5. Default within measured profiles: most headroom first, then sooner reset.
- * 6. Profiles at or below the reserve are only used when nothing else is left.
+ * 6. Default within measured profiles: most headroom first, then sooner reset.
+ * 7. Profiles at or below the reserve are only used when nothing else is left.
  */
 export function rankProfiles(
 	profiles: Profile[],
@@ -48,7 +53,15 @@ export function rankProfiles(
 	const expiringThreshold = opts.expiringThresholdMs ?? DEFAULT_EXPIRING_THRESHOLD_MS;
 
 	const candidates: Candidate[] = profiles
-		.filter(p => !p.bannedAt && !p.authRequiredAt && !p.disabled && !isBlocked(state, p.slug, family, opts.now))
+		.filter(p => {
+			if (p.bannedAt || p.authRequiredAt || p.disabled || isBlocked(state, p.slug, family, opts.now)) {
+				return false;
+			}
+			if (isModelKnownUnsupported(opts.models?.get(p.slug), opts.modelId)) {
+				return false;
+			}
+			return true;
+		})
 		.map(p => {
 			const snapshot = usage.get(p.slug) ?? null;
 			const remaining = minRemaining(snapshot, family);
@@ -68,6 +81,7 @@ export function rankProfiles(
 
 			return {
 				slug: p.slug,
+				modelConfirmed: Boolean(opts.modelId && isModelConfirmed(opts.models?.get(p.slug), opts.modelId)),
 				measured: remaining !== undefined,
 				minRemaining: remaining ?? 100,
 				fiveHourRemaining: fiveRemaining,
@@ -82,6 +96,9 @@ export function rankProfiles(
 	const pool = aboveReserve.length ? aboveReserve : candidates;
 
 	pool.sort((a, b) => {
+		// 0. Profiles confirmed to support the requested model strictly outrank unmeasured ones.
+		if (a.modelConfirmed !== b.modelConfirmed) return a.modelConfirmed ? -1 : 1;
+
 		// 1. Measured profiles strictly preferred over unmeasured.
 		if (a.measured !== b.measured) return a.measured ? -1 : 1;
 

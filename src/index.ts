@@ -8,6 +8,8 @@ import { listProfiles, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
 import { loadState } from "./state";
 import { fetchUsage } from "./usage";
+import { fetchModels, readCachedModels } from "./models";
+import { MODELS_TTL_MS } from "./paths";
 import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
@@ -21,6 +23,7 @@ Usage:
   agy-multi profile sync [<slug>]
   agy-multi profile remove <slug>
   agy-multi quota [--profile <slug>]
+  agy-multi models [--profile <slug>] [--refresh]
   agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
   agy-multi acp [--clean] [--compaction-threshold <tokens>] [-- agy acp args...]
   agy-multi run --prompt <text> [--clean] [--no-skills] [--skills <list>]
@@ -81,6 +84,7 @@ async function main(): Promise<void> {
 			daily: { type: "boolean" },
 			weekly: { type: "boolean" },
 			monthly: { type: "boolean" },
+			refresh: { type: "boolean" },
 			help: { type: "boolean", short: "h" },
 		},
 	});
@@ -201,6 +205,32 @@ async function main(): Promise<void> {
 				console.log(
 					`${profile.slug}\t${window.family}\t${window.window}\t${window.remainingPct}%\t${window.resetsAt}`,
 				);
+			}
+		}
+		return;
+	}
+
+	if (command === "models") {
+		await ensureAgy();
+		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
+		if (!profiles.length) {
+			console.log("no profiles");
+			return;
+		}
+		const now = Date.now();
+		for (const profile of profiles) {
+			const cached = values.refresh ? null : await readCachedModels(profile.slug);
+			const fresh =
+				cached && now - cached.fetchedAt < MODELS_TTL_MS
+					? cached
+					: await fetchModels(profile).catch(() => null);
+			const snapshot = fresh ?? cached;
+			if (!snapshot || snapshot.models.length === 0) {
+				console.log(`${profile.slug}\t(unavailable)`);
+				continue;
+			}
+			for (const model of snapshot.models) {
+				console.log(`${profile.slug}\t${model.modelId}\t${model.name ?? ""}`);
 			}
 		}
 		return;

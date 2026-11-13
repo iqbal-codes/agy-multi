@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { rankProfiles } from "../src/select";
-import type { Profile, UsageSnapshot, WrapperState } from "../src/types";
+import type { ModelsSnapshot, Profile, UsageSnapshot, WrapperState } from "../src/types";
 
 const profiles: Profile[] = [
 	{ slug: "a", createdAt: "" },
@@ -152,7 +152,86 @@ describe("profile ranking", () => {
 			"c",
 		]);
 	});
+
+	test("filters out profiles known not to support the requested model", () => {
+		const usage = new Map<string, UsageSnapshot | null>([
+			["a", snapshot("a", 95)],
+			["b", snapshot("b", 60)],
+			["c", snapshot("c", 80)],
+		]);
+		const models = new Map<string, ModelsSnapshot | null>([
+			["a", modelsSnapshot("a", ["gemini-3.8-flash-high"])],
+			["b", modelsSnapshot("b", ["gemini-4-hydrogen-high", "gemini-3.8-flash-high"])],
+			["c", modelsSnapshot("c", ["gemini-4-argon-medium", "gemini-4-hydrogen-high"])],
+		]);
+		expect(
+			rankProfiles(profiles, usage, state(), {
+				now: 0,
+				reservePct: 10,
+				modelId: "gemini-4-hydrogen-high",
+				models,
+			}),
+		).toEqual(["c", "b"]);
+		expect(
+			rankProfiles(profiles, usage, state(), {
+				now: 0,
+				reservePct: 10,
+				modelId: "gemini-4-argon",
+				models,
+			}),
+		).toEqual(["c"]);
+	});
+
+	test("prefers profiles confirmed to support the model over unmeasured profiles", () => {
+		const usage = new Map<string, UsageSnapshot | null>([
+			["a", snapshot("a", 95)],
+			["b", snapshot("b", 60)],
+			["c", snapshot("c", 80)],
+		]);
+		const models = new Map<string, ModelsSnapshot | null>([
+			["a", null],
+			["b", modelsSnapshot("b", ["gemini-4-hydrogen-high"])],
+			["c", modelsSnapshot("c", ["gemini-3.8-flash-high"])],
+		]);
+		expect(
+			rankProfiles(profiles, usage, state(), {
+				now: 0,
+				reservePct: 10,
+				modelId: "gemini-4-hydrogen-high",
+				models,
+			}),
+		).toEqual(["b", "a"]);
+	});
+
+	test("returns empty list when all measured profiles do not support the requested model", () => {
+		const usage = new Map<string, UsageSnapshot | null>([
+			["a", snapshot("a", 95)],
+			["b", snapshot("b", 60)],
+			["c", snapshot("c", 80)],
+		]);
+		const models = new Map<string, ModelsSnapshot | null>([
+			["a", modelsSnapshot("a", ["gemini-3.8-flash-high"])],
+			["b", modelsSnapshot("b", ["gemini-3.8-flash-high"])],
+			["c", modelsSnapshot("c", ["gemini-3.8-flash-high"])],
+		]);
+		expect(
+			rankProfiles(profiles, usage, state(), {
+				now: 0,
+				reservePct: 10,
+				modelId: "gemini-4-hydrogen-high",
+				models,
+			}),
+		).toEqual([]);
+	});
 });
+
+function modelsSnapshot(slug: string, ids: string[]): ModelsSnapshot {
+	return {
+		profile: slug,
+		fetchedAt: 0,
+		models: ids.map(modelId => ({ modelId })),
+	};
+}
 
 function snapshotWithWeekly(
 	slug: string,
