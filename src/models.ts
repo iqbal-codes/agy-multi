@@ -87,6 +87,30 @@ export function isModelConfirmed(
 	return supportsModel(snapshot, modelId);
 }
 
+/**
+ * Profiles with a larger model catalog (e.g. 18 models incl. Gemini 4 / Claude 5.5)
+ * are reserved for the models only they offer. For a model that a smaller-catalog
+ * profile also confirms (e.g. Gemini 3.8 Flash), return the larger-catalog slugs so
+ * callers never route that model to them. Unmeasured profiles are never reserved.
+ */
+export function reservedProfilesFor(
+	models: Map<string, ModelsSnapshot | null | undefined> | undefined,
+	modelId?: string,
+): Set<string> {
+	const reserved = new Set<string>();
+	if (!models || !modelId) return reserved;
+	const confirming: Array<[string, number]> = [];
+	for (const [slug, snapshot] of models) {
+		if (snapshot && isModelConfirmed(snapshot, modelId)) confirming.push([slug, snapshot.models.length]);
+	}
+	if (confirming.length === 0) return reserved;
+	const smallest = Math.min(...confirming.map(([, count]) => count));
+	for (const [slug, count] of confirming) {
+		if (count > smallest) reserved.add(slug);
+	}
+	return reserved;
+}
+
 /** Return a copy of `snapshot` with `modelId` removed (used when runtime rejects a cached model). */
 export function withoutUnsupportedModel(
 	snapshot: ModelsSnapshot | null | undefined,

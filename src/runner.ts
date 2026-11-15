@@ -6,7 +6,7 @@ import { ensureDir, run } from "./fs-utils";
 import { listProfiles, profileEnvOf, profileHomeOf, saveProfile } from "./registry";
 import { block, getCheckpoint, loadState, pin, pinnedProfile, saveState, setCheckpoint } from "./state";
 import { blockingReset, familyForModel, fetchUsage, readCachedUsage } from "./usage";
-import { fetchModels, readCachedModels, withoutUnsupportedModel, writeCachedModels } from "./models";
+import { fetchModels, readCachedModels, reservedProfilesFor, withoutUnsupportedModel, writeCachedModels } from "./models";
 import { rankProfiles } from "./select";
 import { buildInjectedPrompt } from "./injection";
 
@@ -168,6 +168,12 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 		...(opts.model && !opts.onlyProfile ? { models } : {}),
 	});
 	if (opts.model && !opts.onlyProfile && ranked.length === 0) {
+		const reserved = reservedProfilesFor(models, opts.model);
+		if (reserved.size > 0) {
+			throw new Error(
+				`no available account for model ${opts.model}; ${[...reserved].join(", ")} reserved for newer models`,
+			);
+		}
 		const withoutModelFilter = rankProfiles(candidates, usage, state, {
 			modelId: opts.model,
 			now,

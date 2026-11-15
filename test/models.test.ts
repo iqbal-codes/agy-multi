@@ -7,6 +7,7 @@ import {
 	mergeModelLists,
 	parseModelsOutput,
 	readCachedModels,
+	reservedProfilesFor,
 	supportsModel,
 	writeCachedModels,
 } from "../src/models";
@@ -119,5 +120,34 @@ describe("models parsing and capability matching", () => {
 			else delete process.env.AGY_MULTI_ROOT;
 			await rm(tempRoot, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("reservedProfilesFor", () => {
+	const snap = (profile: string, ids: string[]): ModelsSnapshot => ({
+		profile,
+		fetchedAt: 0,
+		models: ids.map(modelId => ({ modelId })),
+	});
+	const baseline = ["gemini-3.8-flash-high", "claude-sonnet-4-6"];
+	const premium = ["gemini-4-hydrogen-high", "claude-opus-5-5-high", ...baseline];
+	const models = new Map<string, ModelsSnapshot | null>([
+		["base", snap("base", baseline)],
+		["prem", snap("prem", premium)],
+		["fresh", null],
+	]);
+
+	test("reserves larger catalogs for models a smaller catalog offers", () => {
+		expect([...reservedProfilesFor(models, "gemini-3.8-flash-high")]).toEqual(["prem"]);
+		expect([...reservedProfilesFor(models, "claude-sonnet-4-6")]).toEqual(["prem"]);
+	});
+
+	test("reserves nothing for models only the larger catalog offers", () => {
+		expect(reservedProfilesFor(models, "gemini-4-hydrogen").size).toBe(0);
+	});
+
+	test("reserves nothing without a model or snapshots", () => {
+		expect(reservedProfilesFor(models, undefined).size).toBe(0);
+		expect(reservedProfilesFor(undefined, "gemini-3.8-flash-high").size).toBe(0);
 	});
 });

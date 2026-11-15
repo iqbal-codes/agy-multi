@@ -26,6 +26,7 @@ import {
 	mergeConfigOptionLists,
 	mergeModelLists,
 	readCachedModels,
+	reservedProfilesFor,
 	withoutUnsupportedModel,
 	writeCachedModels,
 } from "../models";
@@ -698,20 +699,25 @@ class AcpProxy {
 	private async rankCandidates(
 		options: { modelId?: string; exclude?: string[]; allowBlocked?: boolean; prefer?: string[] } = {},
 	): Promise<Profile[]> {
-		const candidates = [...this.profiles.values()].filter(profile => !options.exclude?.includes(profile.slug));
+		const all = [...this.profiles.values()];
+		const candidates = all.filter(profile => !options.exclude?.includes(profile.slug));
 		const usage = new Map<string, UsageSnapshot | null>();
 		const models = new Map<string, ModelsSnapshot | null>();
 		await Promise.all(
-			candidates.map(async profile => {
+			all.map(async profile => {
 				const [u, m] = await Promise.all([this.getUsage(profile), this.getModels(profile)]);
 				usage.set(profile.slug, u);
 				models.set(profile.slug, m);
 			}),
 		);
+		// Reserved set is computed over every profile so excluding the current one
+		// never lets a newer-model account pick up a baseline model.
+		const reserved = reservedProfilesFor(models, options.modelId);
 		const slugs = rankProfiles(candidates, usage, this.state, {
 			modelId: options.modelId,
 			now: Date.now(),
 			reservePct: this.reservePct,
+			reserved,
 			...(options.modelId ? { models } : {}),
 		});
 		const bySlug = new Map(candidates.map(profile => [profile.slug, profile]));
@@ -724,6 +730,7 @@ class AcpProxy {
 						!profile.bannedAt &&
 						!profile.authRequiredAt &&
 						!profile.disabled &&
+						!reserved.has(profile.slug) &&
 						!isModelKnownUnsupported(models.get(profile.slug), options.modelId),
 				)
 				.sort(
@@ -740,6 +747,18 @@ class AcpProxy {
 			];
 		}
 		return ranked;
+	}
+
+	/** Whether `profile` is a newer-model account that must not serve `modelId`. */
+	private async isReservedFor(profile: Profile, modelId?: string): Promise<boolean> {
+		if (!modelId) return false;
+		const models = new Map<string, ModelsSnapshot | null>();
+		await Promise.all(
+			[...this.profiles.values()].map(async p => {
+				models.set(p.slug, await this.getModels(p));
+			}),
+		);
+		return reservedProfilesFor(models, modelId).has(profile.slug);
 	}
 
 	private blockReset(slug: string, modelId?: string): number | undefined {
@@ -1309,7 +1328,8 @@ class AcpProxy {
 		let lastUnsupportedError: AcpRpcError | undefined;
 		if (currentProfile) {
 			const currentModels = await this.getModels(currentProfile);
-			unsupportedOnCurrent = isModelKnownUnsupported(currentModels, modelId);
+			unsupportedOnCurrent =
+				isModelKnownUnsupported(currentModels, modelId) || (await this.isReservedFor(currentProfile, modelId));
 		}
 
 		if (currentProfile && !unsupportedOnCurrent) {
@@ -1457,7 +1477,9 @@ class AcpProxy {
 		} else {
 			const blocked = isBlocked(this.state, current.slug, family, Date.now());
 			const low = await this.isLowQuota(current, family);
-			const unsupported = isModelKnownUnsupported(await this.getModels(current), session.modelId);
+			const unsupported =
+				isModelKnownUnsupported(await this.getModels(current), session.modelId) ||
+				(await this.isReservedFor(current, session.modelId));
 			const unhealthy = Boolean(current.bannedAt || current.authRequiredAt) || blocked || unsupported;
 			if (unhealthy || low) {
 				const candidates = await this.rankCandidates({

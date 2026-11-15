@@ -223,6 +223,50 @@ describe("profile ranking", () => {
 			}),
 		).toEqual([]);
 	});
+
+	test("reserves larger-catalog profiles for newer models only they offer", () => {
+		const usage = new Map<string, UsageSnapshot | null>([
+			["a", snapshot("a", 40)],
+			["b", snapshot("b", 99)],
+			["c", snapshot("c", 30)],
+		]);
+		const baseline = ["gemini-3.8-flash-high", "gemini-3.8-flash-low", "claude-sonnet-4-6"];
+		const premium = ["gemini-4-hydrogen-high", "gemini-4-argon-medium", ...baseline];
+		const models = new Map<string, ModelsSnapshot | null>([
+			["a", modelsSnapshot("a", baseline)],
+			["b", modelsSnapshot("b", premium)],
+			["c", modelsSnapshot("c", baseline)],
+		]);
+		const rank = (modelId: string, s = state()) =>
+			rankProfiles(profiles, usage, s, { now: 0, reservePct: 10, modelId, models });
+
+		// Baseline model never lands on the premium account, even with more headroom.
+		expect(rank("gemini-3.8-flash-high")).toEqual(["a", "c"]);
+		expect(rank("gemini-3.8-flash")).toEqual(["a", "c"]);
+		// Newer models still route to the premium account.
+		expect(rank("gemini-4-hydrogen-high")).toEqual(["b"]);
+		// Strict: no fallback to premium when every baseline account is blocked.
+		const blocked = state();
+		blocked.blocks.a = { gemini: 1_000 };
+		blocked.blocks.c = { gemini: 1_000 };
+		expect(rank("gemini-3.8-flash-high", blocked)).toEqual([]);
+	});
+
+	test("explicit reserved set overrides the derived one", () => {
+		const usage = new Map<string, UsageSnapshot | null>([
+			["a", snapshot("a", 40)],
+			["b", snapshot("b", 99)],
+			["c", snapshot("c", 30)],
+		]);
+		expect(
+			rankProfiles(profiles, usage, state(), {
+				now: 0,
+				reservePct: 10,
+				modelId: "gemini-3.8-flash-high",
+				reserved: new Set(["b"]),
+			}),
+		).toEqual(["a", "c"]);
+	});
 });
 
 function modelsSnapshot(slug: string, ids: string[]): ModelsSnapshot {

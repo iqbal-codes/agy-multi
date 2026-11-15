@@ -1,7 +1,7 @@
 import type { ModelsSnapshot, Profile, UsageSnapshot, WrapperState } from "./types";
 import { blockingReset, familyForModel, minRemaining, windowRemaining, windowReset } from "./usage";
 import { isBlocked } from "./state";
-import { isModelConfirmed, isModelKnownUnsupported } from "./models";
+import { isModelConfirmed, isModelKnownUnsupported, reservedProfilesFor } from "./models";
 
 export interface RankOptions {
 	modelId?: string;
@@ -14,6 +14,12 @@ export interface RankOptions {
 	expiringThresholdMs?: number;
 	/** Optional per-profile model capability snapshots. */
 	models?: Map<string, ModelsSnapshot | null>;
+	/**
+	 * Profiles reserved for newer models and never used for `modelId`.
+	 * Defaults to `reservedProfilesFor(models, modelId)`; pass explicitly when
+	 * `models` covers only a subset of all profiles.
+	 */
+	reserved?: Set<string>;
 }
 
 interface Candidate {
@@ -33,7 +39,8 @@ const DEFAULT_EXPIRING_THRESHOLD_MS = 48 * 60 * 60 * 1000; // 48 hours
 /**
  * Order candidate profiles for a turn.
  *
- * 1. Drop banned / auth-required / currently blocked profiles, and profiles known not to support `modelId`.
+ * 1. Drop banned / auth-required / currently blocked profiles, profiles known not to support `modelId`,
+ *    and larger-catalog profiles reserved for newer models when a smaller-catalog profile offers `modelId`.
  * 2. Prefer profiles confirmed to support `modelId` when `models` metadata is present.
  * 3. Prefer usage-backed profiles; unmeasured ones rank last.
  * 4. Prioritize draining profiles whose weekly quota is expiring soon (anti-mubazir),
@@ -51,6 +58,7 @@ export function rankProfiles(
 ): string[] {
 	const family = familyForModel(opts.modelId);
 	const expiringThreshold = opts.expiringThresholdMs ?? DEFAULT_EXPIRING_THRESHOLD_MS;
+	const reserved = opts.reserved ?? reservedProfilesFor(opts.models, opts.modelId);
 
 	const candidates: Candidate[] = profiles
 		.filter(p => {
@@ -58,6 +66,9 @@ export function rankProfiles(
 				return false;
 			}
 			if (isModelKnownUnsupported(opts.models?.get(p.slug), opts.modelId)) {
+				return false;
+			}
+			if (reserved.has(p.slug)) {
 				return false;
 			}
 			return true;
