@@ -37,55 +37,116 @@ error() {
 
 printf "${BOLD}Installing agy-multi (multi-account failover for Antigravity)...${NC}\n\n"
 
-# 1. Check or install Bun
-if ! command -v bun >/dev/null 2>&1; then
-    if [ -x "$HOME/.bun/bin/bun" ]; then
-        export PATH="$HOME/.bun/bin:$PATH"
-    else
-        info "Bun runtime not found in PATH."
-        info "Installing Bun via official installer (https://bun.sh)..."
-        curl -fsSL https://bun.sh/install | bash
-        export PATH="$HOME/.bun/bin:$PATH"
-        if ! command -v bun >/dev/null 2>&1; then
-            error "Bun installation failed or PATH not updated. Please install Bun manually from https://bun.sh."
+REPO_SLUG="${REPO_SLUG:-iqbal-codes/agy-multi}"
+RELEASE_BASE_URL="${RELEASE_BASE_URL:-https://github.com/$REPO_SLUG/releases/latest/download}"
+
+detect_platform() {
+    local os arch
+    case "$(uname -s)" in
+        Darwin) os="darwin" ;;
+        Linux)  os="linux" ;;
+        *)      return 1 ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64)   arch="x64" ;;
+        arm64|aarch64)  arch="arm64" ;;
+        *)              return 1 ;;
+    esac
+    echo "${os}-${arch}"
+}
+
+install_from_prebuilt() {
+    local platform asset url tmpdir
+    platform="$(detect_platform)" || return 1
+    asset="agy-multi-${platform}.tar.gz"
+    url="${RELEASE_BASE_URL}/${asset}"
+
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$tmpdir"' RETURN
+
+    info "Downloading prebuilt binaries (${platform}) from GitHub Releases..."
+    if ! curl -fsSL "$url" -o "$tmpdir/$asset"; then
+        return 1
+    fi
+
+    tar -xzf "$tmpdir/$asset" -C "$tmpdir"
+    if [ ! -f "$tmpdir/agy-multi" ] || [ ! -f "$tmpdir/agy-multi-acp" ]; then
+        return 1
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    cp -f "$tmpdir/agy-multi" "$INSTALL_DIR/agy-multi"
+    cp -f "$tmpdir/agy-multi-acp" "$INSTALL_DIR/agy-multi-acp"
+    chmod +x "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp"
+    if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+        codesign -s - -f "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+install_from_source() {
+    # 1. Check or install Bun
+    if ! command -v bun >/dev/null 2>&1; then
+        if [ -x "$HOME/.bun/bin/bun" ]; then
+            export PATH="$HOME/.bun/bin:$PATH"
+        else
+            info "Bun runtime not found in PATH."
+            info "Installing Bun via official installer (https://bun.sh)..."
+            curl -fsSL https://bun.sh/install | bash
+            export PATH="$HOME/.bun/bin:$PATH"
+            if ! command -v bun >/dev/null 2>&1; then
+                error "Bun installation failed or PATH not updated. Please install Bun manually from https://bun.sh."
+            fi
         fi
     fi
-fi
 
-# 2. Determine work directory (local checkout vs remote curl)
-if [ -f "package.json" ] && grep -q '"name": "agy-multi"' package.json 2>/dev/null; then
-    info "Using local workspace: $(pwd)"
-    WORK_DIR="$(pwd)"
-else
-    info "Setting up repository in $SOURCE_DIR..."
-    mkdir -p "$(dirname "$SOURCE_DIR")"
-    if [ -d "$SOURCE_DIR/.git" ]; then
-        info "Updating existing repository in $SOURCE_DIR..."
-        git -C "$SOURCE_DIR" pull --ff-only 2>/dev/null || true
+    # 2. Determine work directory (local checkout vs remote curl)
+    if [ -f "package.json" ] && grep -q '"name": "agy-multi"' package.json 2>/dev/null; then
+        info "Using local workspace: $(pwd)"
+        WORK_DIR="$(pwd)"
     else
-        info "Cloning repository from $REPO_URL..."
-        git clone --depth=1 "$REPO_URL" "$SOURCE_DIR"
+        info "Setting up repository in $SOURCE_DIR..."
+        mkdir -p "$(dirname "$SOURCE_DIR")"
+        if [ -d "$SOURCE_DIR/.git" ]; then
+            info "Updating existing repository in $SOURCE_DIR..."
+            git -C "$SOURCE_DIR" pull --ff-only 2>/dev/null || true
+        else
+            info "Cloning repository from $REPO_URL..."
+            git clone --depth=1 "$REPO_URL" "$SOURCE_DIR"
+        fi
+        WORK_DIR="$SOURCE_DIR"
     fi
-    WORK_DIR="$SOURCE_DIR"
+
+    cd "$WORK_DIR"
+
+    # 3. Install dependencies
+    info "Installing dependencies..."
+    bun install
+
+    # 4. Build standalone binaries
+    info "Compiling standalone single-binary executables..."
+    bun run build
+
+    # 5. Copy binaries to install directory
+    mkdir -p "$INSTALL_DIR"
+    cp -f dist/agy-multi "$INSTALL_DIR/agy-multi"
+    cp -f dist/agy-multi-acp "$INSTALL_DIR/agy-multi-acp"
+    chmod +x "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp"
+    if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+        codesign -s - -f "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp" >/dev/null 2>&1 || true
+    fi
+}
+
+IS_LOCAL_CHECKOUT=0
+if [ -f "package.json" ] && grep -q '"name": "agy-multi"' package.json 2>/dev/null; then
+    IS_LOCAL_CHECKOUT=1
 fi
 
-cd "$WORK_DIR"
-
-# 3. Install dependencies
-info "Installing dependencies..."
-bun install
-
-# 4. Build standalone binaries
-info "Compiling standalone single-binary executables..."
-bun run build
-
-# 5. Copy binaries to install directory
-mkdir -p "$INSTALL_DIR"
-cp -f dist/agy-multi "$INSTALL_DIR/agy-multi"
-cp -f dist/agy-multi-acp "$INSTALL_DIR/agy-multi-acp"
-chmod +x "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp"
-if [ "$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
-    codesign -s - -f "$INSTALL_DIR/agy-multi" "$INSTALL_DIR/agy-multi-acp" >/dev/null 2>&1 || true
+if [ "$IS_LOCAL_CHECKOUT" = "1" ] || [ "${AGY_MULTI_FROM_SOURCE:-0}" = "1" ]; then
+    install_from_source
+elif ! install_from_prebuilt; then
+    warn "Prebuilt release not available for this platform yet; falling back to source build..."
+    install_from_source
 fi
 
 success "Installed agy-multi and agy-multi-acp to $INSTALL_DIR"

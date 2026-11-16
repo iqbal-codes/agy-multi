@@ -161,3 +161,168 @@ export async function fetchUsage(profile: Profile, timeoutMs = 30_000, signal?: 
 		signal?.removeEventListener("abort", cancel);
 	}
 }
+
+export interface ProfileUsageEntry {
+	profile: Profile;
+	snapshot: UsageSnapshot | null;
+}
+
+export interface WindowAverage {
+	fiveHour?: number;
+	weekly?: number;
+	fiveHourResetsAt?: string;
+	weeklyResetsAt?: string;
+	count: number;
+}
+
+export interface AccountUsageRow {
+	slug: string;
+	email?: string;
+	status: "active" | "disabled" | "banned" | "auth-required" | "unavailable";
+	gemini: { fiveHour?: number; weekly?: number };
+	claudeGpt: { fiveHour?: number; weekly?: number };
+}
+
+export interface MultiUsageSummary {
+	totalAccounts: number;
+	measuredAccounts: number;
+	gemini: WindowAverage;
+	claudeGpt: WindowAverage;
+	overall: { fiveHour?: number; weekly?: number };
+	accounts: AccountUsageRow[];
+}
+
+function mean(values: number[]): number | undefined {
+	if (!values.length) return undefined;
+	return values.reduce((sum, v) => sum + v, 0) / values.length;
+}
+
+function formatPct(value: number | undefined): string {
+	if (value === undefined) return "—";
+	const rounded = Math.round(value * 10) / 10;
+	return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
+}
+
+function accountStatus(profile: Profile, snapshot: UsageSnapshot | null): AccountUsageRow["status"] {
+	if (profile.disabled) return "disabled";
+	if (profile.bannedAt) return "banned";
+	if (profile.authRequiredAt) return "auth-required";
+	return snapshot ? "active" : "unavailable";
+}
+
+function earliestReset(resets: Array<string | undefined>): string | undefined {
+	let bestMs = Number.POSITIVE_INFINITY;
+	let bestIso: string | undefined;
+	for (const iso of resets) {
+		if (!iso) continue;
+		const ms = Date.parse(iso);
+		if (Number.isFinite(ms) && ms < bestMs) {
+			bestMs = ms;
+			bestIso = iso;
+		}
+	}
+	return bestIso;
+}
+
+function windowResetIso(snapshot: UsageSnapshot | null, family: Family, windowId: WindowId): string | undefined {
+	return snapshot?.windows.find(w => w.family === family && w.window === windowId)?.resetsAt;
+}
+
+/** Compute per-account and average 5-hour / weekly quota remaining across profiles. */
+export function summarizeMultiUsage(entries: ProfileUsageEntry[]): MultiUsageSummary {
+	const gemini5h: number[] = [];
+	const geminiWeekly: number[] = [];
+	const claude5h: number[] = [];
+	const claudeWeekly: number[] = [];
+	const gemini5hResets: Array<string | undefined> = [];
+	const geminiWeeklyResets: Array<string | undefined> = [];
+	const claude5hResets: Array<string | undefined> = [];
+	const claudeWeeklyResets: Array<string | undefined> = [];
+	const all5h: number[] = [];
+	const allWeekly: number[] = [];
+	let measuredAccounts = 0;
+
+	const accounts: AccountUsageRow[] = entries.map(({ profile, snapshot }) => {
+		const status = accountStatus(profile, snapshot);
+		const g5 = windowRemaining(snapshot, "gemini", "fiveHour");
+		const gw = windowRemaining(snapshot, "gemini", "weekly");
+		const c5 = windowRemaining(snapshot, "claude-gpt", "fiveHour");
+		const cw = windowRemaining(snapshot, "claude-gpt", "weekly");
+		const hasAny = g5 !== undefined || gw !== undefined || c5 !== undefined || cw !== undefined;
+		if (status === "active" && hasAny) {
+			measuredAccounts++;
+			if (g5 !== undefined) {
+				gemini5h.push(g5);
+				all5h.push(g5);
+				gemini5hResets.push(windowResetIso(snapshot, "gemini", "fiveHour"));
+			}
+			if (gw !== undefined) {
+				geminiWeekly.push(gw);
+				allWeekly.push(gw);
+				geminiWeeklyResets.push(windowResetIso(snapshot, "gemini", "weekly"));
+			}
+			if (c5 !== undefined) {
+				claude5h.push(c5);
+				all5h.push(c5);
+				claude5hResets.push(windowResetIso(snapshot, "claude-gpt", "fiveHour"));
+			}
+			if (cw !== undefined) {
+				claudeWeekly.push(cw);
+				allWeekly.push(cw);
+				claudeWeeklyResets.push(windowResetIso(snapshot, "claude-gpt", "weekly"));
+			}
+		}
+		return {
+			slug: profile.slug,
+			email: profile.email,
+			status,
+			gemini: { fiveHour: g5, weekly: gw },
+			claudeGpt: { fiveHour: c5, weekly: cw },
+		};
+	});
+
+	return {
+		totalAccounts: entries.length,
+		measuredAccounts,
+		gemini: {
+			fiveHour: mean(gemini5h),
+			weekly: mean(geminiWeekly),
+			fiveHourResetsAt: earliestReset(gemini5hResets),
+			weeklyResetsAt: earliestReset(geminiWeeklyResets),
+			count: Math.max(gemini5h.length, geminiWeekly.length),
+		},
+		claudeGpt: {
+			fiveHour: mean(claude5h),
+			weekly: mean(claudeWeekly),
+			fiveHourResetsAt: earliestReset(claude5hResets),
+			weeklyResetsAt: earliestReset(claudeWeeklyResets),
+			count: Math.max(claude5h.length, claudeWeekly.length),
+		},
+		overall: {
+			fiveHour: mean(all5h),
+			weekly: mean(allWeekly),
+		},
+		accounts,
+	};
+}
+
+/** Format averaged 5-hour & weekly quota limits in standard Antigravity `/usage` TSV format. */
+export function formatMultiUsageReport(entries: ProfileUsageEntry[]): string {
+	if (!entries.length) return "No accounts configured.";
+	const summary = summarizeMultiUsage(entries);
+	const rows: Array<[string, string, number | undefined, string | undefined]> = [
+		["Gemini Models", "Weekly Limit Remaining", summary.gemini.weekly, summary.gemini.weeklyResetsAt],
+		["Gemini Models", "Five Hour Limit Remaining", summary.gemini.fiveHour, summary.gemini.fiveHourResetsAt],
+		["Claude and GPT models", "Weekly Limit Remaining", summary.claudeGpt.weekly, summary.claudeGpt.weeklyResetsAt],
+		[
+			"Claude and GPT models",
+			"Five Hour Limit Remaining",
+			summary.claudeGpt.fiveHour,
+			summary.claudeGpt.fiveHourResetsAt,
+		],
+	];
+	const lines = rows
+		.filter(([, , pct]) => pct !== undefined)
+		.map(([group, label, pct, resetsAt]) => `${group}\t${label}\t${formatPct(pct)}\t${resetsAt ?? "—"}`);
+	return lines.length ? lines.join("\n") : "No usage data available.";
+}

@@ -1,0 +1,36 @@
+assistant: omp
+assistants:
+  omp:
+    model: default
+tiers:
+  small:
+    provider: omp
+    model: default
+    effort: medium
+  medium:
+    provider: omp
+    model: default
+    effort: high
+  large:
+    provider: omp
+    model: default
+    effort: high
+aliases:
+  "@reasoning":
+    provider: omp
+    model: default
+    effort: high
+worktree:
+  baseBranch: main
+schedule:
+  workflow: animus-loop
+  parallel: 2
+  max_laps: 3
+  interval_seconds: 300
+  inputs:
+    merge: approve
+  work_window:
+    enabled: true
+    start_time: 20:00
+    end_time: 05:00
+    timezone: Asia/Jakarta

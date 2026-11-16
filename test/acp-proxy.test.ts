@@ -551,4 +551,123 @@ lines.on("line", line => {
 		},
 		30_000,
 	);
+
+	test(
+		"/multi-usage is advertised in availableCommands and returns average 5-hour & weekly limits without calling child prompt",
+		async () => {
+			const root = await mkdtemp(join(tmpdir(), "agy-multi-acp-"));
+			const projectRoot = join(import.meta.dir, "..");
+			const fake = join(root, "fake-agy");
+			const promptLog = join(root, "prompts.log");
+
+			const now = Date.now();
+			const profiles = [
+				{ slug: "acct-a", g5: 80, gw: 60, c5: 40, cw: 20 },
+				{ slug: "acct-b", g5: 100, gw: 80, c5: 60, cw: 40 },
+			];
+			for (const p of profiles) {
+				const dir = join(root, "profiles", p.slug);
+				await mkdir(dir, { recursive: true });
+				await writeFile(join(dir, "profile.json"), JSON.stringify({ slug: p.slug, createdAt: new Date().toISOString() }));
+				await writeFile(
+					join(dir, "usage.json"),
+					JSON.stringify({
+						profile: p.slug,
+						fetchedAt: now,
+						windows: [
+							{ family: "gemini", window: "fiveHour", remainingPct: p.g5, resetsAt: "2099-01-01T00:00:00Z" },
+							{ family: "gemini", window: "weekly", remainingPct: p.gw, resetsAt: "2099-01-01T00:00:00Z" },
+							{ family: "claude-gpt", window: "fiveHour", remainingPct: p.c5, resetsAt: "2099-01-01T00:00:00Z" },
+							{ family: "claude-gpt", window: "weekly", remainingPct: p.cw, resetsAt: "2099-01-01T00:00:00Z" },
+						],
+						raw: "",
+					}),
+				);
+			}
+			await writeFile(fake, FAKE_AGY);
+			await chmod(fake, 0o755);
+
+			const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp"], {
+				cwd: projectRoot,
+				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: promptLog },
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+
+			try {
+				const stdin = proxy.stdin;
+				if (!stdin) throw new Error("proxy stdin missing");
+				const pending = new Map<number, (message: unknown) => void>();
+				const chunks: string[] = [];
+				let advertisedCommands: string[] = [];
+				let nextId = 1;
+				const send = async <T>(method: string, params: unknown): Promise<T> => {
+					const id = nextId++;
+					const { promise, resolve } = Promise.withResolvers<unknown>();
+					pending.set(id, resolve);
+					stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+					await stdin.flush();
+					return (await promise) as T;
+				};
+
+				new LineReader(proxy.stdout, line => {
+					let message: unknown;
+					try {
+						message = JSON.parse(line);
+					} catch {
+						return;
+					}
+					if (!isRecord(message)) return;
+					if (typeof message.id === "number" && pending.has(message.id)) {
+						const resolve = pending.get(message.id)!;
+						pending.delete(message.id);
+						resolve(message);
+						return;
+					}
+					if (message.method === "session/update" && isRecord(message.params) && isRecord(message.params.update)) {
+						const update = message.params.update;
+						if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
+							advertisedCommands = update.availableCommands
+								.map(c => (isRecord(c) && typeof c.name === "string" ? c.name : ""))
+								.filter(Boolean);
+						}
+						if (update.sessionUpdate === "agent_message_chunk" && isRecord(update.content) && typeof update.content.text === "string") {
+							chunks.push(update.content.text);
+						}
+					}
+				});
+
+				await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await send<{ result: { sessionId: string } }>("session/new", {
+					cwd: root,
+					mcpServers: [],
+				});
+				expect(advertisedCommands).toContain("multi-usage");
+
+				const prompted = await send<{ result: { stopReason: string } }>("session/prompt", {
+					sessionId: created.result.sessionId,
+					prompt: [{ type: "text", text: "/multi-usage" }],
+				});
+				expect(prompted.result.stopReason).toBe("end_turn");
+				const reply = chunks.join("");
+				expect(reply).toBe(
+					[
+						"Gemini Models\tWeekly Limit Remaining\t70%\t2099-01-01T00:00:00Z",
+						"Gemini Models\tFive Hour Limit Remaining\t90%\t2099-01-01T00:00:00Z",
+						"Claude and GPT models\tWeekly Limit Remaining\t30%\t2099-01-01T00:00:00Z",
+						"Claude and GPT models\tFive Hour Limit Remaining\t50%\t2099-01-01T00:00:00Z",
+					].join("\n"),
+				);
+
+				const childPrompts = await readFile(promptLog, "utf8").catch(() => "");
+				expect(childPrompts).toBe("");
+			} finally {
+				proxy.kill();
+				await proxy.exited.catch(() => {});
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
 });

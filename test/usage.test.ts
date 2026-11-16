@@ -1,6 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { blockingReset, familyForModel, minRemaining, parseUsageTable, profileUsagePath, readCachedUsage, windowRemaining, windowReset, writeCachedUsage } from "../src/usage";
-import type { UsageSnapshot } from "../src/types";
+import {
+	blockingReset,
+	familyForModel,
+	formatMultiUsageReport,
+	minRemaining,
+	parseUsageTable,
+	profileUsagePath,
+	readCachedUsage,
+	summarizeMultiUsage,
+	windowRemaining,
+	windowReset,
+	writeCachedUsage,
+} from "../src/usage";
+import type { Profile, UsageSnapshot } from "../src/types";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,6 +97,74 @@ describe("usage parsing", () => {
 	});
 });
 
-function snapshotOf(table: string): UsageSnapshot {
-	return { profile: "test", fetchedAt: 0, windows: parseUsageTable(table), raw: table };
+function snapshotOf(table: string, profile = "test"): UsageSnapshot {
+	return { profile, fetchedAt: 0, windows: parseUsageTable(table), raw: table };
 }
+
+describe("multi-usage summary", () => {
+	test("computes 5-hour and weekly averages across measured active accounts", () => {
+		const acctA: Profile = { slug: "acct-a", email: "a@example.com", createdAt: "2026-01-01T00:00:00Z" };
+		const acctB: Profile = { slug: "acct-b", createdAt: "2026-01-01T00:00:00Z" };
+		const acctDisabled: Profile = {
+			slug: "acct-off",
+			createdAt: "2026-01-01T00:00:00Z",
+			disabled: true,
+		};
+		const acctUnavailable: Profile = { slug: "acct-none", createdAt: "2026-01-01T00:00:00Z" };
+
+		const snapA = snapshotOf(
+			[
+				"Gemini Models\tWeekly Limit Remaining\t80%\t2026-11-15T23:41:21Z",
+				"Gemini Models\tFive Hour Limit Remaining\t100%\t2026-11-09T04:41:21Z",
+				"Claude and GPT models\tWeekly Limit Remaining\t40%\t2026-11-15T23:41:21Z",
+				"Claude and GPT models\tFive Hour Limit Remaining\t60%\t2026-11-09T04:41:21Z",
+			].join("\n"),
+			"acct-a",
+		);
+		const snapB = snapshotOf(
+			[
+				"Gemini Models\tWeekly Limit Remaining\t60%\t2026-11-15T23:41:21Z",
+				"Gemini Models\tFive Hour Limit Remaining\t80%\t2026-11-09T04:41:21Z",
+				"Claude and GPT models\tWeekly Limit Remaining\t20%\t2026-11-15T23:41:21Z",
+				"Claude and GPT models\tFive Hour Limit Remaining\t40%\t2026-11-09T04:41:21Z",
+			].join("\n"),
+			"acct-b",
+		);
+
+		const summary = summarizeMultiUsage([
+			{ profile: acctA, snapshot: snapA },
+			{ profile: acctB, snapshot: snapB },
+			{ profile: acctDisabled, snapshot: null },
+			{ profile: acctUnavailable, snapshot: null },
+		]);
+
+		expect(summary.totalAccounts).toBe(4);
+		expect(summary.measuredAccounts).toBe(2);
+		expect(summary.gemini.fiveHour).toBe(90);
+		expect(summary.gemini.weekly).toBe(70);
+		expect(summary.claudeGpt.fiveHour).toBe(50);
+		expect(summary.claudeGpt.weekly).toBe(30);
+		expect(summary.overall.fiveHour).toBe(70);
+		expect(summary.overall.weekly).toBe(50);
+		expect(summary.accounts.map(a => a.status)).toEqual(["active", "active", "disabled", "unavailable"]);
+
+		const report = formatMultiUsageReport([
+			{ profile: acctA, snapshot: snapA },
+			{ profile: acctB, snapshot: snapB },
+			{ profile: acctDisabled, snapshot: null },
+		]);
+		expect(report).toBe(
+			[
+				"Gemini Models\tWeekly Limit Remaining\t70%\t2026-11-15T23:41:21Z",
+				"Gemini Models\tFive Hour Limit Remaining\t90%\t2026-11-09T04:41:21Z",
+				"Claude and GPT models\tWeekly Limit Remaining\t30%\t2026-11-15T23:41:21Z",
+				"Claude and GPT models\tFive Hour Limit Remaining\t50%\t2026-11-09T04:41:21Z",
+			].join("\n"),
+		);
+		expect(parseUsageTable(report)).toHaveLength(4);
+	});
+
+	test("handles empty account list", () => {
+		expect(formatMultiUsageReport([])).toBe("No accounts configured.");
+	});
+});

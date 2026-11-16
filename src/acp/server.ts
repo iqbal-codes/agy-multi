@@ -17,7 +17,14 @@ import { rankProfiles } from "../select";
 import { syncProfiles } from "../profile";
 import { listUserSkills } from "../injection";
 import type { FailureKind, Family, ModelsSnapshot, Profile, UsageSnapshot, WrapperState } from "../types";
-import { blockingReset, familyForModel, fetchUsage, minRemaining, readCachedUsage } from "../usage";
+import {
+	blockingReset,
+	familyForModel,
+	fetchUsage,
+	formatMultiUsageReport,
+	minRemaining,
+	readCachedUsage,
+} from "../usage";
 import {
 	deriveBaseConfigOptions,
 	extractAcpModelsFromResult,
@@ -149,6 +156,8 @@ class AcpProxy {
 	private readonly modelsInflight = new Map<string, Promise<ModelsSnapshot | null>>();
 	private readonly usageAbort = new AbortController();
 	private readonly deletedSessionIds = new Set<string>();
+	private readonly releaseCandidates = new Set<string>();
+	private activeClientRequests = 0;
 
 	private profiles = new Map<string, Profile>();
 	private state: WrapperState = { version: 1, pins: {}, blocks: {}, checkpoints: {} };
@@ -254,6 +263,7 @@ class AcpProxy {
 	}
 
 	private async handleClientRequest(request: JsonRpcRequest): Promise<void> {
+		this.activeClientRequests++;
 		try {
 			switch (request.method) {
 				case "initialize":
@@ -275,13 +285,15 @@ class AcpProxy {
 				case "session/fork":
 					return await this.onSessionFork(request);
 				case "session/prompt":
-					this.onSessionPrompt(request);
-					return;
+					return await this.runSessionPrompt(request);
 				default:
 					return await this.onGenericRequest(request);
 			}
 		} catch (error) {
 			this.respondFailure(request.id, error);
+		} finally {
+			this.activeClientRequests--;
+			this.releaseClosedChildren();
 		}
 	}
 
@@ -489,6 +501,7 @@ class AcpProxy {
 			"schedule",
 			"side",
 			"btw",
+			"multi-usage",
 		]);
 
 		// Standard system commands with descriptions
@@ -504,6 +517,7 @@ class AcpProxy {
 			{ name: "boost", description: "Deep thinking, strategic planning, and rigorous verification" },
 			{ name: "grill-me", description: "Interactive interview to resolve design decisions" },
 			{ name: "schedule", description: "Run an instruction on a recurring schedule or as a timer" },
+			{ name: "multi-usage", description: "Show average 5-hour and weekly quota limits across all accounts" },
 		];
 
 		// 1. Prioritize adding essential system slash commands first (so they are never truncated)
@@ -593,6 +607,21 @@ class AcpProxy {
 	// ---------------------------------------------------------------------
 	// Child lifecycle
 	// ---------------------------------------------------------------------
+
+	private releaseClosedChildren(): void {
+		// A concurrent session/new/load may be between ensureChild and its RPC.
+		// Wait for client operations (including prompts) before reclaiming it.
+		if (this.activeClientRequests > 0) return;
+		for (const slug of this.releaseCandidates) {
+			this.releaseCandidates.delete(slug);
+			const child = this.children.get(slug);
+			if (!child || child.loadedSessions.size > 0) continue;
+			this.children.delete(slug);
+			if (this.controlChild === child) this.controlChild = undefined;
+			child.kill();
+			this.log(`released agent ${slug} with no remaining sessions`);
+		}
+	}
 
 	private async ensureChild(profile: Profile): Promise<AcpChild> {
 		const existing = this.children.get(profile.slug);
@@ -1245,6 +1274,7 @@ class AcpProxy {
 			if (session) session.closed = true;
 		}
 		await this.saveStore();
+		this.releaseCandidates.add(record.profile);
 		this.respond(request.id, {});
 	}
 
@@ -1378,6 +1408,7 @@ class AcpProxy {
 					if (apply.error) {
 						nextChild.loadedSessions.delete(createdId);
 						void nextChild.request("session/close", { sessionId: createdId }).catch(() => {});
+						this.releaseCandidates.add(candidate.slug);
 						if (isModelUnsupportedError(apply.error)) {
 							lastUnsupportedError = new AcpRpcError(apply.error);
 							await this.markModelUnsupported(candidate, modelId);
@@ -1402,6 +1433,7 @@ class AcpProxy {
 					if (oldChild?.alive) {
 						oldChild.loadedSessions.delete(previousId);
 						void oldChild.request("session/close", { sessionId: previousId }).catch(() => {});
+						this.releaseCandidates.add(previousProfile);
 					}
 					this.log(`switched session ${session.id} to ${candidate.slug} for model ${modelId}`);
 					await this.saveStore();
@@ -1434,12 +1466,6 @@ class AcpProxy {
 	// Prompt execution and failover
 	// ---------------------------------------------------------------------
 
-	private onSessionPrompt(request: JsonRpcRequest): void {
-		void this.runSessionPrompt(request).catch(error => {
-			this.respondFailure(request.id, error);
-		});
-	}
-
 	private async runSessionPrompt(request: JsonRpcRequest): Promise<void> {
 		const params = isRecord(request.params) ? request.params : {};
 		const sessionId = readString(params.sessionId);
@@ -1455,6 +1481,13 @@ class AcpProxy {
 		const userText = promptToText(params.prompt);
 		if (!userText.trim()) {
 			this.respondError(request.id, -32602, "empty prompt");
+			return;
+		}
+
+		const multiUsageMatch = userText.trim().match(/^\/multi-usage(?:\s+(.*))?$/i);
+		if (multiUsageMatch) {
+			const forceRefresh = /\b(?:--refresh|refresh)\b/i.test(multiUsageMatch[1] ?? "");
+			await this.handleMultiUsageCommand(request.id, session, forceRefresh);
 			return;
 		}
 
@@ -1516,6 +1549,52 @@ class AcpProxy {
 		await this.runPrompt(request.id, session, userText, target, handoff, 0);
 	}
 
+	private async getMultiUsageSnapshot(profile: Profile, forceRefresh: boolean): Promise<UsageSnapshot | null> {
+		if (!forceRefresh) {
+			const now = Date.now();
+			const cached = this.usageCache.get(profile.slug);
+			if (cached && now - cached.at < USAGE_TTL_MS) return cached.snapshot;
+			const diskCached = await readCachedUsage(profile.slug);
+			if (diskCached) {
+				this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
+				if (now - diskCached.fetchedAt < USAGE_TTL_MS) return diskCached;
+			}
+		}
+		const live = await this.getUsage(profile, true);
+		if (live) return live;
+		return this.usageCache.get(profile.slug)?.snapshot ?? (await readCachedUsage(profile.slug));
+	}
+
+	private async handleMultiUsageCommand(
+		clientId: JsonRpcId,
+		session: SessionState,
+		forceRefresh: boolean,
+	): Promise<void> {
+		const profiles = [...this.profiles.values()];
+		const entries = await Promise.all(
+			profiles.map(async profile => {
+				if (profile.disabled || profile.bannedAt || profile.authRequiredAt) {
+					return { profile, snapshot: null };
+				}
+				const snapshot = await this.getMultiUsageSnapshot(profile, forceRefresh);
+				return { profile, snapshot };
+			}),
+		);
+		const report = formatMultiUsageReport(entries);
+		this.sendToClient({
+			jsonrpc: "2.0",
+			method: "session/update",
+			params: {
+				sessionId: session.id,
+				update: {
+					sessionUpdate: "agent_message_chunk",
+					content: { type: "text", text: report },
+				},
+			},
+		});
+		this.respond(clientId, { stopReason: "end_turn" });
+	}
+
 	private async runPrompt(
 		clientId: JsonRpcId,
 		session: SessionState,
@@ -1567,6 +1646,7 @@ class AcpProxy {
 					if (oldChild?.alive) {
 						oldChild.loadedSessions.delete(previousId);
 						void oldChild.request("session/close", { sessionId: previousId }).catch(() => {});
+						this.releaseCandidates.add(previousProfile);
 					}
 
 					const models = isRecord(createdResult.models) ? createdResult.models : undefined;

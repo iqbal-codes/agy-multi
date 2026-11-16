@@ -180,6 +180,65 @@ test("consecutive prompts and proxy restart keep the same backend conversation",
 	} finally { await f.cleanup(); }
 });
 
+test("closing the last session releases its agent and resume preserves the conversation", async () => {
+	const f = await fixture();
+	try {
+		const c = await f.start();
+		const id = await c.newSession();
+		await c.prompt(id, "FIRST");
+		const before = (await f.requests()).find(r => r.method === "session/prompt")!;
+		expect((await c.request("session/close", { sessionId: id })).error).toBeUndefined();
+		const alive = () => { try { process.kill(before.pid, 0); return true; } catch { return false; } };
+		const deadline = Date.now() + 1000;
+		while (alive() && Date.now() < deadline) await Bun.sleep(10);
+		expect(alive()).toBe(false);
+		expect((await c.request("session/resume", { sessionId: id, cwd: f.root })).error).toBeUndefined();
+		expect((await c.prompt(id, "SECOND")).error).toBeUndefined();
+		const after = (await f.requests()).filter(r => r.method === "session/prompt").at(-1)!;
+		expect(after.pid).not.toBe(before.pid);
+		expect(after.params.sessionId).toBe(before.params.sessionId);
+		await f.control({ quota: true });
+		await c.prompt(id, "THIRD");
+		const handoff = (await f.requests()).filter(r => r.method === "session/prompt").at(-1)!;
+		expect(handoff.params.prompt![0].text).toContain("FIRST");
+		expect(handoff.params.prompt![0].text).toContain("ANSWER_SECOND");
+	} finally { await f.cleanup(); }
+});
+
+test("account failover releases the previous agent when it has no other sessions", async () => {
+	const f = await fixture();
+	try {
+		const c = await f.start();
+		const id = await c.newSession();
+		const before = (await f.requests()).find(r => r.method === "session/new")!;
+		await f.control({ quota: true });
+		expect((await c.prompt(id, "SWITCH")).error).toBeUndefined();
+		const alive = () => { try { process.kill(before.pid, 0); return true; } catch { return false; } };
+		const deadline = Date.now() + 1000;
+		while (alive() && Date.now() < deadline) await Bun.sleep(10);
+		expect(alive()).toBe(false);
+	} finally { await f.cleanup(); }
+});
+
+test("account failover keeps the previous agent while another session still uses it", async () => {
+	const f = await fixture();
+	try {
+		const c = await f.start();
+		const first = await c.newSession();
+		const sibling = await c.newSession();
+		const starts = (await f.requests()).filter(r => r.method === "session/new");
+		expect(starts[0].pid).toBe(starts[1].pid);
+		await f.control({ quota: true });
+		expect((await c.prompt(first, "SWITCH")).error).toBeUndefined();
+		expect(() => process.kill(starts[0].pid, 0)).not.toThrow();
+		// Quota-blocked accounts correctly fail over on generation; use a
+		// session operation to verify the sibling's existing agent is retained.
+		expect((await c.request("session/test_usage", { sessionId: sibling, used: 7 })).error).toBeUndefined();
+		const last = (await f.requests()).filter(r => r.method === "session/test_usage").at(-1)!;
+		expect(last.pid).toBe(starts[0].pid);
+	} finally { await f.cleanup(); }
+});
+
 test("native usage is not replaced by synthetic context numbers, including compaction", async () => {
 	const f = await fixture();
 	try {
