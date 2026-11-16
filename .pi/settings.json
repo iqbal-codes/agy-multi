@@ -1,0 +1,5 @@
+{
+  "extensions": [
+    "./.animus/hooks/loop-guard.ts"
+  ]
+}

@@ -11,71 +11,114 @@ $SourceDir = "$HOME\.local\share\agy-multi"
 
 Write-Host "Installing agy-multi (multi-account failover for Antigravity)..." -ForegroundColor Cyan
 
-# 1. Check or install Bun
-if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
-    if (Test-Path "$HOME\.bun\bin\bun.exe") {
-        $env:PATH = "$HOME\.bun\bin;$env:PATH"
-    } else {
-        Write-Host "==> Bun not found in PATH. Installing Bun via bun.sh..." -ForegroundColor Yellow
-        irm bun.sh/install.ps1 | iex
-        $env:PATH = "$HOME\.bun\bin;$env:PATH"
-    }
-}
+$RepoSlug = if ($env:REPO_SLUG) { $env:REPO_SLUG } else { "iqbal-codes/agy-multi" }
+$ReleaseBaseUrl = if ($env:RELEASE_BASE_URL) { $env:RELEASE_BASE_URL } else { "https://github.com/$RepoSlug/releases/latest/download" }
 
-if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
-    Write-Error "Bun is required to build/run agy-multi. Please install Bun from https://bun.sh."
-}
-
-# 2. Determine work directory
+$IsLocalCheckout = $false
 $WorkDir = $null
 if (Test-Path "package.json") {
     try {
         $pkg = Get-Content "package.json" -Raw | ConvertFrom-Json
         if ($pkg.name -eq "agy-multi") {
+            $IsLocalCheckout = $true
             $WorkDir = (Get-Location).Path
         }
     } catch {}
 }
 
-if (-not $WorkDir) {
-    Write-Host "==> Setting up repository in $SourceDir..." -ForegroundColor Cyan
-    if (Test-Path "$SourceDir\.git") {
-        git -C "$SourceDir" pull --ff-only
-    } else {
-        New-Item -ItemType Directory -Force -Path (Split-Path $SourceDir) | Out-Null
-        git clone --depth=1 $RepoUrl $SourceDir
+function Install-FromPrebuilt {
+    $Asset = "agy-multi-windows-x64.zip"
+    $Url = "$ReleaseBaseUrl/$Asset"
+    $TempDir = Join-Path $env:TEMP ("agy-multi-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+
+    try {
+        Write-Host "==> Downloading prebuilt binaries (windows-x64) from GitHub Releases..." -ForegroundColor Cyan
+        $ZipPath = Join-Path $TempDir $Asset
+        Invoke-WebRequest -Uri $Url -OutFile $ZipPath -UseBasicParsing
+        Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
+
+        $BinMain = Join-Path $TempDir "agy-multi.exe"
+        $BinAcp = Join-Path $TempDir "agy-multi-acp.exe"
+        if (-not (Test-Path $BinMain) -or -not (Test-Path $BinAcp)) {
+            return $false
+        }
+
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        Copy-Item -Force $BinMain "$InstallDir\agy-multi.exe"
+        Copy-Item -Force $BinAcp "$InstallDir\agy-multi-acp.exe"
+        return $true
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
     }
-    $WorkDir = $SourceDir
 }
 
-Set-Location $WorkDir
+function Install-FromSource {
+    # 1. Check or install Bun
+    if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+        if (Test-Path "$HOME\.bun\bin\bun.exe") {
+            $env:PATH = "$HOME\.bun\bin;$env:PATH"
+        } else {
+            Write-Host "==> Bun not found in PATH. Installing Bun via bun.sh..." -ForegroundColor Yellow
+            irm bun.sh/install.ps1 | iex
+            $env:PATH = "$HOME\.bun\bin;$env:PATH"
+        }
+    }
 
-# 3. Dependencies
-Write-Host "==> Installing dependencies..." -ForegroundColor Cyan
-bun install
+    if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+        Write-Error "Bun is required to build/run agy-multi. Please install Bun from https://bun.sh."
+    }
 
-# 4. Build standalone binaries
-Write-Host "==> Compiling standalone single-binary executables..." -ForegroundColor Cyan
-bun run build
+    # 2. Determine work directory
+    if (-not $WorkDir) {
+        Write-Host "==> Setting up repository in $SourceDir..." -ForegroundColor Cyan
+        if (Test-Path "$SourceDir\.git") {
+            git -C "$SourceDir" pull --ff-only
+        } else {
+            New-Item -ItemType Directory -Force -Path (Split-Path $SourceDir) | Out-Null
+            git clone --depth=1 $RepoUrl $SourceDir
+        }
+        $WorkDir = $SourceDir
+    }
 
-# 5. Install to target directory
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Set-Location $WorkDir
 
-if (Test-Path "dist\agy-multi.exe") {
-    Copy-Item -Force "dist\agy-multi.exe" "$InstallDir\agy-multi.exe"
-} elseif (Test-Path "dist\agy-multi") {
-    Copy-Item -Force "dist\agy-multi" "$InstallDir\agy-multi.exe"
+    # 3. Dependencies
+    Write-Host "==> Installing dependencies..." -ForegroundColor Cyan
+    bun install
+
+    # 4. Build standalone binaries
+    Write-Host "==> Compiling standalone single-binary executables..." -ForegroundColor Cyan
+    bun run build
+
+    # 5. Install to target directory
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+    if (Test-Path "dist\agy-multi.exe") {
+        Copy-Item -Force "dist\agy-multi.exe" "$InstallDir\agy-multi.exe"
+    } elseif (Test-Path "dist\agy-multi") {
+        Copy-Item -Force "dist\agy-multi" "$InstallDir\agy-multi.exe"
+    }
+
+    if (Test-Path "dist\agy-multi-acp.exe") {
+        Copy-Item -Force "dist\agy-multi-acp.exe" "$InstallDir\agy-multi-acp.exe"
+    } elseif (Test-Path "dist\agy-multi-acp") {
+        Copy-Item -Force "dist\agy-multi-acp" "$InstallDir\agy-multi-acp.exe"
+    }
+
+    # Also copy CMD helper scripts
+    Copy-Item -Force "bin\agy-multi.cmd" "$InstallDir\agy-multi.cmd" -ErrorAction SilentlyContinue
+    Copy-Item -Force "bin\agy-multi-acp.cmd" "$InstallDir\agy-multi-acp.cmd" -ErrorAction SilentlyContinue
 }
 
-if (Test-Path "dist\agy-multi-acp.exe") {
-    Copy-Item -Force "dist\agy-multi-acp.exe" "$InstallDir\agy-multi-acp.exe"
-} elseif (Test-Path "dist\agy-multi-acp") {
-    Copy-Item -Force "dist\agy-multi-acp" "$InstallDir\agy-multi-acp.exe"
+if ($IsLocalCheckout -or ($env:AGY_MULTI_FROM_SOURCE -eq "1")) {
+    Install-FromSource
+} elseif (-not (Install-FromPrebuilt)) {
+    Write-Host "warning: Prebuilt release not available yet; falling back to source build..." -ForegroundColor Yellow
+    Install-FromSource
 }
-
-# Also copy CMD helper scripts
-Copy-Item -Force "bin\agy-multi.cmd" "$InstallDir\agy-multi.cmd" -ErrorAction SilentlyContinue
-Copy-Item -Force "bin\agy-multi-acp.cmd" "$InstallDir\agy-multi-acp.cmd" -ErrorAction SilentlyContinue
 
 # 6. Verify PATH
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")

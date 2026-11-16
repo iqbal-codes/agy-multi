@@ -7,7 +7,7 @@ import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, s
 import { listProfiles, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
 import { loadState } from "./state";
-import { fetchUsage } from "./usage";
+import { fetchUsage, formatMultiUsageReport } from "./usage";
 import { fetchModels, readCachedModels } from "./models";
 import { MODELS_TTL_MS } from "./paths";
 import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
@@ -23,6 +23,7 @@ Usage:
   agy-multi profile sync [<slug>]
   agy-multi profile remove <slug>
   agy-multi quota [--profile <slug>]
+  agy-multi multi-usage [--profile <slug>]
   agy-multi models [--profile <slug>] [--refresh]
   agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
   agy-multi acp [--clean] [--compaction-threshold <tokens>] [-- agy acp args...]
@@ -207,6 +208,19 @@ async function main(): Promise<void> {
 				);
 			}
 		}
+		return;
+	}
+
+	if (command === "multi-usage") {
+		await ensureAgy();
+		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
+		const entries = await Promise.all(
+			profiles.map(async profile => ({
+				profile,
+				snapshot: await fetchUsage(profile).catch(() => null),
+			})),
+		);
+		console.log(formatMultiUsageReport(entries));
 		return;
 	}
 

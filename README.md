@@ -390,6 +390,13 @@ What the proxy does:
   Older mapping-only records hydrate history through a silent load on resume.
 - If an agent process exits, the next prompt resumes its existing conversation.
   If the conversation is unavailable, a replacement receives a contextual handoff.
+- On macOS/Linux, each account's ACP agent runs in an isolated process group.
+  Proxy shutdown or agent exit terminates its remaining MCP/tool descendants.
+  Closing/deleting the last session, or switching away from an account's last
+  session, releases that account's agent after in-flight client requests finish.
+  Shared agents remain alive while other sessions use them. Closed conversations
+  retain their persisted history and can be resumed with a new agent process.
+  Idle but open sessions stay running; this does not impose an inactivity timeout.
 - Native `usage_update` events are forwarded immediately during an active prompt,
   unchanged apart from the session ID; they are not buffered until the turn ends.
   Update frequency depends on when the official agent publishes usage, not on

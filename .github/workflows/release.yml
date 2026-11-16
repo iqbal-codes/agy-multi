@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: false
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!contains(github.event.head_commit.message, '[skip ci]') && github.actor != 'github-actions[bot]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck & test before release
+        run: |
+          bun run typecheck
+          bun test
+
+      - name: Bump version
+        id: version
+        env:
+          BUMP_INPUT: ${{ inputs.bump || '' }}
+          COMMIT_MSG: ${{ github.event.head_commit.message || '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
+          PR_LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '[.[].labels[].name] | join(",")' 2>/dev/null || true)"
+          export LATEST_TAG PR_LABELS
+          NEW_VERSION="$(bun -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+
+            const parseSemver = (v: string): [number, number, number] => {
+              const clean = v.replace(/^v/, "").split("-")[0] ?? "0.0.0";
+              const [maj = 0, min = 0, pat = 0] = clean.split(".").map((n) => Number.parseInt(n, 10) || 0);
+              return [maj, min, pat];
+            };
+
+            const cmpSemver = (a: [number, number, number], b: [number, number, number]) => {
+              for (let i = 0; i < 3; i++) {
+                if (a[i] !== b[i]) return a[i] - b[i];
+              }
+              return 0;
+            };
+
+            const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+            const pkgVer = parseSemver(pkg.version ?? "0.0.0");
+            const tagVer = process.env.LATEST_TAG ? parseSemver(process.env.LATEST_TAG) : ([0, 0, 0] as [number, number, number]);
+            const base = cmpSemver(pkgVer, tagVer) >= 0 ? pkgVer : tagVer;
+
+            const bumpInput = (process.env.BUMP_INPUT || "").trim();
+            const labels = new Set((process.env.PR_LABELS || "").split(",").map((s) => s.trim()).filter(Boolean));
+            const commitMsg = process.env.COMMIT_MSG || "";
+            const labelBump = labels.has("release:major") ? "major" : labels.has("release:minor") ? "minor" : "";
+            const commitBump = commitMsg.includes("[major]") ? "major" : commitMsg.includes("[minor]") ? "minor" : "";
+            const bumpType = bumpInput || labelBump || commitBump || "patch";
+
+            let [maj, min, pat] = base;
+            if (bumpType === "major") {
+              maj += 1;
+              min = 0;
+              pat = 0;
+            } else if (bumpType === "minor") {
+              min += 1;
+              pat = 0;
+            } else {
+              pat += 1;
+            }
+
+            const next = `${maj}.${min}.${pat}`;
+            pkg.version = next;
+            writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+            console.log(next);
+          ')"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump & push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "chore(release): ${{ steps.version.outputs.tag }} [skip ci]"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin HEAD:main
+          git push origin "${{ steps.version.outputs.tag }}"
+
+  build:
+    needs: bump
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-linux-x64
+            asset: agy-multi-linux-x64.tar.gz
+            ext: ""
+          - target: bun-linux-arm64
+            asset: agy-multi-linux-arm64.tar.gz
+            ext: ""
+          - target: bun-darwin-arm64
+            asset: agy-multi-darwin-arm64.tar.gz
+            ext: ""
+          - target: bun-darwin-x64
+            asset: agy-multi-darwin-x64.tar.gz
+            ext: ""
+          - target: bun-windows-x64
+            asset: agy-multi-windows-x64.zip
+            ext: ".exe"
+    steps:
+      - name: Checkout tagged release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Compile standalone binaries (${{ matrix.target }})
+        run: |
+          mkdir -p out release
+          bun build --compile --minify --target=${{ matrix.target }} src/index.ts --outfile "out/agy-multi${{ matrix.ext }}"
+          bun build --compile --minify --target=${{ matrix.target }} src/acp-bin.ts --outfile "out/agy-multi-acp${{ matrix.ext }}"
+
+      - name: Package release archive
+        run: |
+          if [[ "${{ matrix.asset }}" == *.zip ]]; then
+            zip -j "release/${{ matrix.asset }}" out/*
+          else
+            tar -czf "release/${{ matrix.asset }}" -C out .
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: release/${{ matrix.asset }}
+
+  release:
+    needs: [bump, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.bump.outputs.tag }}" \
+            release/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ needs.bump.outputs.tag }}" \
+            --generate-notes

@@ -60,6 +60,9 @@ export class AcpChild {
 		const logPath = join(profileDir(this.slug), `acp-${process.pid}.log`);
 		const args = [options.agyBin, "acp", "--log-file", logPath, ...options.extraArgs];
 		const proc = Bun.spawn(args, {
+			// Own an isolated process group so MCP servers and their descendants
+			// can be reclaimed without signalling the host or another account.
+			detached: process.platform !== "win32",
 			env: profileEnvOf(options.profile),
 			stdin: "pipe",
 			stdout: "pipe",
@@ -126,12 +129,21 @@ export class AcpChild {
 	kill(): void {
 		if (this.exitNotified) return;
 		this.closed = true;
-		try {
-			this.proc.kill();
-		} catch {
-			// Already gone.
-		}
+		this.stopProcessTree();
 		this.rejectPending(new Error(`agent ${this.slug} was stopped`));
+	}
+
+	private stopProcessTree(): void {
+		try {
+			// As with quota probes, terminate the owned group atomically: a
+			// partially interrupted credential read can otherwise launch OAuth.
+			if (process.platform === "win32") this.proc.kill("SIGKILL");
+			else process.kill(-this.proc.pid, "SIGKILL");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+				this.options.log(`[agy:${this.slug}] process cleanup failed: ${error}`);
+			}
+		}
 	}
 
 	private handleLine(line: string): void {
@@ -165,6 +177,8 @@ export class AcpChild {
 		if (this.exitNotified) return;
 		this.exitNotified = true;
 		this.closed = true;
+		// The agent may crash or close stdout while MCP descendants stay alive.
+		this.stopProcessTree();
 		this.rejectPending(new Error(`agent ${this.slug} exited`));
 		this.options.onExit(this, this.exitCode);
 	}
