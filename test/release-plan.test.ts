@@ -21,8 +21,12 @@ describe("release plan", () => {
 		expect(deriveBump("Merge pull request #2 from a/branch")).toBe("patch");
 	});
 
-	test("a BREAKING CHANGE footer makes it major", () => {
+	test("only a footer line marks a breaking change", () => {
 		expect(deriveBump("fix: rename the state root", "BREAKING CHANGE: ~/.agy moved")).toBe("major");
+		expect(deriveBump("fix: rename the state root", "note\n\nBREAKING-CHANGE: ~/.agy moved")).toBe("major");
+		// Prose that talks *about* breaking changes must not bump the major digit.
+		expect(deriveBump("fix: plan docs", "`feat!:` or a `BREAKING CHANGE` footer is major")).toBe("patch");
+		expect(deriveBump("feat: plan docs", "see BREAKING CHANGE for details")).toBe("minor");
 		expect(deriveBump("feat: x", "no breaking marker here")).toBe("minor");
 	});
 

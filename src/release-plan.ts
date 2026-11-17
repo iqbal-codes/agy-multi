@@ -10,11 +10,14 @@ const CONVENTIONAL_TITLE = /^([a-z]+)(?:\([^)]*\))?(!)?:/i;
 
 /**
  * Conventional-commit title → semver bump. `feat:` is a feature, `feat!:` or a
- * `BREAKING CHANGE` footer is a break, everything else is a patch: docs and
+ * `BREAKING CHANGE:` footer is a break, everything else is a patch: docs and
  * chores still ship, they just do not claim a new capability.
+ *
+ * The footer has to start a line, as the convention requires. Prose that merely
+ * mentions a breaking change must not bump the major digit.
  */
 export function deriveBump(title: string, body = ""): ReleaseBump {
-	if (/\bBREAKING[ -]CHANGE\b/i.test(body)) return "major";
+	if (/^BREAKING[ -]CHANGE:/im.test(body)) return "major";
 	const match = CONVENTIONAL_TITLE.exec(title.trim());
 	if (!match) return "patch";
 	if (match[2]) return "major";
