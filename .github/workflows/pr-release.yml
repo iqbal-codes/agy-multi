@@ -1,0 +1,96 @@
+name: PR Release Plan
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-release-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    # Fork pull requests get a read-only token, so labelling would fail there.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    name: Release plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Project the bump and version
+        id: plan
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # The bump is projected from main's released state, while the planning
+          # script comes from the pull request (it is not on main yet on its own PR).
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+          git fetch --no-tags --force origin "$BASE_REF" >/dev/null
+          BUMP="$(bun src/release-plan.ts derive "$TITLE" "$BODY")"
+          PACKAGE="$(git show "origin/$BASE_REF:package.json" | jq -r '.version // "0.0.0"')"
+          TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
+          BASE="$(bun src/release-plan.ts base "$PACKAGE" "$TAG")"
+          VERSION="$(bun src/release-plan.ts next "$BASE" "$BUMP")"
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$BUMP" = "patch" ]; then
+            echo "label=" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=release:$BUMP" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Label the pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          LABEL: ${{ steps.plan.outputs.label }}
+        run: |
+          gh label create release:minor --color 0e8a16 --description "Minor semver bump on merge to main" --force
+          gh label create release:major --color d93f0b --description "Major semver bump on merge to main" --force
+          gh pr edit "$PR" --remove-label release:minor --remove-label release:major >/dev/null 2>&1 || true
+          if [ -n "$LABEL" ]; then
+            gh pr edit "$PR" --add-label "$LABEL" >/dev/null
+          fi
+
+      - name: Post the release plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BUMP: ${{ steps.plan.outputs.bump }}
+          BASE: ${{ steps.plan.outputs.base }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          {
+            printf '<!-- agy-release-plan -->\n'
+            printf '### Release plan\n\n'
+            printf '| | |\n| --- | --- |\n'
+            printf '| Bump | %s |\n' "$BUMP"
+            printf '| Current | %s |\n' "$BASE"
+            printf '| On merge | v%s |\n' "$VERSION"
+            printf '\nMerging this pull request runs the Release workflow: it rewrites the version in `package.json`, tags `v%s`, builds the binaries and publishes the release. Nobody tags by hand.\n\n' "$VERSION"
+            printf 'The bump comes from the pull request title: `feat:` is a minor bump, `feat!:` or a `BREAKING CHANGE` footer is major, everything else is a patch. Retitle the PR to change the plan; the label follows automatically.\n'
+          } > /tmp/release-plan.md
+          EXISTING="$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[] | select(.body | startswith("<!-- agy-release-plan -->")) | .id' | head -n1)"
+          if [ -n "$EXISTING" ]; then
+            jq -n --rawfile body /tmp/release-plan.md '{body: $body}' > /tmp/release-plan.json
+            gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" --input /tmp/release-plan.json >/dev/null
+          else
+            gh pr comment "$PR" --body-file /tmp/release-plan.md >/dev/null
+          fi
