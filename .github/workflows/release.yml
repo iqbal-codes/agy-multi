@@ -59,54 +59,21 @@ jobs:
         run: |
           LATEST_TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
           PR_LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '[.[].labels[].name] | join(",")' 2>/dev/null || true)"
-          export LATEST_TAG PR_LABELS
-          NEW_VERSION="$(bun -e '
+          PACKAGE="$(bun -e 'console.log(JSON.parse(await Bun.file("package.json").text()).version ?? "0.0.0")')"
+          BASE="$(bun src/release-plan.ts base "$PACKAGE" "$LATEST_TAG")"
+          BUMP="$(bun src/release-plan.ts pick "$BUMP_INPUT" "$PR_LABELS" "$COMMIT_MSG")"
+          NEW_VERSION="$(bun src/release-plan.ts next "$BASE" "$BUMP")"
+          export NEW_VERSION
+          bun -e '
             import { readFileSync, writeFileSync } from "node:fs";
-
-            const parseSemver = (v: string): [number, number, number] => {
-              const clean = v.replace(/^v/, "").split("-")[0] ?? "0.0.0";
-              const [maj = 0, min = 0, pat = 0] = clean.split(".").map((n) => Number.parseInt(n, 10) || 0);
-              return [maj, min, pat];
-            };
-
-            const cmpSemver = (a: [number, number, number], b: [number, number, number]) => {
-              for (let i = 0; i < 3; i++) {
-                if (a[i] !== b[i]) return a[i] - b[i];
-              }
-              return 0;
-            };
-
             const pkg = JSON.parse(readFileSync("package.json", "utf8"));
-            const pkgVer = parseSemver(pkg.version ?? "0.0.0");
-            const tagVer = process.env.LATEST_TAG ? parseSemver(process.env.LATEST_TAG) : ([0, 0, 0] as [number, number, number]);
-            const base = cmpSemver(pkgVer, tagVer) >= 0 ? pkgVer : tagVer;
-
-            const bumpInput = (process.env.BUMP_INPUT || "").trim();
-            const labels = new Set((process.env.PR_LABELS || "").split(",").map((s) => s.trim()).filter(Boolean));
-            const commitMsg = process.env.COMMIT_MSG || "";
-            const labelBump = labels.has("release:major") ? "major" : labels.has("release:minor") ? "minor" : "";
-            const commitBump = commitMsg.includes("[major]") ? "major" : commitMsg.includes("[minor]") ? "minor" : "";
-            const bumpType = bumpInput || labelBump || commitBump || "patch";
-
-            let [maj, min, pat] = base;
-            if (bumpType === "major") {
-              maj += 1;
-              min = 0;
-              pat = 0;
-            } else if (bumpType === "minor") {
-              min += 1;
-              pat = 0;
-            } else {
-              pat += 1;
-            }
-
-            const next = `${maj}.${min}.${pat}`;
-            pkg.version = next;
+            pkg.version = process.env.NEW_VERSION;
             writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
-            console.log(next);
-          ')"
+          '
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$NEW_VERSION ($BUMP from $BASE)"
 
       - name: Commit version bump & push tag
         run: |
