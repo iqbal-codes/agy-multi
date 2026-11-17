@@ -12,21 +12,32 @@ describe("ACP prompt helpers", () => {
 		).toBe("hello\n[file: a.ts]\n[image]");
 	});
 
-	test("handoff includes history, cwd, git head and the last user turn", () => {
+	test("replay is the transcript verbatim, with no framing and no account narrative", () => {
 		const text = buildHandoffPrompt({
 			history: [
 				{ role: "user", text: "fix the bug" },
 				{ role: "assistant", text: "I found it" },
 				{ role: "user", text: "continue" },
 			],
-			cwd: "/repo",
-			gitHead: "abc123",
 		});
-		expect(text).toContain("Working directory: /repo");
-		expect(text).toContain("Git HEAD: abc123");
-		expect(text).toContain("User:\nfix the bug");
-		expect(text).toContain("Assistant:\nI found it");
-		expect(text).toContain("User:\ncontinue");
+		expect(text).toBe("User:\nfix the bug\n\nAssistant:\nI found it\n\nUser:\ncontinue");
+		// Nothing is added to make the new session behave differently.
+		expect(text).not.toContain("Conversation so far");
+		expect(text).not.toContain("Continue from the last user message");
+		expect(text.toLowerCase()).not.toContain("account");
+		expect(text).not.toContain("Working directory");
+	});
+
+	test("replay defaults to the whole conversation and honours a cap", () => {
+		const entries = [
+			{ role: "user" as const, text: "old".repeat(100) },
+			{ role: "assistant" as const, text: "new".repeat(100) },
+		];
+		expect(buildHandoffPrompt({ history: entries })).toContain("old".repeat(100));
+		const capped = buildHandoffPrompt({ history: entries, maxChars: 250 });
+		expect(capped).toContain("earlier turns omitted");
+		expect(capped).toContain("new".repeat(100));
+		expect(capped).not.toContain("old".repeat(100));
 	});
 
 	test("history rendering keeps the most recent turns under the cap", () => {

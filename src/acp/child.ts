@@ -52,6 +52,7 @@ export class AcpChild {
 	private closed = false;
 	private exitNotified = false;
 	private exitCode: number | null = null;
+	private readonly exited = Promise.withResolvers<void>();
 
 	constructor(private readonly options: AcpChildOptions) {
 		this.slug = options.profile.slug;
@@ -133,6 +134,18 @@ export class AcpChild {
 		this.rejectPending(new Error(`agent ${this.slug} was stopped`));
 	}
 
+	/**
+	 * Stops the child and settles once the process is actually gone, so sequential
+	 * mode can be sure one account is closed before the next one opens.
+	 */
+	async stop(): Promise<void> {
+		this.kill();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		const timer = setTimeout(resolve, 5_000);
+		await Promise.race([this.exited.promise, promise]);
+		clearTimeout(timer);
+	}
+
 	private stopProcessTree(): void {
 		try {
 			// As with quota probes, terminate the owned group atomically: a
@@ -174,6 +187,7 @@ export class AcpChild {
 
 	private handleExit(code?: number | null): void {
 		if (code !== undefined) this.exitCode = code;
+		this.exited.resolve();
 		if (this.exitNotified) return;
 		this.exitNotified = true;
 		this.closed = true;

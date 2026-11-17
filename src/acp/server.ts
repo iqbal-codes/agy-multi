@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { classifyAcpError, isModelUnsupportedError, isSessionLostError } from "../classify";
-import { exists, run } from "../fs-utils";
+import { exists } from "../fs-utils";
 import {
 	AGY_BIN,
 	ACP_SESSIONS_PATH,
@@ -47,7 +47,7 @@ import {
 	nextWaitMs,
 } from "./daemon-tasks";
 import { isRecord } from "./guards";
-import { buildHandoffPrompt, promptToText, toolTitle, type HistoryEntry } from "./prompt";
+import { buildHandoffPrompt, promptToText, type HistoryEntry } from "./prompt";
 import {
 	isNotification,
 	isRequest,
@@ -69,6 +69,14 @@ import {
 	DEFAULT_COMPACTION_THRESHOLD,
 } from "./token-usage";
 
+/**
+ * Default pause between account handoffs in pool mode. Pacing only: it keeps a
+ * fresh account from absorbing a burst the instant the previous one ran out.
+ */
+const DEFAULT_SWITCH_DELAY_MS = 20_000;
+/** `0` replays the whole conversation: a handoff must not rewrite what the user saw. */
+const DEFAULT_HANDOFF_CONTEXT_CHARS = 0;
+
 export interface AcpProxyOptions {
 	agyBin?: string;
 	extraArgs?: string[];
@@ -77,11 +85,37 @@ export interface AcpProxyOptions {
 	compactionThreshold?: number;
 	sessionsPath?: string;
 	log?: (line: string) => void;
+	/** Pins the proxy to a single account. Nothing selects an account on its own. */
+	profile?: string;
+	/**
+	 * Pool mode only: pause before handing a turn to another account. This is
+	 * pacing — it keeps a fresh account from being hit the instant the previous one
+	 * returned 429. It is not a detection countermeasure and is not presented as one.
+	 */
+	switchDelayMs?: number;
+	/**
+	 * Character budget for replaying the conversation into a fresh backend session.
+	 * `0` replays everything; undefaulted to a size that fits a long session.
+	 */
+	handoffContextChars?: number;
+	/**
+	 * Pool mode only: keep exactly one account active. Ranking reads cached
+	 * snapshots instead of probing every profile, and the previous agent process
+	 * is torn down (and awaited) before the next one starts, so no two accounts are
+	 * ever active at the same moment.
+	 */
+	sequential?: boolean;
+	/**
+	 * Legacy multi-account pool: restores automatic quota failover and rotation.
+	 * Google's Antigravity Terms §6 and FAQ do not permit this on consumer plans;
+	 * it exists only so the previous behaviour stays reachable behind an explicit
+	 * opt-in instead of being deleted.
+	 */
+	allowAccountPool?: boolean;
 }
 
 interface TurnState {
 	assistantText: string;
-	toolTitles: string[];
 	forwardedOutput: boolean;
 	suppressUserChunk: boolean;
 	suppressOutput?: boolean;
@@ -138,7 +172,13 @@ function errorMessage(error: unknown): string {
 class AcpProxy {
 	private readonly agyBin: string;
 	private readonly extraArgs: string[];
-	private readonly maxSwitches: number;
+	private readonly allowAccountPool: boolean;
+	private readonly requestedProfile?: string;
+	private readonly switchDelayMs: number;
+	private readonly handoffContextChars: number;
+	private readonly sequential: boolean;
+	private maxSwitches: number;
+	private pinnedProfile?: Profile;
 	private readonly reservePct: number;
 	private readonly compactionThreshold: number;
 	private readonly sessionsPath: string;
@@ -160,7 +200,7 @@ class AcpProxy {
 	private activeClientRequests = 0;
 
 	private profiles = new Map<string, Profile>();
-	private state: WrapperState = { version: 1, pins: {}, blocks: {}, checkpoints: {} };
+	private state: WrapperState = { version: 2, pins: {}, blocks: {}, checkpoints: {} };
 	private store: AcpSessionStore = { version: 1, sessions: {} };
 	private clientInitialize?: unknown;
 	private controlChild?: AcpChild;
@@ -171,6 +211,12 @@ class AcpProxy {
 	constructor(options: AcpProxyOptions = {}) {
 		this.agyBin = options.agyBin ?? AGY_BIN;
 		this.extraArgs = options.extraArgs ?? [];
+		this.allowAccountPool = options.allowAccountPool ?? false;
+		this.requestedProfile = options.profile;
+		this.switchDelayMs =
+			options.switchDelayMs ?? (this.allowAccountPool ? DEFAULT_SWITCH_DELAY_MS : 0);
+		this.handoffContextChars = options.handoffContextChars ?? DEFAULT_HANDOFF_CONTEXT_CHARS;
+		this.sequential = options.sequential ?? false;
 		this.maxSwitches = options.maxSwitches ?? 3;
 		this.reservePct = options.reservePct ?? DEFAULT_RESERVE_PCT;
 		this.compactionThreshold = resolveCompactionThreshold(options.compactionThreshold);
@@ -182,6 +228,7 @@ class AcpProxy {
 	async start(): Promise<void> {
 		this.profiles = new Map((await listProfiles()).map(profile => [profile.slug, profile]));
 		this.state = await loadState();
+		this.resolvePinnedProfile();
 		this.store = await loadAcpSessions(this.sessionsPath);
 		await Promise.all(
 			[...this.profiles.values()].map(async profile => {
@@ -198,7 +245,9 @@ class AcpProxy {
 			}),
 		);
 		this.log(
-			`ready — ${this.profiles.size} profile(s), ${Object.keys(this.store.sessions).length} stored session(s), auto-compaction threshold: ${this.compactionThreshold > 0 ? `${this.compactionThreshold} tokens` : "disabled"}`,
+			`ready — ${this.profiles.size} profile(s), ${Object.keys(this.store.sessions).length} stored session(s), ` +
+				`account: ${this.allowAccountPool ? `pool (legacy opt-in${this.sequential ? ", sequential" : ""})` : `${this.pinnedProfile?.slug ?? "-"} (pinned)`}, ` +
+				`auto-compaction threshold: ${this.compactionThreshold > 0 ? `${this.compactionThreshold} tokens` : "disabled"}`,
 		);
 
 		new LineReader(
@@ -215,6 +264,98 @@ class AcpProxy {
 		);
 		process.on("SIGTERM", () => this.shutdown());
 		process.on("SIGINT", () => this.shutdown());
+	}
+
+	/**
+	 * Default mode serves exactly one operator-chosen account. There is no
+	 * fallback: picking another account after a quota/ban/auth failure is the
+	 * rotation the Antigravity Terms prohibit, so this mode reports the failure
+	 * instead of acting on it. `--allow-account-pool` keeps the legacy behaviour
+	 * reachable without deleting it.
+	 */
+	private resolvePinnedProfile(): void {
+		if (this.sequential && !this.allowAccountPool) {
+			throw new Error(
+				"--sequential requires --allow-account-pool: pinned mode already serves exactly one account",
+			);
+		}
+		if (this.allowAccountPool) {
+			if (this.requestedProfile) {
+				throw new Error("--profile and --allow-account-pool are mutually exclusive");
+			}
+			this.log(
+				"WARNING: account pool enabled (--allow-account-pool) — automatic quota failover and account rotation " +
+					"violate the Google Antigravity Terms of Service (§6) and are not supported under consumer plans. " +
+					"The previous behaviour stays available behind this flag; the account risk is yours. " +
+					`Handoffs are paced ${Math.round(this.switchDelayMs / 1000)}s apart (--switch-delay).` +
+					(this.sequential
+						? " Sequential mode: one account active at a time; ranking uses cached model/usage snapshots."
+						: " Without --sequential, ranking probes every account (including usage and models) when selecting."),
+			);
+			return;
+		}
+		const slug = this.requestedProfile ?? this.state.defaultProfile;
+		if (!slug) {
+			throw new Error(
+				"no account selected: pass `agy-multi acp --profile <slug>`, or record a default with `agy-multi use <slug>`",
+			);
+		}
+		const profile = this.profiles.get(slug);
+		if (!profile) throw new Error(`unknown profile: ${slug} — list accounts with \`agy-multi profile list\``);
+		if (profile.disabled) {
+			throw new Error(`profile ${slug} is disabled — enable it with \`agy-multi profile enable ${slug}\``);
+		}
+		this.pinnedProfile = profile;
+	}
+
+	/**
+	 * Explains to the operator what failed and what to do by hand. Used instead of
+	 * an account switch, so the client never silently changes identity.
+	 */
+	private accountDiagnostic(profile: Profile, kind: FailureKind, until?: number): string {
+		if (kind === "banned") {
+			return (
+				`account ${profile.slug} is suspended for a Terms of Service violation; this proxy does not fail over ` +
+				"to another account. Switch by hand with `agy-multi use <slug>` (or --profile), then restart the ACP client."
+			);
+		}
+		if (kind === "auth") {
+			return `account ${profile.slug} is signed out — run \`agy-multi profile login ${profile.slug}\`, then restart the ACP client.`;
+		}
+		if (kind === "quota") {
+			const reset = until === undefined ? "" : ` (resets ${new Date(until).toISOString()})`;
+			return (
+				`account ${profile.slug} is out of quota${reset}; no automatic failover is performed. ` +
+				"Wait for the reset, or switch by hand with `agy-multi use <slug>`."
+			);
+		}
+		return `account ${profile.slug} failed: ${kind}`;
+	}
+
+	/** One place that explains why no account can serve, pinned or pooled. */
+	private noUsableAccountError(): Error {
+		const pinned = this.pinnedProfile;
+		if (!this.allowAccountPool && pinned) {
+			if (pinned.disabled) {
+				return new Error(`profile ${pinned.slug} is disabled — enable it with \`agy-multi profile enable ${pinned.slug}\``);
+			}
+			const kind: FailureKind = pinned.bannedAt ? "banned" : pinned.authRequiredAt ? "auth" : "quota";
+			return new Error(this.accountDiagnostic(pinned, kind));
+		}
+		return new Error("no profiles configured; add one with `agy-multi profile add <slug>`");
+	}
+
+	/**
+	 * Pause before a turn moves to another account. Pool mode only, and explicitly
+	 * pacing rather than camouflage: the timing of a switch is not what identifies
+	 * a harness, and this does not make rotation permitted or invisible.
+	 */
+	private async paceAccountSwitch(from: string, to: string): Promise<void> {
+		if (from === to || this.switchDelayMs <= 0) return;
+		this.log(`waiting ${this.switchDelayMs}ms before moving this turn from ${from} to ${to}`);
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve, this.switchDelayMs);
+		await promise;
 	}
 
 	private shutdown(): void {
@@ -404,10 +545,6 @@ class AcpProxy {
 		if (kind === "tool_call" || kind === "tool_call_update") {
 			if (session.activeTurn) {
 				session.activeTurn.forwardedOutput = true;
-				if (kind === "tool_call") {
-					const title = toolTitle(update);
-					if (title) session.activeTurn.toolTitles.push(title);
-				}
 				const signal = daemonTaskSignal(update, Date.now());
 				applyDaemonSignal(session.activeTurn.daemonTasks, signal);
 			}
@@ -623,10 +760,43 @@ class AcpProxy {
 		}
 	}
 
+	/** The account currently running a turn, ignoring `exceptSlug`. */
+	private profileWithActiveTurn(exceptSlug?: string): string | undefined {
+		for (const session of this.sessions.values()) {
+			if (session.profile !== exceptSlug && session.activeTurn) return session.profile;
+		}
+		return undefined;
+	}
+
+	/**
+	 * Keeps exactly one agent process alive. The previous account's child is torn
+	 * down and its exit awaited before the next one starts, so the two accounts are
+	 * never authenticated at the same time.
+	 */
+	private async stopOtherChildren(keepSlug: string): Promise<void> {
+		const others = [...this.children.entries()].filter(([slug]) => slug !== keepSlug);
+		for (const [slug, child] of others) {
+			this.children.delete(slug);
+			if (this.controlChild === child) this.controlChild = undefined;
+			child.loadedSessions.clear();
+			await child.stop();
+			this.log(`stopped agent ${slug}: sequential mode keeps one account active`);
+		}
+	}
+
 	private async ensureChild(profile: Profile): Promise<AcpChild> {
 		const existing = this.children.get(profile.slug);
 		if (existing?.alive) return existing;
 		existing?.kill();
+		if (this.sequential) {
+			const busy = this.profileWithActiveTurn(profile.slug);
+			if (busy) {
+				throw new Error(
+					`sequential mode: account ${busy} is mid-turn; refusing to activate ${profile.slug} until that turn ends`,
+				);
+			}
+			await this.stopOtherChildren(profile.slug);
+		}
 		const child = new AcpChild({
 			profile,
 			agyBin: this.agyBin,
@@ -644,6 +814,11 @@ class AcpProxy {
 	}
 
 	private getHealthyProfiles(preferred?: string[]): Profile[] {
+		if (!this.allowAccountPool) {
+			const pinned = this.pinnedProfile;
+			if (!pinned || pinned.disabled || pinned.bannedAt || pinned.authRequiredAt) return [];
+			return [pinned];
+		}
 		const now = Date.now();
 		const candidates = [...this.profiles.values()].filter(
 			p => !p.bannedAt && !p.authRequiredAt && !p.disabled,
@@ -670,7 +845,7 @@ class AcpProxy {
 		if (this.controlChild?.alive) return this.controlChild;
 		const candidates = this.getHealthyProfiles();
 		const profile = candidates[0];
-		if (!profile) throw new Error("no profiles configured; add one with `agy-multi profile add <slug>`");
+		if (!profile) throw this.noUsableAccountError();
 		const child = await this.ensureChild(profile);
 		await child.initialize(this.clientInitialize);
 		this.controlChild = child;
@@ -728,23 +903,48 @@ class AcpProxy {
 	private async rankCandidates(
 		options: { modelId?: string; exclude?: string[]; allowBlocked?: boolean; prefer?: string[] } = {},
 	): Promise<Profile[]> {
+		if (!this.allowAccountPool) {
+			// Pinned mode must not probe, rank, or even consider another account:
+			// every entry point that could rotate funnels through here.
+			const pinned = this.pinnedProfile;
+			if (!pinned || pinned.disabled) return [];
+			if (options.exclude?.includes(pinned.slug)) return [];
+			if (pinned.bannedAt || pinned.authRequiredAt) return [];
+			return [pinned];
+		}
 		const all = [...this.profiles.values()];
 		const candidates = all.filter(profile => !options.exclude?.includes(profile.slug));
 		const usage = new Map<string, UsageSnapshot | null>();
 		const models = new Map<string, ModelsSnapshot | null>();
-		await Promise.all(
-			all.map(async profile => {
-				const [u, m] = await Promise.all([this.getUsage(profile), this.getModels(profile)]);
-				usage.set(profile.slug, u);
-				models.set(profile.slug, m);
-			}),
-		);
-		// Reserved set is computed over every profile so excluding the current one
-		// never lets a newer-model account pick up a baseline model.
-		const reserved = reservedProfilesFor(models, options.modelId);
+		if (this.sequential) {
+			// One account at a time: rank from cached snapshots, never from a live
+			// probe of another account.
+			for (const profile of all) {
+				usage.set(profile.slug, await readCachedUsage(profile.slug));
+				models.set(profile.slug, await readCachedModels(profile.slug));
+			}
+		} else {
+			await Promise.all(
+				all.map(async profile => {
+					const [u, m] = await Promise.all([this.getUsage(profile), this.getModels(profile)]);
+					usage.set(profile.slug, u);
+					models.set(profile.slug, m);
+				}),
+			);
+		}
+		const family = familyForModel(options.modelId);
+		const now = Date.now();
+		// Reservation is a pool-only contest: it is worth keeping a wider catalog for
+		// its own models only when another account can take the baseline model at no
+		// cost. Sequential mode pays a process teardown plus a resume or handoff for
+		// every switch, so the live account serves whatever model it supports and
+		// concurrent sessions on that one account stay parallel.
+		const reserved = this.sequential
+			? new Set<string>()
+			: reservedProfilesFor(this.reservableCatalogs(models, usage, family, now), options.modelId);
 		const slugs = rankProfiles(candidates, usage, this.state, {
 			modelId: options.modelId,
-			now: Date.now(),
+			now,
 			reservePct: this.reservePct,
 			reserved,
 			...(options.modelId ? { models } : {}),
@@ -775,19 +975,72 @@ class AcpProxy {
 				...ranked.filter(profile => !preferred.includes(profile.slug)),
 			];
 		}
+		if (this.sequential) {
+			// One process at a time: while an account is mid-turn it is the only one
+			// usable without killing work, so a new session (a subagent, say) joins
+			// it rather than triggering a refused switch. That holds even when it is
+			// below `reservePct`: `rankProfiles` drops such accounts, but here the
+			// alternative is not a fresher account, it is a failure — the process is
+			// already running and the switch is refused.
+			const busy = this.profileWithActiveTurn();
+			const busyProfile = busy ? bySlug.get(busy) : undefined;
+			const busyEligible =
+				busyProfile !== undefined &&
+				!busyProfile.bannedAt &&
+				!busyProfile.authRequiredAt &&
+				!busyProfile.disabled &&
+				!isBlocked(this.state, busyProfile.slug, familyForModel(options.modelId), Date.now()) &&
+				!isModelKnownUnsupported(models.get(busyProfile.slug), options.modelId);
+			if (busyProfile && busyEligible) {
+				const index = ranked.findIndex(profile => profile.slug === busyProfile.slug);
+				if (index < 0) ranked = [busyProfile, ...ranked];
+				else if (index > 0) ranked = [ranked[index]!, ...ranked.slice(0, index), ...ranked.slice(index + 1)];
+			}
+		}
 		return ranked;
+	}
+
+	/**
+	 * Catalogs that can take work right now. An account that is banned, signed out,
+	 * disabled, blocked for the family, or under the reserve must not reserve its
+	 * wider catalog: holding it back would leave the baseline model with no account
+	 * at all instead of letting the wider catalog cover it.
+	 */
+	private reservableCatalogs(
+		models: Map<string, ModelsSnapshot | null>,
+		usage: Map<string, UsageSnapshot | null>,
+		family: Family,
+		now: number,
+	): Map<string, ModelsSnapshot | null> {
+		const reservable = new Map<string, ModelsSnapshot | null>();
+		for (const profile of this.profiles.values()) {
+			if (profile.bannedAt || profile.authRequiredAt || profile.disabled) continue;
+			if (isBlocked(this.state, profile.slug, family, now)) continue;
+			const remaining = minRemaining(usage.get(profile.slug) ?? null, family);
+			if (remaining !== undefined && remaining <= this.reservePct) continue;
+			reservable.set(profile.slug, models.get(profile.slug) ?? null);
+		}
+		return reservable;
 	}
 
 	/** Whether `profile` is a newer-model account that must not serve `modelId`. */
 	private async isReservedFor(profile: Profile, modelId?: string): Promise<boolean> {
+		// Reservation is a pool concept: it defends against handing a baseline model
+		// to a newer-model account, which only matters when another account can serve
+		// that model at no cost. Pinned mode has one account; sequential mode makes
+		// every switch a teardown plus a resume, so the live account keeps the work.
+		if (!this.allowAccountPool || this.sequential) return false;
 		if (!modelId) return false;
 		const models = new Map<string, ModelsSnapshot | null>();
+		const usage = new Map<string, UsageSnapshot | null>();
 		await Promise.all(
-			[...this.profiles.values()].map(async p => {
-				models.set(p.slug, await this.getModels(p));
+			[...this.profiles.values()].map(async candidate => {
+				models.set(candidate.slug, await this.getModels(candidate));
+				usage.set(candidate.slug, await this.getUsage(candidate));
 			}),
 		);
-		return reservedProfilesFor(models, modelId).has(profile.slug);
+		const reservable = this.reservableCatalogs(models, usage, familyForModel(modelId), Date.now());
+		return reservedProfilesFor(reservable, modelId).has(profile.slug);
 	}
 
 	private blockReset(slug: string, modelId?: string): number | undefined {
@@ -971,7 +1224,7 @@ class AcpProxy {
 	private async onInitialize(request: JsonRpcRequest): Promise<void> {
 		this.clientInitialize = request.params;
 		const candidates = this.getHealthyProfiles();
-		if (!candidates.length) throw new Error("no profiles configured; add one with `agy-multi profile add <slug>`");
+		if (!candidates.length) throw this.noUsableAccountError();
 		let lastError: unknown;
 		for (const profile of candidates.slice(0, Math.min(candidates.length, 3))) {
 			try {
@@ -1014,7 +1267,7 @@ class AcpProxy {
 		else delete payload.additionalDirectories;
 
 		const candidates = await this.rankCandidates({ allowBlocked: true });
-		if (!candidates.length) throw new Error("no profiles configured");
+		if (!candidates.length) throw this.noUsableAccountError();
 		let lastError: unknown;
 		for (const profile of candidates.slice(0, Math.min(candidates.length, 3))) {
 			try {
@@ -1057,15 +1310,22 @@ class AcpProxy {
 				this.respond(request.id, { ...this.mergeSessionModelsResult(result), sessionId: proxySessionId });
 				this.drainPendingOut(session);
 				this.broadcastAvailableCommands(session);
+				// Prime the usage cache for the account in use so the client's meter has
+				// data. Only the served account is ever read here.
+				this.refreshUsageInBackground(profile);
 				return;
 			} catch (error) {
-				lastError = error;
 				const raw = error instanceof AcpRpcError ? error.rpcError : error;
-				await this.recordFailure(profile, undefined, classifyAcpError(raw));
+				const kind = classifyAcpError(raw);
+				await this.recordFailure(profile, undefined, kind);
 				this.log(`session/new failed on ${profile.slug}: ${errorMessage(error)}`);
+				lastError =
+					!this.allowAccountPool && (kind === "banned" || kind === "quota" || kind === "auth")
+						? new Error(this.accountDiagnostic(profile, kind))
+						: error;
 			}
 		}
-		throw lastError ?? new Error("session/new failed on every profile");
+		throw lastError ?? new Error("session/new failed");
 	}
 
 	private async onSessionLoad(request: JsonRpcRequest, resume: boolean): Promise<void> {
@@ -1093,8 +1353,10 @@ class AcpProxy {
 		if (!session) {
 			const owningProfile = await this.findProfileForSessionDb(requestedId);
 			const candidates = await this.rankCandidates({ allowBlocked: true });
-			const profile = owningProfile ?? candidates[0];
-			if (!profile) throw new Error("no profiles configured");
+			// Pinned mode always adopts on the pinned account: a session database
+			// found in another profile's HOME must not make this proxy drive it.
+			const profile = (this.allowAccountPool ? undefined : this.pinnedProfile) ?? owningProfile ?? candidates[0];
+			if (!profile) throw this.noUsableAccountError();
 			const cwd = readString(params.cwd);
 			if (!cwd) throw new Error(`${resume ? "session/resume" : "session/load"} requires cwd for an unknown session`);
 			const child = await this.ensureChild(profile);
@@ -1159,6 +1421,12 @@ class AcpProxy {
 
 		const profile = this.profiles.get(session.profile);
 		if (!profile) throw new Error(`profile ${session.profile} no longer exists`);
+		if (!this.allowAccountPool && session.profile !== this.pinnedProfile?.slug) {
+			throw new Error(
+				`session ${requestedId} belongs to account ${session.profile}, but this proxy is pinned to ` +
+					`${this.pinnedProfile?.slug ?? "-"}. Switch by hand with \`agy-multi use ${session.profile}\` to continue it.`,
+			);
+		}
 		const child = await this.ensureChild(profile);
 		await child.initialize(this.clientInitialize);
 		const cwd = readString(params.cwd) ?? session.cwd;
@@ -1385,12 +1653,23 @@ class AcpProxy {
 			await this.markModelUnsupported(currentProfile, modelId);
 		}
 
+		if (!this.allowAccountPool) {
+			// Pinned mode has no second account to migrate to; say so instead of
+			// reporting a generic "no available account" from an empty candidate list.
+			if (lastUnsupportedError) throw lastUnsupportedError;
+			throw new Error(
+				`model ${modelId} is not available on account ${session.profile}; pinned mode does not switch accounts. ` +
+					"Pick another model, or switch by hand with `agy-multi use <slug>`.",
+			);
+		}
+
 		const exclude = currentProfile ? [currentProfile.slug] : undefined;
 		const candidates = await this.rankCandidates({ modelId, exclude, allowBlocked: false });
 
 		if (session.history.length === 0) {
 			for (const candidate of candidates.slice(0, Math.min(candidates.length, 3))) {
 				try {
+					await this.paceAccountSwitch(session.profile, candidate.slug);
 					const nextChild = await this.ensureChild(candidate);
 					await nextChild.initialize(this.clientInitialize);
 					const created = await nextChild.request("session/new", {
@@ -1440,10 +1719,12 @@ class AcpProxy {
 					this.respond(request.id, apply.result ?? {});
 					return;
 				} catch (error) {
-					if (error instanceof AcpRpcError && !isModelUnsupportedError(error.rpcError)) {
+					// Only a rejected model means "try the next account". Anything else
+					// (a refused switch, a spawn failure) must reach the client intact.
+					if (!(error instanceof AcpRpcError) || !isModelUnsupportedError(error.rpcError)) {
 						throw error;
 					}
-					lastUnsupportedError = error instanceof AcpRpcError ? error : lastUnsupportedError;
+					lastUnsupportedError = error;
 				}
 			}
 			if (lastUnsupportedError) throw lastUnsupportedError;
@@ -1527,14 +1808,24 @@ class AcpProxy {
 				} else if (unhealthy) {
 					const until = current.bannedAt ? undefined : this.state.blocks[current.slug]?.[family];
 					session.history.pop();
+					const kind: FailureKind = current.bannedAt
+						? "banned"
+						: current.authRequiredAt
+							? "auth"
+							: "quota";
 					this.respondError(
 						request.id,
 						-32000,
-						current.bannedAt
-							? "all accounts are banned or unavailable"
-							: unsupported
-								? `no available account supports model ${session.modelId}`
-								: `all accounts are quota-blocked${until ? ` until ${new Date(until).toISOString()}` : ""}`,
+						!this.allowAccountPool
+							? unsupported
+								? `model ${session.modelId} is not available on account ${current.slug}; pinned mode does not ` +
+									"switch accounts. Pick another model, or switch by hand with `agy-multi use <slug>`."
+								: this.accountDiagnostic(current, kind, until)
+							: current.bannedAt
+								? "all accounts are banned or unavailable"
+								: unsupported
+									? `no available account supports model ${session.modelId}`
+									: `all accounts are quota-blocked${until ? ` until ${new Date(until).toISOString()}` : ""}`,
 					);
 					return;
 				}
@@ -1546,10 +1837,15 @@ class AcpProxy {
 			this.respondError(request.id, -32000, "no available accounts");
 			return;
 		}
+		await this.paceAccountSwitch(session.profile, target.slug);
 		await this.runPrompt(request.id, session, userText, target, handoff, 0);
 	}
 
-	private async getMultiUsageSnapshot(profile: Profile, forceRefresh: boolean): Promise<UsageSnapshot | null> {
+	private async getMultiUsageSnapshot(
+		profile: Profile,
+		forceRefresh: boolean,
+		allowLive = true,
+	): Promise<UsageSnapshot | null> {
 		if (!forceRefresh) {
 			const now = Date.now();
 			const cached = this.usageCache.get(profile.slug);
@@ -1559,6 +1855,11 @@ class AcpProxy {
 				this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
 				if (now - diskCached.fetchedAt < USAGE_TTL_MS) return diskCached;
 			}
+		}
+		if (!allowLive) {
+			// Sequential mode never authenticates as an idle account just to report
+			// its numbers; stale cache is the honest answer here.
+			return this.usageCache.get(profile.slug)?.snapshot ?? (await readCachedUsage(profile.slug));
 		}
 		const live = await this.getUsage(profile, true);
 		if (live) return live;
@@ -1570,13 +1871,19 @@ class AcpProxy {
 		session: SessionState,
 		forceRefresh: boolean,
 	): Promise<void> {
-		const profiles = [...this.profiles.values()];
+		// Pinned mode reports the account in use. Enumerating the others would mean
+		// authenticating as them, which is exactly what must not happen.
+		const profiles = this.allowAccountPool
+			? [...this.profiles.values()]
+			: this.pinnedProfile
+				? [this.pinnedProfile]
+				: [];
 		const entries = await Promise.all(
 			profiles.map(async profile => {
 				if (profile.disabled || profile.bannedAt || profile.authRequiredAt) {
 					return { profile, snapshot: null };
 				}
-				const snapshot = await this.getMultiUsageSnapshot(profile, forceRefresh);
+				const snapshot = await this.getMultiUsageSnapshot(profile, forceRefresh, !this.sequential);
 				return { profile, snapshot };
 			}),
 		);
@@ -1615,7 +1922,40 @@ class AcpProxy {
 					session.profile === profile.slug &&
 					this.sessionsByChild.get(this.childKey(profile.slug, session.childSessionId)) === session &&
 					child.loadedSessions.has(session.childSessionId);
-				if (!ready) {
+				// The conversation store is shared by every profile, so the same
+				// conversation can continue under another account. Resume first; the
+				// transcript replay below is the fallback when it is not there.
+				const resumed =
+					!ready && session.childSessionId && session.profile !== profile.slug
+						? await child.request("session/resume", {
+								sessionId: session.childSessionId,
+								cwd: session.cwd,
+								mcpServers: session.mcpServers,
+								...(session.additionalDirectories
+									? { additionalDirectories: session.additionalDirectories }
+									: {}),
+							})
+						: undefined;
+				const resumedNative = Boolean(resumed && !resumed.error);
+				if (resumedNative) {
+					const previousProfile = session.profile;
+					this.sessionsByChild.delete(this.childKey(previousProfile, session.childSessionId));
+					session.profile = profile.slug;
+					session.record.profile = profile.slug;
+					session.record.updatedAt = new Date().toISOString();
+					child.loadedSessions.add(session.childSessionId);
+					this.sessionsByChild.set(this.childKey(profile.slug, session.childSessionId), session);
+					session.handoffSessionReady = true;
+					session.needsHandoff = false;
+					const oldChild = this.children.get(previousProfile);
+					if (oldChild?.alive) {
+						oldChild.loadedSessions.delete(session.childSessionId);
+						void oldChild.request("session/close", { sessionId: session.childSessionId }).catch(() => {});
+						this.releaseCandidates.add(previousProfile);
+					}
+					this.log(`resumed conversation ${session.childSessionId} on ${profile.slug}`);
+					await this.saveStore();
+				} else if (!ready) {
 					const created = await child.request("session/new", {
 						cwd: session.cwd,
 						mcpServers: session.mcpServers,
@@ -1670,6 +2010,7 @@ class AcpProxy {
 							});
 							const next = candidates[0];
 							if (next) {
+								await this.paceAccountSwitch(profile.slug, next.slug);
 								await this.runPrompt(clientId, session, originalText, next, true, switches + 1);
 								return;
 							}
@@ -1677,13 +2018,13 @@ class AcpProxy {
 						throw new AcpRpcError(setModel.error);
 					}
 				}
-				const gitHead = await this.gitHead(session.cwd);
-				text = buildHandoffPrompt({ history: session.history, cwd: session.cwd, gitHead });
+				text = resumedNative
+					? originalText
+					: buildHandoffPrompt({ history: session.history, maxChars: this.handoffContextChars }) || originalText;
 			}
 
 			const turn: TurnState = {
 				assistantText: "",
-				toolTitles: [],
 				forwardedOutput: false,
 				suppressUserChunk: handoff,
 				daemonTasks: new Map(),
@@ -1771,27 +2112,22 @@ class AcpProxy {
 						await this.runPrompt(clientId, session, originalText, profile, true, switches + 1);
 						return;
 					}
-					const candidates = await this.rankCandidates({
-						modelId: session.modelId,
-						exclude: [profile.slug],
-						allowBlocked: false,
-					});
-					const next = candidates[0];
-					if (next) {
-						await this.runPrompt(clientId, session, originalText, next, true, switches + 1);
-						return;
+					if (this.allowAccountPool) {
+						const candidates = await this.rankCandidates({
+							modelId: session.modelId,
+							exclude: [profile.slug],
+							allowBlocked: false,
+						});
+						const next = candidates[0];
+						if (next) {
+							await this.paceAccountSwitch(profile.slug, next.slug);
+							await this.runPrompt(clientId, session, originalText, next, true, switches + 1);
+							return;
+						}
 					}
 				}
-				if (turn.forwardedOutput) {
-					const parts: string[] = [];
-					if (turn.assistantText.trim()) parts.push(turn.assistantText.trim());
-					if (turn.toolTitles.length) parts.push(`[used tools: ${turn.toolTitles.join(", ")}]`);
-					if (parts.length) {
-						session.history.push({
-							role: "assistant",
-							text: `${parts.join("\n\n")}\n\n(interrupted: ${kind})`,
-						});
-					}
+				if (turn.forwardedOutput && turn.assistantText.trim()) {
+					session.history.push({ role: "assistant", text: turn.assistantText.trim() });
 				}
 				if (switchable) {
 					session.needsHandoff = true;
@@ -1799,6 +2135,12 @@ class AcpProxy {
 				}
 				session.record.updatedAt = new Date().toISOString();
 				await this.saveStore();
+				if (!this.allowAccountPool && (kind === "banned" || kind === "quota" || kind === "auth")) {
+					const until =
+						kind === "quota" ? this.state.blocks[profile.slug]?.[familyForModel(session.modelId)] : undefined;
+					this.respondError(clientId, -32000, this.accountDiagnostic(profile, kind, until));
+					return;
+				}
 				this.respondError(clientId, response.error.code, response.error.message, response.error.data);
 				return;
 			}
@@ -1807,8 +2149,6 @@ class AcpProxy {
 			const stopReason = readString(result.stopReason) ?? "end_turn";
 			if (turn.assistantText.trim()) {
 				session.history.push({ role: "assistant", text: turn.assistantText.trim() });
-			} else if (turn.toolTitles.length) {
-				session.history.push({ role: "assistant", text: `[used tools: ${turn.toolTitles.join(", ")}]` });
 			}
 			session.needsHandoff = false;
 			session.handoffSessionReady = false;
@@ -1852,7 +2192,6 @@ class AcpProxy {
 
 		const compactionTurn: TurnState = {
 			assistantText: "",
-			toolTitles: [],
 			forwardedOutput: false,
 			suppressUserChunk: true,
 			suppressOutput: true,
@@ -1897,11 +2236,6 @@ class AcpProxy {
 		while (!session.cancelled && Date.now() < deadline) {
 			await new Promise(resolve => setTimeout(resolve, Math.min(250, deadline - Date.now())));
 		}
-	}
-
-	private async gitHead(cwd: string): Promise<string | undefined> {		const result = await run(["git", "rev-parse", "HEAD"], { cwd }).catch(() => null);
-		if (!result || result.exitCode !== 0) return undefined;
-		return result.stdout.trim() || undefined;
 	}
 
 	// ---------------------------------------------------------------------
@@ -1950,7 +2284,9 @@ class AcpProxy {
 	}
 
 	private async findProfileForSessionDb(sessionId: string): Promise<Profile | undefined> {
-		for (const profile of this.profiles.values()) {
+		const candidates =
+			this.allowAccountPool || !this.pinnedProfile ? [...this.profiles.values()] : [this.pinnedProfile];
+		for (const profile of candidates) {
 			const dbPath = join(profileHome(profile.slug), ".gemini", "antigravity-cli", "conversations", `${sessionId}.db`);
 			if (await exists(dbPath)) {
 				return profile;

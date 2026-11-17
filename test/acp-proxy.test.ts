@@ -5,31 +5,67 @@ import { describe, expect, test } from "bun:test";
 import { isRecord } from "../src/acp/guards";
 import { LineReader } from "../src/acp/rpc";
 
+const projectRoot = join(import.meta.dir, "..");
+
 /**
- * Fake official client. `acct-a` rejects prompts with a quota error; every
- * other profile answers `OK`. `/usage` always reports full windows so the
- * wrapper must rely on the generation failure, not a preflight block.
+ * Fake official agent. Every process start and every JSON-RPC request is
+ * appended to `FAKE_AGY_LOG` together with the HOME it was launched under, so a
+ * test can prove which accounts the wrapper authenticated as.
+ *
+ * `FAKE_AGY_MODE` (quota | banned | auth) makes `session/prompt` fail with the
+ * wording the real CLI uses; `FAKE_AGY_FAIL_SLUG` narrows that to one profile.
+ * `/usage` always reports full windows so a failure is a generation failure,
+ * never a preflight block.
  */
 const FAKE_AGY = `#!/usr/bin/env bun
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const argv = Bun.argv.slice(2);
 const home = process.env.HOME ?? "";
-const promptLog = process.env.FAKE_AGY_LOG;
-const usageLog = process.env.FAKE_AGY_USAGE_LOG;
+const log = process.env.FAKE_AGY_LOG;
+const record = entry => {
+  if (log) appendFileSync(log, JSON.stringify({ home, ...entry }) + "\\n");
+};
+
+record({ event: "start", argv });
+
+// Sequential-mode detector: an agent process records whether another account's
+// agent is still alive at its own startup.
+const liveDir = process.env.FAKE_AGY_LIVE_DIR;
+if (liveDir && argv.includes("acp")) {
+  try {
+    for (const entry of readdirSync(liveDir)) {
+      const pid = Number(entry);
+      if (!Number.isFinite(pid) || pid === process.pid) continue;
+      let otherHome = "";
+      try { otherHome = readFileSync(join(liveDir, entry), "utf8"); } catch {}
+      if (otherHome === home) continue;
+      try { process.kill(pid, 0); record({ event: "overlap", otherPid: pid, otherHome }); } catch {}
+    }
+    writeFileSync(join(liveDir, String(process.pid)), home);
+  } catch {}
+}
 
 if (argv.includes("/usage")) {
-  if (usageLog) appendFileSync(usageLog, home + "\\n");
+  const bySlug = JSON.parse(process.env.FAKE_AGY_USAGE_BY_SLUG ?? "{}");
+  const slug = Object.keys(bySlug).find(key => home.includes("/" + key + "/"));
+  const pct = Array.isArray(bySlug[slug]) ? bySlug[slug] : [100, 100, 100, 100];
   process.stdout.write(JSON.stringify({
     status: "SUCCESS",
     response: [
-      "Gemini Models\\tWeekly Limit Remaining\\t100%\\t2099-01-01T00:00:00Z",
-      "Gemini Models\\tFive Hour Limit Remaining\\t100%\\t2099-01-01T00:00:00Z",
-      "Claude and GPT models\\tWeekly Limit Remaining\\t100%\\t2099-01-01T00:00:00Z",
-      "Claude and GPT models\\tFive Hour Limit Remaining\\t100%\\t2099-01-01T00:00:00Z",
+      "Gemini Models\\tWeekly Limit Remaining\\t" + pct[0] + "%\\t2099-01-01T00:00:00Z",
+      "Gemini Models\\tFive Hour Limit Remaining\\t" + pct[1] + "%\\t2099-01-01T00:00:00Z",
+      "Claude and GPT models\\tWeekly Limit Remaining\\t" + pct[2] + "%\\t2099-01-01T00:00:00Z",
+      "Claude and GPT models\\tFive Hour Limit Remaining\\t" + pct[3] + "%\\t2099-01-01T00:00:00Z",
     ].join("\\n"),
   }) + "\\n");
+  process.exit(0);
+}
+
+if (argv.includes("models")) {
+  process.stdout.write("gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n");
   process.exit(0);
 }
 
@@ -38,13 +74,24 @@ if (argv[0] !== "acp") {
   process.exit(2);
 }
 
-const sessions = new Map();
+const failures = {
+  quota: "RESOURCE_EXHAUSTED: quota exceeded",
+  banned: "Your account is disabled: violation of Terms of Service",
+  auth: "not logged into Antigravity; authentication required",
+};
+const mode = process.env.FAKE_AGY_MODE ?? "ok";
+const failSlug = process.env.FAKE_AGY_FAIL_SLUG ?? "";
+const mayFail = Object.hasOwn(failures, mode) && (!failSlug || home.includes("/" + failSlug + "/"));
+
 let sequence = 0;
 const send = message => process.stdout.write(JSON.stringify(message) + "\\n");
 const lines = createInterface({ input: process.stdin });
 lines.on("line", line => {
   let message;
   try { message = JSON.parse(line); } catch { return; }
+  if (!message || typeof message.method !== "string") return;
+  const params = message.params ?? {};
+  record({ event: "request", method: message.method, sessionId: params.sessionId, ...(message.method === "session/prompt" ? { text: params.prompt?.[0]?.text } : {}) });
   if (message.method === "initialize") {
     send({ jsonrpc: "2.0", id: message.id, result: {
       protocolVersion: 1,
@@ -55,33 +102,34 @@ lines.on("line", line => {
     return;
   }
   if (message.method === "session/new") {
-    const sessionId = "fake-session-" + (++sequence);
-    sessions.set(sessionId, { fail: home.includes("acct-a") });
     send({ jsonrpc: "2.0", id: message.id, result: {
-      sessionId,
+      sessionId: "fake-session-" + (++sequence),
       models: { currentModelId: "gemini-3.8-flash-high", availableModels: [] },
     }});
     return;
   }
   if (message.method === "session/prompt") {
-    const session = sessions.get(message.params.sessionId);
-    if (promptLog) appendFileSync(promptLog, home + "\\n");
-    if (session && session.fail) {
-      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: "RESOURCE_EXHAUSTED: quota exceeded" } });
+    const holdSlug = process.env.FAKE_AGY_HOLD_HOME;
+    if (holdSlug && home.includes("/" + holdSlug + "/")) {
+      record({ event: "held", method: "session/prompt", sessionId: params.sessionId });
+      send({ jsonrpc: "2.0", method: "session/update", params: {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "HOLDING " + params.sessionId } },
+      }});
+      return;
+    }
+    if (mayFail) {
+      send({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: failures[mode] } });
       return;
     }
     send({ jsonrpc: "2.0", method: "session/update", params: {
-      sessionId: message.params.sessionId,
+      sessionId: params.sessionId,
       update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OK" } },
     }});
     send({ jsonrpc: "2.0", id: message.id, result: { stopReason: "end_turn" } });
     return;
   }
-  if (message.method === "session/load" || message.method === "session/resume" || message.method === "session/close") {
-    send({ jsonrpc: "2.0", id: message.id, result: {} });
-    return;
-  }
-  if (message.method === "session/set_model") {
+  if (message.method === "session/load" || message.method === "session/resume" || message.method === "session/close" || message.method === "session/set_model") {
     send({ jsonrpc: "2.0", id: message.id, result: {} });
     return;
   }
@@ -89,207 +137,874 @@ lines.on("line", line => {
 });
 `;
 
-describe("agy-multi ACP proxy", () => {
-	test(
-		"switches profiles on a quota error and hands the turn to the next account",
-		async () => {
-			const root = await mkdtemp(join(tmpdir(), "agy-multi-acp-"));
-			const projectRoot = join(import.meta.dir, "..");
-			const fake = join(root, "fake-agy");
-			const promptLog = join(root, "prompts.log");
+interface Invocation {
+	home: string;
+	event: "start" | "request" | "overlap" | "held";
+	argv?: string[];
+	method?: string;
+	sessionId?: string;
+	text?: string;
+	otherPid?: number;
+	otherHome?: string;
+}
 
-			for (const slug of ["acct-a", "acct-b"]) {
-				const dir = join(root, "profiles", slug);
-				await mkdir(dir, { recursive: true });
-				await writeFile(join(dir, "profile.json"), JSON.stringify({ slug, createdAt: new Date().toISOString() }));
+interface Reply {
+	result?: { protocolVersion?: number; sessionId?: string; stopReason?: string };
+	error?: { code: number; message: string };
+}
+
+interface ProxyClient {
+	proxy: Bun.Subprocess;
+	send: <T extends Reply>(method: string, params: unknown) => Promise<T>;
+	notify: (method: string, params: unknown) => Promise<void>;
+	notifications: unknown[];
+	stderrLines: string[];
+	waitForStderr: (predicate: (line: string) => boolean, timeoutMs?: number) => Promise<void>;
+	waitForNotification: (predicate: (message: unknown) => boolean, timeoutMs?: number) => Promise<unknown>;
+}
+
+function collectLines(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): void {
+	const decoder = new TextDecoder();
+	let buffer = "";
+	void (async () => {
+		const reader = stream.getReader();
+		try {
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+				let index = buffer.indexOf("\n");
+				while (index >= 0) {
+					onLine(buffer.slice(0, index));
+					buffer = buffer.slice(index + 1);
+					index = buffer.indexOf("\n");
+				}
 			}
-			await writeFile(fake, FAKE_AGY);
-			await chmod(fake, 0o755);
+			if (buffer) onLine(buffer);
+		} catch {
+			// The pipe closed; whatever was read is already reported.
+		}
+	})();
+}
 
-			const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp"], {
-				cwd: projectRoot,
-				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: promptLog },
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
-			});
+async function fixture(
+	slugs: string[],
+	options: { agent?: string; env?: Record<string, string> } = {},
+) {
+	const root = await mkdtemp(join(tmpdir(), "agy-multi-acp-"));
+	const fake = join(root, "fake-agy");
+	const log = join(root, "invocations.jsonl");
+	await writeFile(fake, options.agent ?? FAKE_AGY);
+	await chmod(fake, 0o755);
+	for (const slug of slugs) {
+		const dir = join(root, "profiles", slug);
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, "profile.json"), JSON.stringify({ slug, createdAt: new Date().toISOString() }));
+	}
+	const baseEnv = { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: log, ...options.env };
 
+	const invocations = async (): Promise<Invocation[]> => {
+		try {
+			const text = await readFile(log, "utf8");
+			return text
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Invocation);
+		} catch {
+			return [];
+		}
+	};
+
+	/** One-shot CLI invocation (no long-lived JSON-RPC session). */
+	const cli = async (args: string[]) => {
+		const proc = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), ...args], {
+			cwd: projectRoot,
+			env: baseEnv,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		return { stdout, stderr, exitCode };
+	};
+
+	/** A wrapper ACP process speaking JSON-RPC over stdio to the test client. */
+	const proxy = (args: string[], env: Record<string, string> = {}): ProxyClient => {
+		const child = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp", ...args], {
+			cwd: projectRoot,
+			env: { ...baseEnv, ...env },
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdin = child.stdin;
+		const stdout = child.stdout;
+		const stderr = child.stderr;
+		if (!stdin || !stdout || !stderr) throw new Error("proxy stdio missing");
+
+		const pending = new Map<number, (message: unknown) => void>();
+		const notifications: unknown[] = [];
+		const notificationWaiters: {
+			predicate: (message: unknown) => boolean;
+			resolve: (message: unknown) => void;
+		}[] = [];
+		let nextId = 1;
+
+		new LineReader(stdout, line => {
+			let message: unknown;
 			try {
-				const stdin = proxy.stdin;
-				if (!stdin) throw new Error("proxy stdin missing");
-				const pending = new Map<number, (message: unknown) => void>();
-				let nextId = 1;
-				const send = async <T>(method: string, params: unknown): Promise<T> => {
-					const id = nextId++;
-					const { promise, resolve } = Promise.withResolvers<unknown>();
-					pending.set(id, resolve);
-					stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-					await stdin.flush();
-					return (await promise) as T;
-				};
+				message = JSON.parse(line);
+			} catch {
+				return;
+			}
+			if (isRecord(message) && typeof message.id === "number" && pending.has(message.id)) {
+				const resolve = pending.get(message.id)!;
+				pending.delete(message.id);
+				resolve(message);
+				return;
+			}
+			notifications.push(message);
+			for (const waiter of [...notificationWaiters]) {
+				if (!waiter.predicate(message)) continue;
+				notificationWaiters.splice(notificationWaiters.indexOf(waiter), 1);
+				waiter.resolve(message);
+			}
+		});
 
-				const notifications: unknown[] = [];
-				new LineReader(proxy.stdout, line => {
-					let message: unknown;
-					try {
-						message = JSON.parse(line);
-					} catch {
-						return;
-					}
-					if (
-						isRecord(message) &&
-						typeof message.id === "number" &&
-						pending.has(message.id)
-					) {
-						const resolve = pending.get(message.id)!;
-						pending.delete(message.id);
-						resolve(message);
-						return;
-					}
-					notifications.push(message);
-				});
+		const stderrLines: string[] = [];
+		const stderrWaiters: { predicate: (line: string) => boolean; resolve: () => void }[] = [];
+		collectLines(stderr, line => {
+			stderrLines.push(line);
+			for (const waiter of [...stderrWaiters]) {
+				if (!waiter.predicate(line)) continue;
+				stderrWaiters.splice(stderrWaiters.indexOf(waiter), 1);
+				waiter.resolve();
+			}
+		});
 
-				const initialized = await send<{ result: { protocolVersion: number } }>("initialize", {
+		const send = async <T extends Reply>(method: string, params: unknown): Promise<T> => {
+			const id = nextId++;
+			const { promise, resolve } = Promise.withResolvers<unknown>();
+			pending.set(id, resolve);
+			stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+			await stdin.flush();
+			return (await promise) as T;
+		};
+
+		const notify = async (method: string, params: unknown) => {
+			stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+			await stdin.flush();
+		};
+
+		const waitForStderr = (predicate: (line: string) => boolean, timeoutMs = 10_000): Promise<void> => {
+			if (stderrLines.some(predicate)) return Promise.resolve();
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			const timer = setTimeout(() => {
+				reject(new Error(`timed out waiting for stderr; saw: ${stderrLines.join(" | ") || "(nothing)"}`));
+			}, timeoutMs);
+			stderrWaiters.push({
+				predicate,
+				resolve: () => {
+					clearTimeout(timer);
+					resolve();
+				},
+			});
+			return promise;
+		};
+
+		const waitForNotification = (predicate: (message: unknown) => boolean, timeoutMs = 10_000): Promise<unknown> => {
+			const seen = notifications.find(predicate);
+			if (seen !== undefined) return Promise.resolve(seen);
+			const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+			const timer = setTimeout(() => {
+				reject(new Error("timed out waiting for a proxy notification"));
+			}, timeoutMs);
+			notificationWaiters.push({
+				predicate,
+				resolve: message => {
+					clearTimeout(timer);
+					resolve(message);
+				},
+			});
+			return promise;
+		};
+
+		return { proxy: child, send, notify, notifications, stderrLines, waitForStderr, waitForNotification };
+	};
+
+	const cleanup = async () => {
+		await rm(root, { recursive: true, force: true });
+	};
+
+	return { root, invocations, cli, proxy, cleanup };
+}
+
+async function stop(client: ProxyClient): Promise<void> {
+	client.proxy.kill();
+	await client.proxy.exited.catch(() => {});
+}
+
+function homeOf(root: string, slug: string): string {
+	return join(root, "profiles", slug, "home");
+}
+
+/** Agent HOMEs that received a `session/prompt`, in order. */
+function promptHomes(invocations: Invocation[]): string[] {
+	return invocations.filter(entry => entry.method === "session/prompt").map(entry => entry.home);
+}
+
+describe("agy-multi ACP proxy (single pinned account)", () => {
+	test(
+		"serves only the pinned profile: with two accounts configured, one HOME is ever used",
+		async () => {
+			// `acct-aa` sorts first, so a ranking implementation would prefer it.
+			const f = await fixture(["acct-aa", "acct-zz"]);
+			const client = f.proxy(["--profile", "acct-zz"]);
+			try {
+				const initialized = await client.send<Reply>("initialize", {
 					protocolVersion: 1,
 					clientCapabilities: {},
 					clientInfo: { name: "test", version: "1.0.0" },
 				});
-				expect(initialized.result.protocolVersion).toBe(1);
+				expect(initialized.result?.protocolVersion).toBe(1);
 
-				const created = await send<{ result: { sessionId: string } }>("session/new", {
-					cwd: root,
-					mcpServers: [],
-				});
-				const sessionId = created.result.sessionId;
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const sessionId = created.result?.sessionId;
 				expect(typeof sessionId).toBe("string");
 
-				const prompted = await send<{ result: { stopReason: string } }>("session/prompt", {
+				const prompted = await client.send<Reply>("session/prompt", {
 					sessionId,
-					prompt: [{ type: "text", text: "TRIGGER" }],
+					prompt: [{ type: "text", text: "hello" }],
 				});
-				expect(prompted.result.stopReason).toBe("end_turn");
+				expect(prompted.error).toBeUndefined();
+				expect(prompted.result?.stopReason).toBe("end_turn");
 
-				const state = JSON.parse(await readFile(join(root, "state.json"), "utf8")) as {
-					blocks: Record<string, { gemini?: number }>;
-				};
-				expect(state.blocks["acct-a"]?.gemini).toBeGreaterThan(Date.now());
+				const invocations = await f.invocations();
+				const pinnedHome = homeOf(f.root, "acct-zz");
+				expect(new Set(invocations.map(entry => entry.home))).toEqual(new Set([pinnedHome]));
+				expect(invocations.filter(entry => entry.home.includes("acct-aa"))).toEqual([]);
 
-				const homes = (await readFile(promptLog, "utf8")).trim().split("\n");
-				expect(homes.length).toBe(2);
-				expect(homes[0]).toContain("acct-a");
-				expect(homes[1]).toContain("acct-b");
-
-				let matchedSessionId: unknown;
-				for (const message of notifications) {
-					if (!isRecord(message) || message.method !== "session/update" || !isRecord(message.params)) continue;
-					const params = message.params;
-					if (!isRecord(params.update) || !isRecord(params.update.content)) continue;
-					if (params.update.content.text !== "OK") continue;
-					matchedSessionId = params.sessionId;
-					break;
+				// The wrapper flags are consumed by the proxy, never forwarded to `agy acp`.
+				for (const entry of invocations.filter(entry => entry.event === "start")) {
+					expect(entry.argv).not.toContain("--profile");
+					expect(entry.argv).not.toContain("--allow-account-pool");
 				}
-				expect(matchedSessionId).toBe(sessionId);
+
+				const newSessions = invocations.filter(entry => entry.method === "session/new");
+				expect(newSessions).toHaveLength(1);
+				expect(newSessions[0]!.home).toBe(pinnedHome);
 			} finally {
-				proxy.kill();
-				await proxy.exited.catch(() => {});
-				await rm(root, { recursive: true, force: true });
+				await stop(client);
+				await f.cleanup();
 			}
 		},
 		30_000,
 	);
 
 	test(
-		"initialize handshake does not invoke blocking /usage preflight",
+		"quota failure answers the client with a quota error instead of switching accounts",
 		async () => {
-			const root = await mkdtemp(join(tmpdir(), "agy-multi-acp-fast-"));
-			const projectRoot = join(import.meta.dir, "..");
-			const fake = join(root, "fake-agy");
-			const usageLog = join(root, "usage.log");
-
-			for (const slug of ["acct-1", "acct-2", "acct-3"]) {
-				const dir = join(root, "profiles", slug);
-				await mkdir(dir, { recursive: true });
-				await writeFile(
-					join(dir, "profile.json"),
-					JSON.stringify({ slug, createdAt: new Date().toISOString() }),
-				);
-			}
-
-			await writeFile(fake, FAKE_AGY);
-			await chmod(fake, 0o755);
-
-			const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src", "index.ts"), "acp"], {
-				env: {
-					...process.env,
-					AGY_MULTI_ROOT: root,
-					AGY_BIN: fake,
-					FAKE_AGY_USAGE_LOG: usageLog,
-				},
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-
-			const stdin = proxy.stdin;
-			const stdout = proxy.stdout;
-			if (!stdin || !stdout) throw new Error("no stdio");
-
-			let seq = 0;
-			const pending = new Map<number, (res: unknown) => void>();
-
-			new LineReader(stdout, line => {
-				let parsed: unknown;
-				try { parsed = JSON.parse(line); } catch { return; }
-				if (isRecord(parsed) && typeof parsed.id === "number") {
-					const cb = pending.get(parsed.id);
-					if (cb) {
-						pending.delete(parsed.id);
-						cb(parsed);
-					}
-				}
-			});
-
-			function send<T>(method: string, params: unknown): Promise<T> {
-				const id = ++seq;
-				return new Promise(resolve => {
-					pending.set(id, resolve as (res: unknown) => void);
-					stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
-					stdin.flush();
-				});
-			}
-
+			const f = await fixture(["acct-a", "acct-b"], { env: { FAKE_AGY_MODE: "quota" } });
+			const client = f.proxy(["--profile", "acct-a"]);
 			try {
-				const res = await send<{ result: { protocolVersion: number } }>("initialize", {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId: created.result?.sessionId,
+					prompt: [{ type: "text", text: "TRIGGER" }],
+				});
+
+				expect(prompted.result).toBeUndefined();
+				expect(prompted.error?.message).toMatch(/quota/i);
+
+				const invocations = await f.invocations();
+				expect(new Set(invocations.map(entry => entry.home))).toEqual(new Set([homeOf(f.root, "acct-a")]));
+				const newSessions = invocations.filter(entry => entry.method === "session/new");
+				expect(newSessions).toHaveLength(1);
+				expect(newSessions[0]!.home).toBe(homeOf(f.root, "acct-a"));
+				// No retry: the turn was attempted exactly once.
+				expect(promptHomes(invocations)).toEqual([homeOf(f.root, "acct-a")]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"banned account explains the Terms of Service and points at manual account selection",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"], { env: { FAKE_AGY_MODE: "banned" } });
+			const client = f.proxy(["--profile", "acct-a"]);
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId: created.result?.sessionId,
+					prompt: [{ type: "text", text: "TRIGGER" }],
+				});
+
+				expect(prompted.result).toBeUndefined();
+				expect(prompted.error?.message).toContain("Terms of Service");
+				expect(prompted.error?.message).toContain("agy-multi use");
+
+				const invocations = await f.invocations();
+				expect(invocations.filter(entry => entry.home.includes("acct-b"))).toEqual([]);
+				expect(promptHomes(invocations)).toEqual([homeOf(f.root, "acct-a")]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"auth failure tells the operator to log the pinned profile in",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"], { env: { FAKE_AGY_MODE: "auth" } });
+			const client = f.proxy(["--profile", "acct-a"]);
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId: created.result?.sessionId,
+					prompt: [{ type: "text", text: "TRIGGER" }],
+				});
+
+				expect(prompted.result).toBeUndefined();
+				expect(prompted.error?.message).toContain("agy-multi profile login");
+
+				const invocations = await f.invocations();
+				expect(invocations.filter(entry => entry.home.includes("acct-b"))).toEqual([]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"initialize hands control to the agent without a blocking /usage preflight",
+		async () => {
+			const f = await fixture(["acct-1", "acct-2", "acct-3"]);
+			const client = f.proxy(["--profile", "acct-1"]);
+			try {
+				const initialized = await client.send<Reply>("initialize", {
 					protocolVersion: 1,
 					clientCapabilities: {},
 				});
-				expect(res.result.protocolVersion).toBe(1);
+				expect(initialized.result?.protocolVersion).toBe(1);
 
-				// Verify usage was never invoked during initialize handshake
-				let usageCalls = 0;
-				try {
-					const usageContent = await readFile(usageLog, "utf8");
-					usageCalls = usageContent.trim().split("\n").filter(Boolean).length;
-				} catch {
-					// File does not exist because no /usage was executed
-					usageCalls = 0;
-				}
-				expect(usageCalls).toBe(0);
+				const usageProbes = (await f.invocations()).filter(
+					entry => entry.event === "start" && entry.argv?.includes("/usage"),
+				);
+				expect(usageProbes).toEqual([]);
 			} finally {
-				proxy.kill();
-				await proxy.exited.catch(() => {});
-				await rm(root, { recursive: true, force: true });
+				await stop(client);
+				await f.cleanup();
 			}
 		},
-		10_000,
+		30_000,
 	);
 
-	/**
-	 * Reproduces the reported failure: the agent launches a long build as a daemon
-	 * task, the 10s wait expires, and it closes the turn claiming it is "waiting".
-	 * `manage_task status` only reports the task finished on the third poll.
-	 */
-	const FAKE_DAEMON_AGY = `#!/usr/bin/env bun
+	test(
+		"fails closed when neither --profile nor a recorded default exists",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"]);
+			const result = await f.cli(["acp"]);
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr).toContain("agy-multi use");
+			// The wrapper must not authenticate any account before the operator picks one.
+			expect(await f.invocations()).toEqual([]);
+			await f.cleanup();
+		},
+		20_000,
+	);
+
+	test(
+		"`use <slug>` records the default profile a bare `acp` then serves",
+		async () => {
+			const f = await fixture(["acct-first", "acct-second"]);
+			try {
+				// Legacy pool bookkeeping must survive a `use`: pins, blocks and
+				// checkpoints still back `agy-multi acp --allow-account-pool`.
+				await writeFile(
+					join(f.root, "state.json"),
+					JSON.stringify({
+						version: 2,
+						pins: { "conv-1": "acct-first" },
+						blocks: { "acct-first": { gemini: 4_102_444_800_000 } },
+						checkpoints: {
+							"conv-1": { prompt: "legacy", slug: "acct-first", updatedAt: "2026-01-01T00:00:00Z" },
+						},
+					}),
+				);
+
+				const used = await f.cli(["use", "acct-second"]);
+				expect(used.exitCode, used.stderr).toBe(0);
+
+				const state = JSON.parse(await readFile(join(f.root, "state.json"), "utf8")) as {
+					version?: number;
+					defaultProfile?: string;
+					pins?: Record<string, string>;
+					blocks?: Record<string, { gemini?: number }>;
+					checkpoints?: Record<string, { slug?: string }>;
+				};
+				expect(state).toMatchObject({ version: 2, defaultProfile: "acct-second" });
+				expect(state.pins).toEqual({ "conv-1": "acct-first" });
+				expect(state.blocks?.["acct-first"]?.gemini).toBe(4_102_444_800_000);
+				expect(state.checkpoints?.["conv-1"]?.slug).toBe("acct-first");
+
+				const client = f.proxy([]);
+				try {
+					await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+					const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+					const prompted = await client.send<Reply>("session/prompt", {
+						sessionId: created.result?.sessionId,
+						prompt: [{ type: "text", text: "hello" }],
+					});
+					expect(prompted.result?.stopReason).toBe("end_turn");
+				} finally {
+					await stop(client);
+				}
+
+				const invocations = await f.invocations();
+				expect(new Set(invocations.map(entry => entry.home))).toEqual(
+					new Set([homeOf(f.root, "acct-second")]),
+				);
+				expect(invocations.filter(entry => entry.home.includes("acct-first"))).toEqual([]);
+			} finally {
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+});
+
+/** Seeds a profile's cached `/usage` and model catalog, as a refresh would have. */
+async function seedProfile(
+	root: string,
+	slug: string,
+	options: { usagePct?: number; models?: string[] } = {},
+): Promise<void> {
+	const dir = join(root, "profiles", slug);
+	const fetchedAt = Date.now();
+	if (options.usagePct !== undefined) {
+		await writeFile(
+			join(dir, "usage.json"),
+			JSON.stringify({
+				profile: slug,
+				fetchedAt,
+				windows: [
+					{ family: "gemini", window: "fiveHour", remainingPct: options.usagePct, resetsAt: "2099-01-01T00:00:00Z" },
+					{ family: "gemini", window: "weekly", remainingPct: options.usagePct, resetsAt: "2099-01-01T00:00:00Z" },
+				],
+				raw: "",
+			}),
+		);
+	}
+	if (options.models) {
+		await writeFile(
+			join(dir, "models.json"),
+			JSON.stringify({ profile: slug, fetchedAt, models: options.models.map(modelId => ({ modelId })) }),
+		);
+	}
+}
+
+describe("agy-multi ACP proxy (legacy account pool)", () => {
+	test(
+		"legacy pooling is opt-in and warns about the Terms of Service before serving requests",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"]);
+			const client = f.proxy(["--allow-account-pool"]);
+			try {
+				await client.waitForStderr(line => line.includes("Terms of Service"));
+				expect(client.stderrLines.join("\n")).toContain("not supported");
+
+				// The warning was observed before any request was written, so it
+				// precedes the first served request rather than racing the handshake.
+				const initialized = await client.send<Reply>("initialize", {
+					protocolVersion: 1,
+					clientCapabilities: {},
+				});
+				expect(initialized.result?.protocolVersion).toBe(1);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"legacy pooling completes a quota-blocked turn on the next account",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"], {
+				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a" },
+			});
+			const client = f.proxy(["--allow-account-pool", "--switch-delay", "0"]);
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const sessionId = created.result?.sessionId;
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId,
+					prompt: [{ type: "text", text: "TRIGGER" }],
+				});
+
+				expect(prompted.error).toBeUndefined();
+				expect(prompted.result?.stopReason).toBe("end_turn");
+
+				const invocations = await f.invocations();
+				expect(promptHomes(invocations)).toEqual([homeOf(f.root, "acct-a"), homeOf(f.root, "acct-b")]);
+
+				const state = JSON.parse(await readFile(join(f.root, "state.json"), "utf8")) as {
+					version?: number;
+					blocks: Record<string, { gemini?: number }>;
+				};
+				expect(state.version).toBe(2);
+				expect(state.blocks["acct-a"]?.gemini).toBeGreaterThan(Date.now());
+
+				let answeredSession: unknown;
+				for (const message of client.notifications) {
+					if (!isRecord(message) || message.method !== "session/update" || !isRecord(message.params)) continue;
+					const params = message.params;
+					if (!isRecord(params.update) || !isRecord(params.update.content)) continue;
+					if (params.update.content.text !== "OK") continue;
+					answeredSession = params.sessionId;
+					break;
+				}
+				expect(answeredSession).toBe(sessionId);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"legacy pooling paces the handoff to the next account",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"], {
+				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a" },
+			});
+			const client = f.proxy(["--allow-account-pool", "--switch-delay", "1"]);
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const startedAt = Date.now();
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId: created.result?.sessionId,
+					prompt: [{ type: "text", text: "TRIGGER" }],
+				});
+				const elapsed = Date.now() - startedAt;
+
+				// The pause must not swallow the handoff: the turn still completes on the
+				// next account, one second later.
+				expect(prompted.error).toBeUndefined();
+				expect(prompted.result?.stopReason).toBe("end_turn");
+				expect(elapsed).toBeGreaterThanOrEqual(900);
+				expect(promptHomes(await f.invocations())).toEqual([
+					homeOf(f.root, "acct-a"),
+					homeOf(f.root, "acct-b"),
+				]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"pool mode continues the same conversation on the next account instead of replaying it",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"], {
+				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a" },
+			});
+			const client = f.proxy(["--allow-account-pool", "--switch-delay", "0"]);
+			try {
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId: created.result?.sessionId,
+					prompt: [{ type: "text", text: "KEEP THIS THREAD" }],
+				});
+				expect(prompted.error).toBeUndefined();
+
+				const invocations = await f.invocations();
+				const firstPrompt = invocations.find(
+					entry => entry.method === "session/prompt" && entry.home === homeOf(f.root, "acct-a"),
+				);
+				const resumed = invocations.find(
+					entry => entry.method === "session/resume" && entry.home === homeOf(f.root, "acct-b"),
+				);
+				// The shared store lets the second account open the same conversation.
+				expect(resumed?.sessionId).toBe(firstPrompt?.sessionId);
+
+				const continued = invocations.filter(
+					entry => entry.method === "session/prompt" && entry.home === homeOf(f.root, "acct-b"),
+				);
+				expect(continued).toHaveLength(1);
+				// The account switch carries the thread, so no transcript is replayed.
+				expect(continued[0]?.text).toBe("KEEP THIS THREAD");
+				expect(invocations.filter(entry => entry.method === "session/new")).toHaveLength(1);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"sequential mode never runs two accounts at once and never probes the idle one",
+		async () => {
+			const liveDir = await mkdtemp(join(tmpdir(), "agy-live-"));
+			const f = await fixture(["acct-a", "acct-b"], {
+				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a", FAKE_AGY_LIVE_DIR: liveDir },
+			});
+			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId: created.result?.sessionId,
+					prompt: [{ type: "text", text: "TRIGGER" }],
+				});
+
+				expect(prompted.error).toBeUndefined();
+				expect(prompted.result?.stopReason).toBe("end_turn");
+
+				const invocations = await f.invocations();
+				// Every fake agent reports a sibling account's process that is still
+				// alive when it starts. Sequential mode must produce none of those.
+				expect(invocations.filter(entry => entry.event === "overlap")).toEqual([]);
+
+				// The idle account is never read: its first invocation is the agent
+				// itself, not a `/usage` or `models` probe.
+				const firstOnB = invocations.find(entry => entry.home === homeOf(f.root, "acct-b"));
+				expect(firstOnB?.argv).toContain("acp");
+
+				expect(promptHomes(invocations)).toEqual([
+					homeOf(f.root, "acct-a"),
+					homeOf(f.root, "acct-b"),
+				]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+				await rm(liveDir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"sequential mode refuses to switch accounts while one is mid-turn",
+		async () => {
+			const f = await fixture(["acct-a", "acct-b"], { env: { FAKE_AGY_HOLD_HOME: "acct-a" } });
+			// acct-a is the healthy one (so the first session lands there); only
+			// acct-b can serve the newer model.
+			await seedProfile(f.root, "acct-a", { usagePct: 90, models: ["gemini-3.8-flash-high"] });
+			await seedProfile(f.root, "acct-b", {
+				usagePct: 5,
+				models: ["gemini-3.8-flash-high", "gemini-4-argon-high"],
+			});
+
+			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			try {
+				const first = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				// Hold a turn on acct-a so a switch would have to kill it.
+				void client.send<Reply>("session/prompt", {
+					sessionId: first.result?.sessionId,
+					prompt: [{ type: "text", text: "LONG" }],
+				});
+				await client.waitForNotification(message => JSON.stringify(message).includes("HOLDING"));
+
+				const second = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const switched = await client.send<Reply>("session/set_model", {
+					sessionId: second.result?.sessionId,
+					modelId: "gemini-4-argon-high",
+				});
+
+				expect(switched.error?.message).toContain("mid-turn");
+				const agentStartsOnA = (await f.invocations()).filter(
+					entry =>
+						entry.event === "start" && entry.home === homeOf(f.root, "acct-a") && entry.argv?.includes("acp"),
+				);
+				expect(agentStartsOnA).toHaveLength(1);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"sequential mode runs a second session on the same account with another model",
+		async () => {
+			const f = await fixture(["acct-pro", "acct-basic"], { env: { FAKE_AGY_HOLD_HOME: "acct-pro" } });
+
+			// The pro account owns the wider catalog, so in pool mode it is reserved
+			// for its own models and must not burn quota on one basic can serve.
+			await seedProfile(f.root, "acct-pro", {
+				usagePct: 90,
+				models: ["gemini-3.8-flash-high", "gemini-4-argon-high", "gemini-4-argon-low"],
+			});
+			await seedProfile(f.root, "acct-basic", { usagePct: 60, models: ["gemini-3.8-flash-high"] });
+
+			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			try {
+				const main = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const mainOnArgon = await client.send<Reply>("session/set_model", {
+					sessionId: main.result?.sessionId,
+					modelId: "gemini-4-argon-high",
+				});
+				expect(mainOnArgon.error).toBeUndefined();
+
+				void client.send<Reply>("session/prompt", {
+					sessionId: main.result?.sessionId,
+					prompt: [{ type: "text", text: "ORCHESTRATE" }],
+				});
+				await client.waitForNotification(message => JSON.stringify(message).includes("HOLDING"));
+
+				const subagent = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				expect(subagent.error).toBeUndefined();
+				// Reservation is a pool-only contest: the live account serves flash
+				// itself, so the subagent runs while the argon turn is still going.
+				const subagentOnFlash = await client.send<Reply>("session/set_model", {
+					sessionId: subagent.result?.sessionId,
+					modelId: "gemini-3.8-flash-high",
+				});
+				expect(subagentOnFlash.error).toBeUndefined();
+				void client.send<Reply>("session/prompt", {
+					sessionId: subagent.result?.sessionId,
+					prompt: [{ type: "text", text: "SUBAGENT" }],
+				});
+
+				// Two sessions, two models, one account, both turns in flight at once.
+				const firstHold = JSON.stringify(
+					await client.waitForNotification(message => JSON.stringify(message).includes("HOLDING ")),
+				);
+				await client.waitForNotification(message => {
+					const text = JSON.stringify(message);
+					return text.includes("HOLDING ") && text !== firstHold;
+				});
+
+				const holds = (await f.invocations()).filter(entry => entry.event === "held");
+				expect(holds.map(entry => entry.home)).toEqual([
+					homeOf(f.root, "acct-pro"),
+					homeOf(f.root, "acct-pro"),
+				]);
+				expect(new Set(holds.map(entry => entry.sessionId)).size).toBe(2);
+				const basicTouched = (await f.invocations()).filter(entry => entry.home === homeOf(f.root, "acct-basic"));
+				expect(basicTouched).toEqual([]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"pool mode serves a reserved model when the account that owns it is blocked",
+		async () => {
+			const f = await fixture(["acct-pro", "acct-basic"]);
+			await seedProfile(f.root, "acct-pro", {
+				usagePct: 90,
+				models: ["gemini-3.8-flash-high", "gemini-4-argon-high", "gemini-4-argon-low"],
+			});
+			await seedProfile(f.root, "acct-basic", { usagePct: 90, models: ["gemini-3.8-flash-high"] });
+			// The basic account burned its Gemini quota, so it cannot take flash.
+			await writeFile(
+				join(f.root, "state.json"),
+				JSON.stringify({
+					version: 2,
+					pins: {},
+					blocks: { "acct-basic": { gemini: Date.now() + 3_600_000 } },
+					checkpoints: {},
+				}),
+			);
+
+			const client = f.proxy(["--allow-account-pool"]);
+			try {
+				const session = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				expect(session.error).toBeUndefined();
+				// Reservation must not outlive the account it protects: with the basic
+				// account blocked, the pro catalog is the only way to run flash at all.
+				const switched = await client.send<Reply>("session/set_model", {
+					sessionId: session.result?.sessionId,
+					modelId: "gemini-3.8-flash-high",
+				});
+				expect(switched.error).toBeUndefined();
+				const basicTouched = (await f.invocations()).filter(entry => entry.home === homeOf(f.root, "acct-basic"));
+				expect(basicTouched).toEqual([]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"sequential mode parks a new session on the account that is mid-turn",
+		async () => {
+			const slugs = ["acct-a", "acct-b", "acct-c", "acct-d"];
+			const f = await fixture(slugs, { env: { FAKE_AGY_HOLD_HOME: "acct-a" } });
+
+			// acct-a leads the ranking, so the first session lands there.
+			await seedProfile(f.root, "acct-a", { usagePct: 90 });
+			for (const slug of slugs.slice(1)) await seedProfile(f.root, slug, { usagePct: 5 });
+
+			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			try {
+				const first = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				expect(first.error).toBeUndefined();
+				void client.send<Reply>("session/prompt", {
+					sessionId: first.result?.sessionId,
+					prompt: [{ type: "text", text: "LONG" }],
+				});
+				await client.waitForNotification(message => JSON.stringify(message).includes("HOLDING"));
+
+				// Quota drops mid-turn: every other account now outranks acct-a, and
+				// three of them fill the candidate window a switch would try.
+				await seedProfile(f.root, "acct-a", { usagePct: 5 });
+				for (const slug of slugs.slice(1)) await seedProfile(f.root, slug, { usagePct: 90 });
+
+				const second = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				expect(second.error).toBeUndefined();
+				expect(second.result?.sessionId).toBeTruthy();
+
+				const newSessionsPerHome = (await f.invocations())
+					.filter(entry => entry.event === "request" && entry.method === "session/new")
+					.map(entry => entry.home);
+				expect(newSessionsPerHome).toEqual([homeOf(f.root, "acct-a"), homeOf(f.root, "acct-a")]);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+});
+
+/**
+ * Reproduces the reported failure: the agent launches a long build as a daemon
+ * task, the 10s wait expires, and it closes the turn claiming it is "waiting".
+ * `manage_task status` only reports the task finished on the third poll.
+ */
+const FAKE_DAEMON_AGY = `#!/usr/bin/env bun
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
@@ -387,77 +1102,37 @@ lines.on("line", line => {
 });
 `;
 
+function isToolCallNotification(message: unknown, toolCallId: string): boolean {
+	if (!isRecord(message) || message.method !== "session/update" || !isRecord(message.params)) return false;
+	const update = message.params.update;
+	return isRecord(update) && update.toolCallId === toolCallId;
+}
+
+describe("agy-multi ACP proxy (single-account features)", () => {
 	test(
 		"holds the turn open while a daemon task is still running instead of reporting end_turn",
 		async () => {
-			const root = await mkdtemp(join(tmpdir(), "agy-multi-daemon-"));
-			const projectRoot = join(import.meta.dir, "..");
-			const fake = join(root, "fake-agy");
-			const log = join(root, "turns.log");
-
-			const dir = join(root, "profiles", "acct-1");
-			await mkdir(dir, { recursive: true });
-			await writeFile(join(dir, "profile.json"), JSON.stringify({ slug: "acct-1", createdAt: new Date().toISOString() }));
-			await writeFile(fake, FAKE_DAEMON_AGY);
-			await chmod(fake, 0o755);
-
-			const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp"], {
-				cwd: projectRoot,
-				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_DAEMON_LOG: log },
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-
+			const f = await fixture(["acct-1"], { agent: FAKE_DAEMON_AGY });
+			const turnsLog = join(f.root, "turns.log");
+			const client = f.proxy(["--profile", "acct-1"], { FAKE_DAEMON_LOG: turnsLog });
 			try {
-				const stdin = proxy.stdin;
-				if (!stdin) throw new Error("proxy stdin missing");
-				const pending = new Map<number, (message: unknown) => void>();
-				let nextId = 1;
-				const send = async <T>(method: string, params: unknown): Promise<T> => {
-					const id = nextId++;
-					const { promise, resolve } = Promise.withResolvers<unknown>();
-					pending.set(id, resolve);
-					stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-					await stdin.flush();
-					return (await promise) as T;
-				};
-
-				new LineReader(proxy.stdout, line => {
-					let message: unknown;
-					try {
-						message = JSON.parse(line);
-					} catch {
-						return;
-					}
-					if (isRecord(message) && typeof message.id === "number" && pending.has(message.id)) {
-						const resolve = pending.get(message.id)!;
-						pending.delete(message.id);
-						resolve(message);
-					}
-				});
-
-				await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
-				const created = await send<{ result: { sessionId: string } }>("session/new", {
-					cwd: root,
-					mcpServers: [],
-				});
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
 
 				// The reported bug: this resolved with end_turn while the daemon was alive.
-				const prompted = await send<{ result: { stopReason: string } }>("session/prompt", {
-					sessionId: created.result.sessionId,
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId: created.result?.sessionId,
 					prompt: [{ type: "text", text: "run cargo xtask ci" }],
 				});
 
 				// Only the proxy asked the agent to resume: once it did, the task was finished.
-				expect(prompted.result.stopReason).toBe("end_turn");
-				const turns = (await readFile(log, "utf8")).trim().split("\n");
+				expect(prompted.result?.stopReason).toBe("end_turn");
+				const turns = (await readFile(turnsLog, "utf8")).trim().split("\n");
 				expect(turns[0]).toBe("PROMPT");
 				expect(turns.filter(turn => turn === "HOLD").length).toBeGreaterThanOrEqual(2);
 			} finally {
-				proxy.kill();
-				await proxy.exited.catch(() => {});
-				await rm(root, { recursive: true, force: true });
+				await stop(client);
+				await f.cleanup();
 			}
 		},
 		30_000,
@@ -466,206 +1141,115 @@ lines.on("line", line => {
 	test(
 		"cancel during the hold releases the turn and reports cancelled",
 		async () => {
-			const root = await mkdtemp(join(tmpdir(), "agy-multi-daemon-cancel-"));
-			const projectRoot = join(import.meta.dir, "..");
-			const fake = join(root, "fake-agy");
-			const log = join(root, "turns.log");
-
-			const dir = join(root, "profiles", "acct-1");
-			await mkdir(dir, { recursive: true });
-			await writeFile(join(dir, "profile.json"), JSON.stringify({ slug: "acct-1", createdAt: new Date().toISOString() }));
-			await writeFile(fake, FAKE_DAEMON_AGY);
-			await chmod(fake, 0o755);
-
-			const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp"], {
-				cwd: projectRoot,
-				env: {
-					...process.env,
-					AGY_MULTI_ROOT: root,
-					AGY_BIN: fake,
-					FAKE_DAEMON_LOG: log,
-					// Long enough that the assertion runs while the proxy is still holding.
-					FAKE_DAEMON_TIMER: "30",
-				},
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
+			const f = await fixture(["acct-1"], { agent: FAKE_DAEMON_AGY });
+			const turnsLog = join(f.root, "turns.log");
+			// Long enough that the turn is still held when the client cancels.
+			const client = f.proxy(["--profile", "acct-1"], {
+				FAKE_DAEMON_LOG: turnsLog,
+				FAKE_DAEMON_TIMER: "30",
 			});
-
 			try {
-				const stdin = proxy.stdin;
-				if (!stdin) throw new Error("proxy stdin missing");
-				const pending = new Map<number, (message: unknown) => void>();
-				let nextId = 1;
-				const send = async <T>(method: string, params: unknown): Promise<T> => {
-					const id = nextId++;
-					const { promise, resolve } = Promise.withResolvers<unknown>();
-					pending.set(id, resolve);
-					stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-					await stdin.flush();
-					return (await promise) as T;
-				};
-				const notify = async (method: string, params: unknown) => {
-					stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
-					await stdin.flush();
-				};
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const sessionId = created.result?.sessionId;
 
-				new LineReader(proxy.stdout, line => {
-					let message: unknown;
-					try {
-						message = JSON.parse(line);
-					} catch {
-						return;
-					}
-					if (isRecord(message) && typeof message.id === "number" && pending.has(message.id)) {
-						const resolve = pending.get(message.id)!;
-						pending.delete(message.id);
-						resolve(message);
-					}
-				});
-
-				await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
-				const created = await send<{ result: { sessionId: string } }>("session/new", {
-					cwd: root,
-					mcpServers: [],
-				});
-				const sessionId = created.result.sessionId;
-
-				// Do not await: the proxy is holding the turn, so only cancel can release it.
-				const inflight = send<{ result: { stopReason: string } }>("session/prompt", {
+				// Do not await: the turn is held, so only cancel can release it.
+				const inflight = client.send<Reply>("session/prompt", {
 					sessionId,
 					prompt: [{ type: "text", text: "run cargo xtask ci" }],
 				});
-				await new Promise(resolve => setTimeout(resolve, 300));
-				await notify("session/cancel", { sessionId });
+				// The first tool_call proves the prompt reached the agent and is held.
+				await client.waitForNotification(message => isToolCallNotification(message, "call-817"));
+				await client.notify("session/cancel", { sessionId });
 
 				const prompted = await inflight;
-				expect(prompted.result.stopReason).toBe("cancelled");
-				const turns = (await readFile(log, "utf8")).trim().split("\n");
+				expect(prompted.result?.stopReason).toBe("cancelled");
+				const turns = (await readFile(turnsLog, "utf8")).trim().split("\n");
 				expect(turns.filter(turn => turn === "HOLD")).toEqual([]);
 			} finally {
-				proxy.kill();
-				await proxy.exited.catch(() => {});
-				await rm(root, { recursive: true, force: true });
+				await stop(client);
+				await f.cleanup();
 			}
 		},
 		30_000,
 	);
 
 	test(
-		"/multi-usage is advertised in availableCommands and returns average 5-hour & weekly limits without calling child prompt",
+		"/multi-usage reports only the pinned account and never probes another one",
 		async () => {
-			const root = await mkdtemp(join(tmpdir(), "agy-multi-acp-"));
-			const projectRoot = join(import.meta.dir, "..");
-			const fake = join(root, "fake-agy");
-			const promptLog = join(root, "prompts.log");
-
+			const f = await fixture(["acct-a", "acct-b"], {
+				env: {
+					FAKE_AGY_USAGE_BY_SLUG: JSON.stringify({
+						"acct-a": [60, 80, 20, 40],
+						"acct-b": [80, 100, 40, 60],
+					}),
+				},
+			});
 			const now = Date.now();
 			const profiles = [
 				{ slug: "acct-a", g5: 80, gw: 60, c5: 40, cw: 20 },
 				{ slug: "acct-b", g5: 100, gw: 80, c5: 60, cw: 40 },
 			];
-			for (const p of profiles) {
-				const dir = join(root, "profiles", p.slug);
-				await mkdir(dir, { recursive: true });
-				await writeFile(join(dir, "profile.json"), JSON.stringify({ slug: p.slug, createdAt: new Date().toISOString() }));
+			for (const profile of profiles) {
 				await writeFile(
-					join(dir, "usage.json"),
+					join(f.root, "profiles", profile.slug, "usage.json"),
 					JSON.stringify({
-						profile: p.slug,
+						profile: profile.slug,
 						fetchedAt: now,
 						windows: [
-							{ family: "gemini", window: "fiveHour", remainingPct: p.g5, resetsAt: "2099-01-01T00:00:00Z" },
-							{ family: "gemini", window: "weekly", remainingPct: p.gw, resetsAt: "2099-01-01T00:00:00Z" },
-							{ family: "claude-gpt", window: "fiveHour", remainingPct: p.c5, resetsAt: "2099-01-01T00:00:00Z" },
-							{ family: "claude-gpt", window: "weekly", remainingPct: p.cw, resetsAt: "2099-01-01T00:00:00Z" },
+							{ family: "gemini", window: "fiveHour", remainingPct: profile.g5, resetsAt: "2099-01-01T00:00:00Z" },
+							{ family: "gemini", window: "weekly", remainingPct: profile.gw, resetsAt: "2099-01-01T00:00:00Z" },
+							{ family: "claude-gpt", window: "fiveHour", remainingPct: profile.c5, resetsAt: "2099-01-01T00:00:00Z" },
+							{ family: "claude-gpt", window: "weekly", remainingPct: profile.cw, resetsAt: "2099-01-01T00:00:00Z" },
 						],
 						raw: "",
 					}),
 				);
 			}
-			await writeFile(fake, FAKE_AGY);
-			await chmod(fake, 0o755);
 
-			const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp"], {
-				cwd: projectRoot,
-				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: promptLog },
-				stdin: "pipe",
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-
+			const client = f.proxy(["--profile", "acct-a"]);
 			try {
-				const stdin = proxy.stdin;
-				if (!stdin) throw new Error("proxy stdin missing");
-				const pending = new Map<number, (message: unknown) => void>();
 				const chunks: string[] = [];
-				let advertisedCommands: string[] = [];
-				let nextId = 1;
-				const send = async <T>(method: string, params: unknown): Promise<T> => {
-					const id = nextId++;
-					const { promise, resolve } = Promise.withResolvers<unknown>();
-					pending.set(id, resolve);
-					stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-					await stdin.flush();
-					return (await promise) as T;
-				};
+				const advertised: string[] = [];
+				const notifications = client.notifications;
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const sessionId = created.result?.sessionId;
 
-				new LineReader(proxy.stdout, line => {
-					let message: unknown;
-					try {
-						message = JSON.parse(line);
-					} catch {
-						return;
-					}
-					if (!isRecord(message)) return;
-					if (typeof message.id === "number" && pending.has(message.id)) {
-						const resolve = pending.get(message.id)!;
-						pending.delete(message.id);
-						resolve(message);
-						return;
-					}
-					if (message.method === "session/update" && isRecord(message.params) && isRecord(message.params.update)) {
-						const update = message.params.update;
-						if (update.sessionUpdate === "available_commands_update" && Array.isArray(update.availableCommands)) {
-							advertisedCommands = update.availableCommands
-								.map(c => (isRecord(c) && typeof c.name === "string" ? c.name : ""))
-								.filter(Boolean);
-						}
-						if (update.sessionUpdate === "agent_message_chunk" && isRecord(update.content) && typeof update.content.text === "string") {
-							chunks.push(update.content.text);
-						}
-					}
-				});
-
-				await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
-				const created = await send<{ result: { sessionId: string } }>("session/new", {
-					cwd: root,
-					mcpServers: [],
-				});
-				expect(advertisedCommands).toContain("multi-usage");
-
-				const prompted = await send<{ result: { stopReason: string } }>("session/prompt", {
-					sessionId: created.result.sessionId,
+				const prompted = await client.send<Reply>("session/prompt", {
+					sessionId,
 					prompt: [{ type: "text", text: "/multi-usage" }],
 				});
-				expect(prompted.result.stopReason).toBe("end_turn");
-				const reply = chunks.join("");
-				expect(reply).toBe(
+				expect(prompted.result?.stopReason).toBe("end_turn");
+
+				for (const message of notifications) {
+					if (!isRecord(message) || message.method !== "session/update" || !isRecord(message.params)) continue;
+					const params = message.params;
+					if (!isRecord(params.update)) continue;
+					if (params.update.sessionUpdate === "available_commands_update" && Array.isArray(params.update.availableCommands)) {
+						for (const command of params.update.availableCommands) {
+							if (isRecord(command) && typeof command.name === "string") advertised.push(command.name);
+						}
+					}
+					if (!isRecord(params.update.content)) continue;
+					if (typeof params.update.content.text === "string") chunks.push(params.update.content.text);
+				}
+				expect(advertised).toContain("multi-usage");
+				// Cached usage for the pinned account only: no averaging, no sibling probe.
+				expect(chunks.join("")).toBe(
 					[
-						"Gemini Models\tWeekly Limit Remaining\t70%\t2099-01-01T00:00:00Z",
-						"Gemini Models\tFive Hour Limit Remaining\t90%\t2099-01-01T00:00:00Z",
-						"Claude and GPT models\tWeekly Limit Remaining\t30%\t2099-01-01T00:00:00Z",
-						"Claude and GPT models\tFive Hour Limit Remaining\t50%\t2099-01-01T00:00:00Z",
+						"Gemini Models\tWeekly Limit Remaining\t60%\t2099-01-01T00:00:00Z",
+						"Gemini Models\tFive Hour Limit Remaining\t80%\t2099-01-01T00:00:00Z",
+						"Claude and GPT models\tWeekly Limit Remaining\t20%\t2099-01-01T00:00:00Z",
+						"Claude and GPT models\tFive Hour Limit Remaining\t40%\t2099-01-01T00:00:00Z",
 					].join("\n"),
 				);
 
-				const childPrompts = await readFile(promptLog, "utf8").catch(() => "");
-				expect(childPrompts).toBe("");
+				const invocations = await f.invocations();
+				expect(invocations.filter(entry => entry.home.includes("acct-b"))).toEqual([]);
 			} finally {
-				proxy.kill();
-				await proxy.exited.catch(() => {});
-				await rm(root, { recursive: true, force: true });
+				await stop(client);
+				await f.cleanup();
 			}
 		},
 		30_000,

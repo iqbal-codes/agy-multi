@@ -76,6 +76,8 @@ export interface FailoverOptions {
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	skills?: string[];
+	/** Pool mode only: pause between attempts. Pacing, not evasion. */
+	switchDelayMs?: number;
 }
 
 export interface RunAttempt {
@@ -113,7 +115,7 @@ async function gitHead(cwd: string): Promise<string | undefined> {
 function buildHandoffPrompt(checkpoint: Checkpoint | undefined, prompt: string): string {
 	if (!checkpoint) return prompt;
 	const lines = [
-		"You are resuming an interrupted task on a different account.",
+		"Resuming an interrupted task.",
 		"Previous session checkpoint:",
 		`- Original task: ${checkpoint.prompt}`,
 		checkpoint.response
@@ -205,6 +207,12 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 	for (const slug of ordered.slice(0, maxSwitches + 1)) {
 		const profile = candidates.find(p => p.slug === slug);
 		if (!profile) continue;
+
+		if (attempts.length > 0 && opts.switchDelayMs && opts.switchDelayMs > 0) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, opts.switchDelayMs);
+			await promise;
+		}
 
 		// Handoff-only: never resume another account's conversation. Only the
 		// profile that owns the conversation may pass --conversation.

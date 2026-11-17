@@ -210,7 +210,8 @@ async function setupTieredEnv() {
 }
 
 function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: string) {
-	const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp"], {
+	// Cross-profile model routing only exists in the opt-in legacy account pool.
+	const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--allow-account-pool", "--switch-delay", "0"], {
 		cwd: projectRoot,
 		env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: promptLog },
 		stdin: "pipe",

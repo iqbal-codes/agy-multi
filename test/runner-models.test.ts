@@ -35,6 +35,12 @@ const modelIdx = argv.indexOf("--model");
 const model = modelIdx >= 0 ? argv[modelIdx + 1] : undefined;
 if (runLog) appendFileSync(runLog, (isPro ? "acct-pro" : "acct-basic") + ":" + (model ?? "") + "\\n");
 
+const failSlug = process.env.FAKE_RUN_FAIL;
+if (failSlug && home.includes(failSlug)) {
+  process.stderr.write((process.env.FAKE_RUN_FAIL_MESSAGE ?? "RESOURCE_EXHAUSTED: quota exceeded") + "\\n");
+  process.exit(1);
+}
+
 if (!isPro && model && model.startsWith("gemini-4-")) {
   process.stderr.write("Unknown model ID: " + model + "\\n");
   process.exit(1);
@@ -99,7 +105,7 @@ describe("CLI run model capability selection", () => {
 			);
 
 			const proc = Bun.spawn(
-				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--prompt", "hi", "--model", "gemini-4-hydrogen-high"],
+				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--allow-account-pool", "--switch-delay", "0", "--prompt", "hi", "--model", "gemini-4-hydrogen-high"],
 				{
 					cwd: projectRoot,
 					env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_RUN_LOG: runLog },
@@ -134,7 +140,7 @@ describe("CLI run model capability selection", () => {
 			}
 
 			const proc = Bun.spawn(
-				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--prompt", "hi", "--model", "gemini-4-argon-high"],
+				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--allow-account-pool", "--switch-delay", "0", "--prompt", "hi", "--model", "gemini-4-argon-high"],
 				{
 					cwd: projectRoot,
 					env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_RUN_LOG: runLog },
@@ -150,4 +156,44 @@ describe("CLI run model capability selection", () => {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+
+	for (const failure of [
+		{ kind: "banned", message: "violation of Terms of Service" },
+		{ kind: "quota", message: "RESOURCE_EXHAUSTED: quota exceeded" },
+		{ kind: "auth", message: "not logged into Antigravity" },
+	] as const) {
+		test(`--profile reports a ${failure.kind} failure instead of retrying on another account`, async () => {
+			const { root, fake, runLog } = await setupCliEnv();
+			const projectRoot = join(import.meta.dir, "..");
+			try {
+				const proc = Bun.spawn(
+					["bun", "run", join(projectRoot, "src/index.ts"), "run", "--prompt", "hi", "--profile", "acct-basic"],
+					{
+						cwd: projectRoot,
+						env: {
+							...process.env,
+							AGY_MULTI_ROOT: root,
+							AGY_BIN: fake,
+							FAKE_RUN_LOG: runLog,
+							FAKE_RUN_FAIL: "acct-basic",
+							FAKE_RUN_FAIL_MESSAGE: failure.message,
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+					},
+				);
+				const [stdout, stderr, code] = await Promise.all([
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+					proc.exited,
+				]);
+				expect(code, stderr).not.toBe(0);
+				expect(`${stderr}${stdout}`).toContain(failure.kind);
+				// Exactly one attempt, on the pinned account.
+				expect((await readFile(runLog, "utf8")).trim().split("\n")).toEqual(["acct-basic:"]);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+	}
 });
