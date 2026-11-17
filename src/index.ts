@@ -7,10 +7,24 @@ import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, s
 import { listProfiles, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
 import { loadState, saveState, setDefaultProfile } from "./state";
-import { fetchUsage, formatMultiUsageReport } from "./usage";
+import { formatMultiUsageReport, readCachedUsage } from "./usage";
 import { fetchModels, readCachedModels } from "./models";
-import { MODELS_TTL_MS } from "./paths";
+import { MODELS_TTL_MS, PROBE_SPACING_MS } from "./paths";
+import { ProbeSync } from "./probe-sync";
+import { SerialQueue } from "./serial-queue";
+import type { Profile, UsageSnapshot } from "./types";
 import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
+
+/** Short age for cache lines: `42s`, `7m`, `3h`, `2d`. */
+function ageText(ms: number): string {
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${hours}h`;
+	return `${Math.round(hours / 24)}d`;
+}
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
 
@@ -22,8 +36,8 @@ Usage:
   agy-multi profile enable <slug>
   agy-multi profile sync [<slug>]
   agy-multi profile remove <slug>
-  agy-multi quota [--profile <slug>]
-  agy-multi multi-usage [--profile <slug>]
+  agy-multi quota [--profile <slug>] [--refresh]
+  agy-multi multi-usage [--profile <slug>] [--refresh]
   agy-multi models [--profile <slug>] [--refresh]
   agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
   agy-multi use <slug>
@@ -33,6 +47,11 @@ Usage:
                  [--conversation <id>] [--model <id>] [--profile <slug>]
                  [--cwd <dir>] [--json] [--allow-account-pool] [--max-switches <n>]
   agy-multi state
+
+Quota:
+  quota and multi-usage print the cached snapshot and never start a check on
+  their own; the proxy keeps that cache warm in the background, one account at
+  a time. --refresh probes now, still one account at a time.
 
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
@@ -242,36 +261,49 @@ async function main(): Promise<void> {
 	}
 
 	if (command === "quota") {
-		await ensureAgy();
 		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
 		if (!profiles.length) {
 			console.log("no profiles");
 			return;
 		}
+		if (values.refresh) {
+			await ensureAgy();
+			const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
+			await probes.syncStale(profiles, { usage: true, force: true });
+		}
+		let oldest: number | undefined;
 		for (const profile of profiles) {
-			const snapshot = await fetchUsage(profile).catch(() => null);
+			const snapshot = await readCachedUsage(profile.slug);
 			if (!snapshot) {
-				console.log(`${profile.slug}\t(unavailable)`);
+				console.log(`${profile.slug}\t(no cached usage; run with --refresh)`);
 				continue;
 			}
+			oldest = Math.min(oldest ?? snapshot.fetchedAt, snapshot.fetchedAt);
 			for (const window of snapshot.windows) {
 				console.log(
 					`${profile.slug}\t${window.family}\t${window.window}\t${window.remainingPct}%\t${window.resetsAt}`,
 				);
 			}
 		}
+		if (oldest !== undefined) {
+			console.error(
+				`# cached ${ageText(Date.now() - oldest)} ago; ${values.refresh ? "refreshed one account at a time" : "--refresh syncs one account at a time"}`,
+			);
+		}
 		return;
 	}
 
 	if (command === "multi-usage") {
-		await ensureAgy();
 		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
-		const entries = await Promise.all(
-			profiles.map(async profile => ({
-				profile,
-				snapshot: await fetchUsage(profile).catch(() => null),
-			})),
-		);
+		if (values.refresh) {
+			await ensureAgy();
+			const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
+			await probes.syncStale(profiles, { usage: true, force: true });
+		}
+		const entries: Array<{ profile: Profile; snapshot: UsageSnapshot | null }> = [];
+		for (const profile of profiles) {
+			entries.push({ profile, snapshot: await readCachedUsage(profile.slug) });
+		}
 		console.log(formatMultiUsageReport(entries));
 		return;
 	}

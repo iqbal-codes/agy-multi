@@ -1,12 +1,14 @@
 import { join } from "node:path";
-import { AGY_BIN, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, MODELS_TTL_MS, profileDir, USAGE_TTL_MS } from "./paths";
+import { AGY_BIN, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, PROBE_SPACING_MS, profileDir } from "./paths";
 import type { AgyResultEvent, Checkpoint, FailureKind, ModelsSnapshot, Profile, RunOutcome, UsageSnapshot } from "./types";
 import { classifyRun, isModelUnsupportedError } from "./classify";
 import { ensureDir, run } from "./fs-utils";
 import { listProfiles, profileEnvOf, profileHomeOf, saveProfile } from "./registry";
 import { block, getCheckpoint, loadState, pin, pinnedProfile, saveState, setCheckpoint } from "./state";
-import { blockingReset, familyForModel, fetchUsage, readCachedUsage } from "./usage";
-import { fetchModels, readCachedModels, reservedProfilesFor, withoutUnsupportedModel, writeCachedModels } from "./models";
+import { blockingReset, familyForModel, readCachedUsage } from "./usage";
+import { readCachedModels, reservedProfilesFor, withoutUnsupportedModel, writeCachedModels } from "./models";
+import { ProbeSync } from "./probe-sync";
+import { SerialQueue } from "./serial-queue";
 import { rankProfiles } from "./select";
 import { buildInjectedPrompt } from "./injection";
 
@@ -141,27 +143,21 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 	const now = Date.now();
 	const usage = new Map<string, UsageSnapshot | null>();
 	const models = new Map<string, ModelsSnapshot | null>();
-	await Promise.all(
-		candidates.map(async profile => {
-			const disk = await readCachedUsage(profile.slug);
-			if (disk && now - disk.fetchedAt < USAGE_TTL_MS) {
-				usage.set(profile.slug, disk);
-			} else {
-				const snapshot = await fetchUsage(profile).catch(() => null);
-				usage.set(profile.slug, snapshot ?? disk ?? null);
-			}
-
-			if (opts.model && !opts.onlyProfile) {
-				const cachedModels = await readCachedModels(profile.slug);
-				if (cachedModels && now - cachedModels.fetchedAt < MODELS_TTL_MS) {
-					models.set(profile.slug, cachedModels);
-				} else {
-					const fresh = await fetchModels(profile).catch(() => null);
-					models.set(profile.slug, fresh ?? cachedModels ?? null);
-				}
-			}
-		}),
-	);
+	const wantsModels = Boolean(opts.model && !opts.onlyProfile);
+	for (const profile of candidates) {
+		usage.set(profile.slug, await readCachedUsage(profile.slug));
+		if (wantsModels) models.set(profile.slug, await readCachedModels(profile.slug));
+	}
+	// A one-shot run may wait for a probe, but never fans one out across accounts:
+	// stale caches are refreshed one account at a time, oldest first.
+	const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
+	await probes.syncStale(candidates, { usage: true, models: wantsModels });
+	for (const profile of candidates) {
+		usage.set(profile.slug, (await readCachedUsage(profile.slug)) ?? usage.get(profile.slug) ?? null);
+		if (wantsModels) {
+			models.set(profile.slug, (await readCachedModels(profile.slug)) ?? models.get(profile.slug) ?? null);
+		}
+	}
 
 	const ranked = rankProfiles(candidates, usage, state, {
 		modelId: opts.model,

@@ -268,8 +268,11 @@ agy-multi profile sync
 agy-multi profile list
 agy-multi profile remove work
 
-# Check quota percentage (rolling 5h & weekly remaining)
-agy-multi quota [--profile <slug>]
+# Print the cached quota snapshot (rolling 5h & weekly remaining).
+# The proxy keeps that cache warm in the background, one account at a time;
+# --refresh probes now, still one account at a time.
+agy-multi quota [--profile <slug>] [--refresh]
+agy-multi multi-usage [--profile <slug>] [--refresh]
 
 # Check token usage & Gemini 3.8 Flash cost analytics
 agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
@@ -296,7 +299,7 @@ agy-multi state
 
 ### Token Usage & Cost Analytics (`usage`)
 
-While `agy-multi quota` queries the real-time remaining quota percentages from Google's `/usage` API, `agy-multi usage` (or `agy-multi tokens`) aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
+`agy-multi quota` prints the cached remaining-quota percentages that the proxy already synced from the CLI's `/usage` command; it never starts a check of its own, so it answers in milliseconds. `--refresh` probes on demand, one account at a time. `agy-multi usage` (or `agy-multi tokens`) is a different report: it aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
 
 Rates are calculated based on **Gemini 3.8 Flash** pricing:
 - **Input Tokens**: `$1.50` / 1M tokens
@@ -390,8 +393,9 @@ another account. Nothing probes a second account's `/usage` or `models`; `/multi
 reports only the account in use.
 
 The ranking and rotation described below is the **legacy pool mode**:
-`--allow-account-pool` preflights `/usage` for every candidate, ranks by
-headroom (10% reserve), pins conversations, and fails over on quota/ban/auth.
+`--allow-account-pool` ranks candidates from the cached `/usage` and `models`
+snapshots (refreshed in the background through one serial queue) and fails over
+on quota/ban/auth.
 
 ## Legacy failover rules (`--allow-account-pool`)
 

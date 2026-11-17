@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LineReader } from "../src/acp/rpc";
@@ -29,6 +29,11 @@ process.on("SIGTERM", oauth);
 process.on("exit", () => child.kill("SIGKILL"));
 void reader.read().then(({value}) => { if (value) oauth(); });
 writeFileSync(process.env.STARTED_MARKER, JSON.stringify({pid:process.pid,helper:child.pid}));
+if (process.env.SCENARIO === "oauth-fallback") {
+  const at = process.argv.indexOf("--log-file");
+  const logPath = at >= 0 ? process.argv[at + 1] : undefined;
+  if (logPath) writeFileSync(logPath, "Print mode: silent auth failed\nPrint mode: triggering interactive OAuth\n");
+}
 if (process.env.SCENARIO === "normal" || process.env.SCENARIO === "host-signal") {
   setTimeout(() => {
     console.log(JSON.stringify({status:"SUCCESS",response:"Gemini Models\tFive Hour Limit Remaining\t40%\t2027-01-01T00:00:00Z"}));
@@ -39,11 +44,17 @@ if (process.env.SCENARIO === "normal" || process.env.SCENARIO === "host-signal")
 
 const WORKER = String.raw`
 import { fetchUsage, readCachedUsage } from "USAGE_MODULE";
+import { existsSync, writeFileSync } from "node:fs";
 const controller = new AbortController();
 const scenario = process.env.SCENARIO;
+const startedAt = Date.now();
 process.on("SIGTERM", () => {});
 if (scenario === "pre-abort") controller.abort();
-const result = fetchUsage({slug:"probe",home:process.env.TEST_HOME,createdAt:"now"}, 1500, controller.signal);
+const result = fetchUsage({slug:"probe",home:process.env.TEST_HOME,createdAt:"now"}, {
+  timeoutMs: scenario === "oauth-fallback" ? 20000 : 1500,
+  signal: controller.signal,
+  onNeedsLogin: () => writeFileSync(process.env.NEEDS_LOGIN_MARKER, "1"),
+});
 if (scenario === "abort" || scenario === "host-signal") {
   const deadline = Date.now()+4000;
   while (!(await Bun.file(process.env.STARTED_MARKER).exists())) {
@@ -54,7 +65,7 @@ if (scenario === "abort" || scenario === "host-signal") {
   else process.kill(-process.pid,"SIGTERM");
 }
 const snapshot = await result;
-console.log(JSON.stringify({snapshot,cached:await readCachedUsage("probe"),browser:await Bun.file(process.env.BROWSER_MARKER).exists(),started:await Bun.file(process.env.STARTED_MARKER).exists()}));
+console.log(JSON.stringify({snapshot,cached:await readCachedUsage("probe"),browser:await Bun.file(process.env.BROWSER_MARKER).exists(),started:await Bun.file(process.env.STARTED_MARKER).exists(),needsLogin:existsSync(process.env.NEEDS_LOGIN_MARKER),elapsedMs:Date.now()-startedAt}));
 `;
 
 async function probe(scenario: string) {
@@ -63,11 +74,13 @@ async function probe(scenario: string) {
 	const worker = join(root, "worker.ts");
 	await writeFile(cli, CLI);
 	await chmod(cli, 0o755);
+	await mkdir(join(root, "profiles/probe"), { recursive: true });
 	await writeFile(worker, WORKER.replace("USAGE_MODULE", join(import.meta.dir, "../src/usage.ts")));
 	const proc = Bun.spawn([process.execPath, worker], {
 		detached: true,
 		env: { ...process.env, AGY_BIN: cli, AGY_MULTI_ROOT: root, TEST_HOME: root, SCENARIO: scenario,
-			STARTED_MARKER: join(root, "started"), BROWSER_MARKER: join(root, "browser") },
+			STARTED_MARKER: join(root, "started"), BROWSER_MARKER: join(root, "browser"),
+			NEEDS_LOGIN_MARKER: join(root, "needs-login") },
 		stdout: "pipe", stderr: "pipe",
 	});
 	try {
@@ -110,6 +123,15 @@ describe.skipIf(process.platform === "win32")("quota subprocess lifecycle", () =
 		expect(result.browser).toBe(false);
 		expect(result.snapshot?.windows[0]?.remainingPct).toBe(40);
 	}, 8000);
+	test("an interactive-login fallback is killed at once, not after the timeout", async () => {
+		const result = await probe("oauth-fallback");
+		expect(result.started).toBe(true);
+		expect(result.needsLogin).toBe(true);
+		expect(result.snapshot).toBeNull();
+		expect(result.cached).toBeNull();
+		expect(result.browser).toBe(false);
+		expect(result.elapsedMs).toBeLessThan(8000);
+	}, 15000);
 	test("successful checks still cache real quota results", async () => {
 		const result = await probe("normal");
 		expect(result.browser).toBe(false);
