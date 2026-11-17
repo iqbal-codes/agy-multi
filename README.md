@@ -5,11 +5,11 @@
 
 > [!NOTE]
 > **Requires an ACP Client / Host**:
-> `agy-multi` is an **ACP (Agent Client Protocol) Proxy Server**, not an interactive terminal chat replacement or patch for `agy`. It is designed to be connected to an **ACP Client / AI Editor** (such as **T3 Code**, **Zed**, **Oh My Pi (OMP)**, or custom ACP harnesses). The ACP client sees a single agent, while `agy-multi` manages multiple Google accounts and seamless quota failover in the background.
+> `agy-multi` is an **ACP (Agent Client Protocol) Proxy Server**, not an interactive terminal chat replacement or patch for `agy`. It is designed to be connected to an **ACP Client / AI Editor** (such as **T3 Code**, **Zed**, or any interactive ACP client). Each proxy process serves exactly one Google account, selected by you; quota and suspension failures are reported back to you rather than routed to another account.
 
-Run the official Antigravity CLI (`agy`) with multiple Google accounts and
-automatic, quota-aware failover — without patching the binary, proxying traffic,
-or reimplementing the protocol.
+Run the official Antigravity CLI (`agy`) with isolated Google accounts, one
+account per process, chosen by you — without patching the binary, proxying
+traffic, or reimplementing the protocol.
 
 ## Why an isolated HOME
 
@@ -17,10 +17,22 @@ or reimplementing the protocol.
 `~/.gemini`. A different `HOME` is a genuinely separate installation:
 
 - Fresh HOME → agy creates its own `~/.gemini`, its own keychain/file token and
-  its own conversation store.
+  its own auth state.
 - A profile-level keychain is created inside that HOME. The wrapper does not
   change the desktop session's default keychain.
 - `GEMINI_DIR` is **not** sufficient: it does not isolate auth.
+
+Conversations are the deliberate exception. `brain/`, `conversations/` and
+`history.jsonl` are linked into one store under `~/.agy-multi/shared/gemini`, so
+switching accounts keeps the thread — the same thing that happens when you
+re-login inside `agy` itself. Credentials, accounts, settings, caches and logs
+stay inside each profile HOME. `conversation_summaries.db` stays per account on
+purpose: it is an index that cannot be merged safely, and each account listing
+its own conversations is harmless. Existing profile carry-overs are moved into
+the shared store on the next `agy-multi sync` or ACP start; if two accounts hold
+the same conversation id, the losing copy is kept in
+`~/.agy-multi/shared/gemini/migrated` rather than deleted. Profiles that adopt an
+existing HOME (`profile add --home`) are left exactly as they are.
 
 The wrapper only chooses which HOME runs, at turn boundaries. On the wire it is
 100% the official client.
@@ -35,20 +47,20 @@ flowchart TD
 
     subgraph Wrapper["agy-multi Engine"]
         Proxy["ACP Proxy & Quota-Aware Router"]
-        Store[("State & Quota Store<br/>~/.agy/state.json")]
+        Store[("State & Quota Store<br/>~/.agy-multi/state.json")]
         Proxy <--> Store
     end
 
     subgraph Profiles["100% Isolated Profile Environments"]
         direction TB
         subgraph P1["Profile: Account A (Active)"]
-            H1["HOME: ~/.agy/profiles/work/home"]
-            K1["Isolated Keychain & .gemini"]
+            H1["HOME: ~/.agy-multi/profiles/work/home"]
+            K1["Isolated keychain, auth & settings"]
             I1["Unique installation_id A"]
         end
         subgraph P2["Profile: Account B (Standby)"]
-            H2["HOME: ~/.agy/profiles/personal/home"]
-            K2["Isolated Keychain & .gemini"]
+            H2["HOME: ~/.agy-multi/profiles/personal/home"]
+            K2["Isolated keychain, auth & settings"]
             I2["Unique installation_id B"]
         end
     end
@@ -68,7 +80,7 @@ flowchart TD
 
     IDE -->|"stdio (JSON-RPC)"| Proxy
     Proxy -->|"Route Turn"| P1
-    Proxy -.->|"Auto-Failover on Quota"| P2
+    Proxy -.->|"Legacy pool only (--allow-account-pool)"| P2
     P1 --> Bin1
     P2 --> Bin2
     Bin1 -->|"Run tools & terminal"| SB
@@ -77,36 +89,98 @@ flowchart TD
     Bin2 -->|"Direct Official TLS"| API
 ```
 
-## How `agy-multi` Stays Safe & Avoids Google ToS Bans
+## Compliance: what is and is not permitted
 
-Multi-account tooling often risks account suspension when implemented carelessly (e.g. via proxy hacks, header tampering, or session replay). `agy-multi` is architected specifically to eliminate these risks:
+This project does not claim that any configuration avoids a ban. Here is what
+Google actually publishes, and how the tool maps to it.
 
-1. **Zero Binary Patching (100% Official Binary)**:
-   - `agy-multi` never disassembles, patches, bytecode-edits, or hooks into the Google Antigravity binary.
-   - It runs the official binary directly as an external subprocess, preserving Google's authentic binary signatures, checksums, and runtime integrity.
+- **Antigravity Additional Terms §6** — "using the Service in connection with
+  products not provided by us… Using third party software, tools, or services to
+  access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of
+  this Agreement", with suspension of the Antigravity and/or Gemini CLI accounts
+  as the stated consequence — <https://antigravity.google/terms/>
+- **FAQ** — "Wrapping `agy` inside third-party coding agents or applications, or
+  automating account rotation, is not supported under consumer plans" —
+  <https://antigravity.google/docs/faq>
+- **Maintainer answer on ACP** — an interactive ACP client driven by a human is
+  fine, including a custom non-editor UI; using `agy acp` as a backend for
+  another agent, an autonomous harness or a background orchestrator is not —
+  <https://github.com/google-antigravity/antigravity-cli/issues/1493>
 
-2. **Zero Traffic Decryption / No MITM Proxy**:
-   - `agy-multi` **never** decrypts or intercepts network traffic between `agy` and Google.
-   - TLS connections originate directly from the official `agy` client and terminate at Google servers using standard system TLS certificates. No self-signed certificates, proxies, or packet modifications exist.
+What that means for this tool:
 
-3. **Isolated Identity & Pristine Fingerprints**:
-   - Anti-abuse systems flag accounts when multiple identities share conflicting cookies, shared SQLite stores, or identical persistent installation keys.
-   - By creating a separate `HOME` directory per profile, each account receives its own isolated `~/.gemini/` storage, private macOS Keychain, and independent `installation_id`. Google sees each profile as a genuine, cleanly separated installation.
+| Mode | Where it stands |
+|---|---|
+| One account, selected with `agy-multi use` or `--profile`, interactive turns | Closest to the permitted shape described above |
+| Pooled failover between accounts (`--allow-account-pool`) | Automatic account rotation — explicitly not supported on consumer plans |
+| `gemini-api-key` / `agent-platform` auth via `agy` itself | The path Google recommends for automation and higher concurrency |
 
-4. **Legitimate Single-Writer Turn Boundaries**:
-   - Conversations are strictly single-writer. `agy-multi` never runs multiple accounts against the same conversation simultaneously.
-   - A turn is **never replayed** once output has been streamed to the user, preventing anomalous duplicate requests or state desynchronization.
+`agy-multi` still launches the unmodified official binary, never decrypts
+traffic, and never spoofs a User-Agent, but none of that changes the two bullets
+above. Compliance is about what the tool does, not how carefully it hides it.
 
-5. **Quota Protection & Anti-Spam Backoff**:
+Still true, and still worth keeping:
+
+1. **Zero Binary Patching** — the official binary runs as an external subprocess.
+2. **Zero Traffic Decryption** — TLS goes from `agy` to Google; no proxy, no
+   self-signed certificate, no packet modification.
+3. **Single-Writer Turns** — a turn whose output already streamed is never
+   replayed elsewhere.
+
+4. **Quota Protection & Anti-Spam Backoff**:
    - When an account hits `RESOURCE_EXHAUSTED` (429) or drops below the 10% reserve threshold, `agy-multi` marks it blocked and honors the reset duration.
    - It does not hammer exhausted endpoints or retry failed calls repeatedly, ensuring standard respectful API behavior.
 
-6. **Transparent Developer Shell Bridge**:
+5. **Transparent Developer Shell Bridge**:
    - The isolated `HOME` is confined to `agy`'s internal auth. Child commands spawned by the agent (`gh`, `git`, `ssh`, `docker`) automatically map to your primary user's environment, avoiding missing SSH keys or broken developer tool credentials.
 
-## Failover Workflow
+## Legacy: pooled failover (`--allow-account-pool`)
 
-When an active account runs out of quota, `agy-multi` keeps the client session ID and creates a new backend conversation on the next available account, carrying recent user/assistant text in a handoff prompt:
+> [!WARNING]
+> This flow is **not permitted** on consumer Antigravity plans: the FAQ says
+> wrapping `agy` inside third-party coding agents and automating account rotation
+> are unsupported, and Terms §6 makes third-party access a breach. It stays behind
+> `--allow-account-pool` so the previous behaviour is not lost; running it is
+> account risk you accept.
+
+`--switch-delay <seconds>` (default 20 in pool mode, `0` disables) pauses before a
+turn is handed to another account. It is **pacing**, so a fresh account is not hit
+the instant the previous one returns 429. It is not a detection countermeasure:
+the switch's timing is not what identifies a harness, and this does not make
+rotation permitted or invisible.
+
+`--sequential` keeps exactly one account active. Ranking reads cached `/usage`
+and model snapshots instead of probing every profile, and the previous `agy acp`
+child is stopped — with its exit awaited — before the next one starts, so two
+accounts are never authenticated at the same moment.
+
+Concurrent sessions on that one account are normal and run in parallel: several
+sessions, different models, one process. Only crossing to another account is
+serialized. Model reservation is therefore a pool-only rule — it is worth
+keeping a wider catalog for its own models only when a switch is cheap, and here
+every switch costs a teardown plus a resume or handoff — so the live account
+serves any model it supports.
+
+Because only one agent process may be alive, sequential mode cannot serve two
+concurrent sessions on different accounts. If a switch would have to kill an
+in-flight turn, the request is refused with `sequential mode: account <slug> is
+mid-turn` instead — the running turn finishes intact, and the client retries
+afterwards. Choose pool mode if you need parallel sessions across accounts.
+
+A session is pinned to the account it was created on and only re-ranks when that
+account becomes unusable (banned, signed out, quota-blocked, or the model is not
+offered there). So a subagent that opens `session/new` while another account is
+mid-turn is placed on that busy account — same process, second session — even
+when its own quota is below the reserve, because the only alternative would be a
+refused switch. A subagent asking for a model the busy account supports runs
+alongside the parent turn; a model only another account offers has to wait for
+that turn to end. Two sessions on two accounts still work over time: the idle
+child is replaced, and the parked session is resumed, or handed off as a fresh
+conversation when the agent lost it.
+
+When an active account runs out of quota, pooled mode keeps the client session ID and continues the same conversation on the next available account. Because the conversation store is shared, the new account resumes that conversation by id (`session/resume`) and receives only the user's current message — no replay, no rewritten prompt. When the conversation cannot be resumed (it is not in the store, or the agent refuses it), the proxy falls back to replaying the client's transcript verbatim as `User:` / `Assistant:` turns: no framing line, no request to continue, no account narrative, no synthesized tool markers, in full by default (`--handoff-context <chars>` caps it). Tool calls cannot cross either way: ACP carries text, so only what the assistant said survives a replay.
+
+The replay carries no tool state: tool calls themselves are not replayed, so the new account has no in-memory call history and must re-verify the workspace.
 
 ```mermaid
 sequenceDiagram
@@ -124,7 +198,7 @@ sequenceDiagram
     Note over Proxy,ActA: Quota cap detected BEFORE output streaming
     Proxy->>Proxy: Mark Account A blocked in state.json until reset
     Proxy->>Proxy: Rank & select Account B (highest headroom / nearest reset)
-    Proxy->>ActB: Create session with contextual handoff (history + cwd + git HEAD)
+    Proxy->>ActB: Replay transcript verbatim (history only)
     ActB->>Google: Direct TLS request (Account B token)
     Google-->>ActB: 200 OK (Streaming generation)
     ActB-->>Proxy: Stream assistant output & tool calls
@@ -200,11 +274,17 @@ agy-multi quota [--profile <slug>]
 # Check token usage & Gemini 3.8 Flash cost analytics
 agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
 
-# Start ACP proxy server for t3code, Zed, OMP, or any ACP orchestrator
-agy-multi acp [--clean] [-- agy acp args...]
+# Choose the account this process serves (one at a time)
+agy-multi use work
 
-# Run non-interactive prompt with failover
-agy-multi run --prompt "fix the failing test" --model gemini-3.8-flash
+# Start ACP proxy server for t3code, Zed, or any interactive ACP client
+agy-multi acp [--profile <slug>] [--clean] [-- agy acp args...]
+
+# Run a non-interactive prompt on the selected account
+agy-multi run --prompt "fix the failing test" --model gemini-3.8-flash [--profile <slug>]
+
+# Legacy pooled failover (see the warning above — ToS risk)
+agy-multi acp --allow-account-pool
 
 # Run in clean subagent mode with manual injections (ala Pi Agent)
 agy-multi run --prompt "review this diff" --clean --skills "git,diagnosing-bugs" \
@@ -303,13 +383,17 @@ When running `agy-multi profile add <slug>` on a remote machine, VPS, or over SS
 5. Paste it back into the remote terminal and press Enter. The account is now authenticated and ready!
 
 
-`run` and `acp` preflight `/usage` for every candidate, rank with smart
-**anti-mubazir** logic (drains expiring weekly quota first within 48h, prefers
-sooner weekly resets for comparable headroom, keeps a 10% safety reserve),
-pin a conversation to its account, and fail over on quota/ban/auth errors.
-Transient network errors are returned, never silently retried on another account.
+By default `run` and `acp` touch exactly one account: the one you selected. A
+quota, suspension, or sign-out failure is classified and reported — with the
+reset time and the command to switch accounts by hand — and is never retried on
+another account. Nothing probes a second account's `/usage` or `models`; `/multi-usage`
+reports only the account in use.
 
-## Failover rules
+The ranking and rotation described below is the **legacy pool mode**:
+`--allow-account-pool` preflights `/usage` for every candidate, ranks by
+headroom (10% reserve), pins conversations, and fails over on quota/ban/auth.
+
+## Legacy failover rules (`--allow-account-pool`)
 
 | Signal | Action |
 |---|---|
@@ -347,20 +431,22 @@ bin\agy-multi-acp.cmd
 ## ACP host (t3code, Zed, OMP, any ACP client)
 
 `agy-multi acp` is a stdio ACP server. An ACP host sees **one** Antigravity
-agent; the proxy keeps the accounts and switches them when quota runs out.
+agent backed by **one** account: select it with `agy-multi use <slug>` (or pass
+`--profile <slug>`). When that account is out of quota or suspended, the turn
+fails with a message naming the fix; the proxy does not switch accounts.
 
 In t3code: **Settings → Providers → Add provider → Local ACP command**.
 
 | Field | Value |
 |---|---|
 | Executable | `agy-multi` (or absolute path: `~/.local/bin/agy-multi`) |
-| Arguments | `acp` |
+| Arguments | `acp` — or `acp --profile <slug>` to pin explicitly |
 | Environment | none — installed standalone binary handles execution |
 
 `install.sh` / `install.ps1` compiles standalone single-binary executables and places them directly into `~/.local/bin/` (`$HOME/.local/bin/agy-multi` and `agy-multi-acp`).
 
-`agy-multi acp -- --dangerously-skip-permissions` forwards extra args to every
-`agy acp` child.
+`agy-multi acp -- --dangerously-skip-permissions` forwards extra args to the
+`agy acp` child it runs.
 
 For **OMP (Oh My Pi)** or harnesses expecting a dedicated ACP executable:
 ```bash
@@ -384,6 +470,12 @@ What the proxy does:
   performs the handoff. A turn is never replayed under another account.
 - Banned and quota-blocked profiles are stored in `state.json` and excluded from
   selection. A 403 ToS ban is never retried.
+- An account with a wider model catalog is reserved for its own models: a
+  baseline request goes to the account that only offers baseline models, so the
+  premium catalog is not spent on work a smaller account can do. The reservation
+  only holds while that smaller account can actually take the request — if it is
+  banned, signed out, quota-blocked, or under the reserve, the wider catalog
+  serves the baseline model instead of failing the request.
 - `session/load` and `session/resume` after a proxy restart use the persisted
   profile, child session ID, model, user/assistant history, and handoff state in
   `acp-sessions.json`. Load replays messages; resume does not duplicate them.
@@ -420,14 +512,16 @@ before its full text is saved.
 ## Layout
 
 ```
-~/.agy/
+~/.agy-multi/
 ├── state.json                    # pins, quota blocks, checkpoints
 ├── acp-sessions.json             # session mapping, model, text history, handoff state
+├── shared/gemini/                # one conversation store for every account
+│   └── antigravity-cli/{brain,conversations,history.jsonl}
 └── profiles/<slug>/
     ├── profile.json              # email, status, timestamps
     ├── acp-<pid>.log             # ACP process log (debugging)
     └── home/                     # HOME for this account
-        ├── .gemini/              # per-account auth + conversations
+        ├── .gemini/              # per-account auth; conversations link to shared/
         ├── Library/Keychains/    # isolated keychain
         └── .gitconfig, .config, .ssh, ...  # symlinks to the real home
 ```
@@ -435,7 +529,10 @@ before its full text is saved.
 Shared (symlinked): `.gemini/config`, `.gemini/skills`, `GEMINI.md`,
 `antigravity-cli/settings.json`, and tool config (`.gitconfig`, `.config`,
 `.ssh`, `.npmrc`, `.netrc`, `.agents`, `.aws`, `.kube`, `.docker`).
-Per-profile: auth token/keychain, conversations, history, `installation_id`.
+Across profiles: conversations — `brain/`, `conversations/` and `history.jsonl`
+point at `shared/gemini`.
+Per-profile: auth token/keychain, accounts, settings, caches, logs,
+`installation_id`, and the conversation index (`conversation_summaries.db`).
 
 ## Safety notes
 
@@ -443,8 +540,9 @@ Per-profile: auth token/keychain, conversations, history, `installation_id`.
 - One account per running process; conversations are single-writer.
 - A banned account still reports 100% on `/usage`; only a generation canary or a
   real turn detects it. `profile add` runs a canary by default.
-- Multi-account rotation is a policy grey area regardless of implementation;
-  keep one active account per session and fail over only on real caps.
+- Automatic multi-account rotation is not permitted under the Antigravity Terms.
+  It now requires `--allow-account-pool`; selecting an account with `agy-multi
+  use` (or `--profile`) is the supported path.
 
 ## Tests
 
@@ -453,6 +551,8 @@ bun test
 bun run typecheck
 ```
 
-`test/acp-proxy.test.ts` runs the real proxy against a fake `agy` process:
-`acct-a` rejects a prompt with `RESOURCE_EXHAUSTED`, the proxy blocks it and
-completes the turn on `acct-b` with a handoff prompt.
+`test/acp-proxy.test.ts` drives the real proxy against a fake `agy` process. It
+covers both modes: in the default single-account mode a `RESOURCE_EXHAUSTED` turn
+is reported to the client and no other account is ever spawned; with
+`--allow-account-pool`, `acct-a` is blocked and the turn completes on `acct-b`
+with a handoff prompt.

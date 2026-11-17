@@ -51,6 +51,9 @@ async function fixture() {
 	await writeFile(cli, AGENT);
 	await chmod(cli, 0o755);
 	await Bun.write(join(root, "profiles/probe/profile.json"), JSON.stringify({slug:"probe", home:root, createdAt:"now"}));
+	// ACP serves one operator-selected account; record it so the entrypoint does
+	// not fail closed before the process-lifecycle behaviour under test runs.
+	await writeFile(join(root, "state.json"), JSON.stringify({version:2, defaultProfile:"probe", pins:{}, blocks:{}, checkpoints:{}}));
 	const proxyCommand = process.env.AGY_TEST_ACP_BIN
 		? [process.env.AGY_TEST_ACP_BIN]
 		: [process.execPath, join(import.meta.dir, "../src/acp-bin.ts")];

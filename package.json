@@ -1,7 +1,7 @@
 {
   "name": "agy-multi",
   "version": "0.2.0",
-  "description": "Unofficial multi-account, quota-aware failover wrapper and ACP proxy for Google Antigravity CLI (agy)",
+  "description": "Unofficial single-account ACP proxy for Google Antigravity CLI (agy), with isolated per-account HOMEs and quota diagnostics",
   "type": "module",
   "license": "MIT",
   "bin": {

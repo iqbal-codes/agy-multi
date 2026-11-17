@@ -41,10 +41,10 @@ export function promptToText(prompt: unknown): string {
 }
 
 /**
- * Render the most recent history under a character budget. The newest turns
- * are the ones a handoff needs; older turns are summarized away.
+ * Render history for replay under a character budget. Newest turns are kept; when
+ * the budget is exhausted the oldest surviving block is marked as omitted.
  */
-export function renderHistory(entries: HistoryEntry[], maxChars = 60_000): string {
+export function renderHistory(entries: HistoryEntry[], maxChars = Number.POSITIVE_INFINITY): string {
 	const blocks: string[] = [];
 	let used = 0;
 	for (let index = entries.length - 1; index >= 0; index--) {
@@ -63,29 +63,22 @@ export function renderHistory(entries: HistoryEntry[], maxChars = 60_000): strin
 }
 
 export interface HandoffPromptOptions {
+	/** Conversation the client already holds; replayed so the new session starts warm. */
 	history: HistoryEntry[];
-	cwd: string;
-	gitHead?: string;
+	/** Character budget for the replay; `0` or `undefined` replays everything. */
 	maxChars?: number;
 }
 
+/**
+ * Seeds a fresh backend session with the conversation the client already has.
+ *
+ * The replay is the transcript and nothing else: no framing line, no request to
+ * continue, no account narrative, no synthesized tool markers. The new session
+ * sees the turns the user sees and answers the last user message — the closest a
+ * text-only protocol allows to carrying the session across accounts.
+ */
 export function buildHandoffPrompt(options: HandoffPromptOptions): string {
-	const history = renderHistory(options.history, options.maxChars);
-	const lines = [
-		"You are taking over an existing coding session on a different account after an account/quota handoff.",
-		"The previous account may have used tools; you do not have its in-memory tool state. Verify the workspace before acting.",
-		`Working directory: ${options.cwd}`,
-	];
-	if (options.gitHead) lines.push(`Git HEAD: ${options.gitHead}`);
-	lines.push("", "Conversation so far:", history || "(no prior turns)", "");
-	lines.push("Continue the task from the last user message. Do not repeat work that is already complete.");
-	return lines.join("\n");
+	const maxChars = options.maxChars && options.maxChars > 0 ? options.maxChars : Number.POSITIVE_INFINITY;
+	return renderHistory(options.history, maxChars);
 }
 
-export function toolTitle(update: unknown): string | undefined {
-	if (!isRecord(update)) return undefined;
-	for (const key of ["title", "name", "kind"] as const) {
-		if (typeof update[key] === "string" && update[key]) return update[key];
-	}
-	return undefined;
-}

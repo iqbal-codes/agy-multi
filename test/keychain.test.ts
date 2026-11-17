@@ -22,6 +22,11 @@ async function fixture(password?: string, withItem = false) {
 	await writeFile(join(dir, "profile.json"), JSON.stringify({
 		slug: "locked-profile", createdAt: new Date().toISOString(),
 	}));
+	// ACP serves exactly one operator-selected account; record it so startup does
+	// not fail closed before the keychain work under test happens.
+	await writeFile(join(root, "state.json"), JSON.stringify({
+		version: 2, defaultProfile: "locked-profile", pins: {}, blocks: {}, checkpoints: {},
+	}));
 	if (password !== undefined) {
 		await security("create-keychain", "-p", password, keychain);
 		if (withItem) {

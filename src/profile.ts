@@ -5,6 +5,7 @@ import { AGY_BIN, profileDir, profileHome } from "./paths";
 import type { Profile } from "./types";
 import { ensureDir, exists, linkOrReplaceWithSymlink, run, symlinkIfMissing } from "./fs-utils";
 import { listProfiles, loadProfile, profileEnvOf, saveProfile } from "./registry";
+import { linkSharedConversations } from "./conversation-store";
 import { classifyRun } from "./classify";
 import { runTurn } from "./runner";
 
@@ -229,6 +230,8 @@ async function provision(home: string, clean = false): Promise<void> {
 		}
 	}
 	await provisionShellBridge(home, sourceHome);
+	// Conversations are shared by every account; credentials and settings are not.
+	await linkSharedConversations(home);
 }
 
 function readEmailFromLog(text: string): string | undefined {

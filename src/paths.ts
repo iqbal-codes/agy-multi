@@ -1,8 +1,40 @@
+import { existsSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+const HOME = homedir();
+const DEFAULT_ROOT = join(HOME, ".agy-multi");
+const LEGACY_ROOT = join(HOME, ".agy");
+const OVERRIDE = process.env.AGY_MULTI_ROOT || undefined;
+
+/** Whether a path holds agy-multi state, rather than some unrelated directory. */
+function isOurs(path: string): boolean {
+	return existsSync(join(path, "profiles")) || existsSync(join(path, "state.json"));
+}
+
+/**
+ * Resolves the state root, moving a pre-rename `~/.agy` into `~/.agy-multi` once.
+ * The rename is atomic and keeps every profile HOME intact; conversation links
+ * are relative, so they survive it. If the move is impossible the legacy root is
+ * used as-is rather than losing state.
+ */
+function resolveRoot(): string {
+	if (OVERRIDE) return OVERRIDE;
+	if (existsSync(DEFAULT_ROOT) || !isOurs(LEGACY_ROOT)) return DEFAULT_ROOT;
+	try {
+		renameSync(LEGACY_ROOT, DEFAULT_ROOT);
+		process.stderr.write(`agy-multi: moved ${LEGACY_ROOT} to ${DEFAULT_ROOT}\n`);
+		return DEFAULT_ROOT;
+	} catch (error) {
+		process.stderr.write(
+			`agy-multi: could not move ${LEGACY_ROOT} to ${DEFAULT_ROOT} (${error instanceof Error ? error.message : String(error)}); using ${LEGACY_ROOT}\n`,
+		);
+		return LEGACY_ROOT;
+	}
+}
+
 /** Wrapper state root. Override for tests. */
-export const ROOT = process.env.AGY_MULTI_ROOT ?? join(homedir(), ".agy");
+export const ROOT = resolveRoot();
 export const PROFILES_DIR = join(ROOT, "profiles");
 export const STATE_PATH = join(ROOT, "state.json");
 export const ACP_SESSIONS_PATH = join(ROOT, "acp-sessions.json");

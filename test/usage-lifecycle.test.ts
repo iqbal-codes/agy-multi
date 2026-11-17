@@ -124,7 +124,7 @@ describe.skipIf(process.platform === "win32")("quota subprocess lifecycle", () =
 		await writeFile(cli, CLI);
 		await chmod(cli, 0o755);
 		await Bun.write(join(root, "profiles/probe/profile.json"), JSON.stringify({ slug: "probe", home: root, createdAt: "now" }));
-		const proxy = Bun.spawn([process.execPath, join(import.meta.dir, "../src/index.ts"), "acp"], {
+		const proxy = Bun.spawn([process.execPath, join(import.meta.dir, "../src/index.ts"), "acp", "--profile", "probe"], {
 			detached: true,
 			env: { ...process.env, AGY_BIN: cli, AGY_MULTI_ROOT: root, STARTED_MARKER: marker, BROWSER_MARKER: browser, SCENARIO: "abort" },
 			stdin: "pipe", stdout: "pipe", stderr: "pipe",

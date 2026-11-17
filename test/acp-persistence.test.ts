@@ -66,7 +66,7 @@ createInterface({ input: process.stdin }).on("line", line => {
     }
     const text = p.prompt[0].text;
     if (text === "EXIT_CHILD") process.exit(0);
-    if (control.trajectoryNotFound && !text.includes("taking over")) {
+    if (control.trajectoryNotFound && !text.startsWith("User:\n")) {
       delete control.trajectoryNotFound;
       writeFileSync(root + "/control.json", JSON.stringify(control));
       return error("Failed to send user message: not_found: trajectory not found: " + p.sessionId + ": not found");
@@ -109,8 +109,10 @@ async function fixture() {
 	const control = (value: Record<string, unknown>) => writeFile(join(root, "control.json"), JSON.stringify(value));
 	await control({});
 	const clients: { close(): Promise<void> }[] = [];
+	// These tests exercise the opt-in legacy account pool (failover/rotation and
+	// cross-account handoff). The default proxy serves one pinned account.
 	const start = async () => {
-		const proc = Bun.spawn(["bun", "run", join(project, "src/index.ts"), "acp"], {
+		const proc = Bun.spawn(["bun", "run", join(project, "src/index.ts"), "acp", "--allow-account-pool", "--switch-delay", "0"], {
 			cwd: project,
 			env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake },
 			stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -205,7 +207,7 @@ test("closing the last session releases its agent and resume preserves the conve
 	} finally { await f.cleanup(); }
 });
 
-test("account failover releases the previous agent when it has no other sessions", async () => {
+test("legacy account-pool failover releases the previous agent when it has no other sessions", async () => {
 	const f = await fixture();
 	try {
 		const c = await f.start();
@@ -220,7 +222,7 @@ test("account failover releases the previous agent when it has no other sessions
 	} finally { await f.cleanup(); }
 });
 
-test("account failover keeps the previous agent while another session still uses it", async () => {
+test("legacy account-pool failover keeps the previous agent while another session still uses it", async () => {
 	const f = await fixture();
 	try {
 		const c = await f.start();
@@ -401,8 +403,9 @@ test("prompt failing with trajectory not found recovers seamlessly via fresh ses
 		const requests = await f.requests();
 		expect(requests.filter(r => r.method === "session/new")).toHaveLength(2);
 		const last = requests.filter(r => r.method === "session/prompt").at(-1)!;
-		expect(last.params.prompt![0]!.text).toContain("User:\nFIRST");
-		expect(last.params.prompt![0]!.text).toContain("User:\nRETRY_AFTER_TRAJECTORY_LOST");
+		expect(last.params.prompt![0]!.text).toBe(
+			"User:\nFIRST\n\nAssistant:\nANSWER_FIRST\n\nUser:\nRETRY_AFTER_TRAJECTORY_LOST",
+		);
 	} finally { await f.cleanup(); }
 });
 

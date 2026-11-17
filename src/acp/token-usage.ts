@@ -150,6 +150,25 @@ export function resolveCompactionThreshold(
 	return DEFAULT_COMPACTION_THRESHOLD;
 }
 
+/** Pulls `--name <value>` / `--name=<value>` out of argv, leaving the rest intact. */
+export function extractFlagArg(args: string[], name: string): { value?: string; rest: string[] } {
+	const rest: string[] = [];
+	let value: string | undefined;
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === name) {
+			value = args[++index];
+			continue;
+		}
+		if (arg.startsWith(`${name}=`)) {
+			value = arg.slice(name.length + 1);
+			continue;
+		}
+		rest.push(arg);
+	}
+	return { value, rest };
+}
+
 /**
  * Extracts --compaction-threshold from argv and returns remaining args.
  */

@@ -18,7 +18,7 @@ function snapshot(slug: string, pct: number): UsageSnapshot {
 }
 
 function state(): WrapperState {
-	return { version: 1, pins: {}, blocks: {}, checkpoints: {} };
+	return { version: 2, pins: {}, blocks: {}, checkpoints: {} };
 }
 
 describe("profile ranking", () => {
