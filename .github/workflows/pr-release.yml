@@ -20,10 +20,9 @@ jobs:
     name: Release plan
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout the released state
+      - name: Checkout the pull request
         uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
 
       - name: Setup Bun
@@ -36,9 +35,14 @@ jobs:
         env:
           TITLE: ${{ github.event.pull_request.title }}
           BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
+          # The bump is projected from main's released state, while the planning
+          # script comes from the pull request (it is not on main yet on its own PR).
+          git fetch --tags --force origin >/dev/null 2>&1 || true
+          git fetch --no-tags --force origin "$BASE_REF" >/dev/null
           BUMP="$(bun src/release-plan.ts derive "$TITLE" "$BODY")"
-          PACKAGE="$(bun -e 'console.log(JSON.parse(await Bun.file("package.json").text()).version ?? "0.0.0")')"
+          PACKAGE="$(git show "origin/$BASE_REF:package.json" | jq -r '.version // "0.0.0"')"
           TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
           BASE="$(bun src/release-plan.ts base "$PACKAGE" "$TAG")"
           VERSION="$(bun src/release-plan.ts next "$BASE" "$BUMP")"
