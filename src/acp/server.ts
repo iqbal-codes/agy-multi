@@ -7,8 +7,7 @@ import {
 	ACP_SESSIONS_PATH,
 	DEFAULT_BLOCK_MS,
 	DEFAULT_RESERVE_PCT,
-	MODELS_TTL_MS,
-	USAGE_TTL_MS,
+	PROBE_SPACING_MS,
 	profileHome,
 } from "../paths";
 import { listProfiles, profileHomeOf, saveProfile } from "../registry";
@@ -16,11 +15,12 @@ import { block, isBlocked, loadState, saveState } from "../state";
 import { rankProfiles } from "../select";
 import { syncProfiles } from "../profile";
 import { listUserSkills } from "../injection";
+import { ProbeSync } from "../probe-sync";
+import { SerialQueue } from "../serial-queue";
 import type { FailureKind, Family, ModelsSnapshot, Profile, UsageSnapshot, WrapperState } from "../types";
 import {
 	blockingReset,
 	familyForModel,
-	fetchUsage,
 	formatMultiUsageReport,
 	minRemaining,
 	readCachedUsage,
@@ -190,11 +190,10 @@ class AcpProxy {
 	private readonly sessionsByChild = new Map<string, SessionState>();
 	private readonly agentRequests = new Map<string, { child: AcpChild; id: JsonRpcId }>();
 	private readonly unknownUpdates = new Map<string, JsonRpcMessage[]>();
-	private readonly usageCache = new Map<string, { snapshot: UsageSnapshot | null; at: number }>();
-	private readonly usageInflight = new Map<string, Promise<UsageSnapshot | null>>();
 	private readonly modelsCache = new Map<string, { snapshot: ModelsSnapshot | null; at: number }>();
-	private readonly modelsInflight = new Map<string, Promise<ModelsSnapshot | null>>();
 	private readonly usageAbort = new AbortController();
+	/** One serial queue for every usage/model probe this process ever starts. */
+	private probes!: ProbeSync;
 	private readonly deletedSessionIds = new Set<string>();
 	private readonly releaseCandidates = new Set<string>();
 	private activeClientRequests = 0;
@@ -230,20 +229,21 @@ class AcpProxy {
 		this.state = await loadState();
 		this.resolvePinnedProfile();
 		this.store = await loadAcpSessions(this.sessionsPath);
-		await Promise.all(
-			[...this.profiles.values()].map(async profile => {
-				const [diskCached, diskModels] = await Promise.all([
-					readCachedUsage(profile.slug),
-					readCachedModels(profile.slug),
-				]);
-				if (diskCached) {
-					this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
-				}
-				if (diskModels) {
-					this.modelsCache.set(profile.slug, { snapshot: diskModels, at: diskModels.fetchedAt });
-				}
-			}),
-		);
+		this.probes = new ProbeSync({
+			queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }),
+			signal: this.usageAbort.signal,
+			onModels: snapshot => this.modelsCache.set(snapshot.profile, { snapshot, at: snapshot.fetchedAt }),
+			onAuthRequired: slug => {
+				const profile = this.profiles.get(slug);
+				if (profile) void this.recordFailure(profile, undefined, "auth").catch(() => {});
+			},
+		});
+		for (const profile of this.profiles.values()) {
+			const diskModels = await readCachedModels(profile.slug);
+			if (diskModels) this.modelsCache.set(profile.slug, { snapshot: diskModels, at: diskModels.fetchedAt });
+		}
+		// Nothing is probed at startup: the cache is read from disk, and an account
+		// is only refreshed once it has actually served work (session start/end).
 		this.log(
 			`ready — ${this.profiles.size} profile(s), ${Object.keys(this.store.sessions).length} stored session(s), ` +
 				`account: ${this.allowAccountPool ? `pool (legacy opt-in${this.sequential ? ", sequential" : ""})` : `${this.pinnedProfile?.slug ?? "-"} (pinned)`}, ` +
@@ -779,6 +779,9 @@ class AcpProxy {
 			this.children.delete(slug);
 			if (this.controlChild === child) this.controlChild = undefined;
 			child.loadedSessions.clear();
+			// The account just finished a stretch of work: leave a fresh snapshot
+			// behind, unless its cache is still within the TTL.
+			this.refreshServedAccount(slug);
 			await child.stop();
 			this.log(`stopped agent ${slug}: sequential mode keeps one account active`);
 		}
@@ -916,21 +919,12 @@ class AcpProxy {
 		const candidates = all.filter(profile => !options.exclude?.includes(profile.slug));
 		const usage = new Map<string, UsageSnapshot | null>();
 		const models = new Map<string, ModelsSnapshot | null>();
-		if (this.sequential) {
-			// One account at a time: rank from cached snapshots, never from a live
-			// probe of another account.
-			for (const profile of all) {
-				usage.set(profile.slug, await readCachedUsage(profile.slug));
-				models.set(profile.slug, await readCachedModels(profile.slug));
-			}
-		} else {
-			await Promise.all(
-				all.map(async profile => {
-					const [u, m] = await Promise.all([this.getUsage(profile), this.getModels(profile)]);
-					usage.set(profile.slug, u);
-					models.set(profile.slug, m);
-				}),
-			);
+		// Ranking is a cached decision in every mode: a turn never waits on a child
+		// process, and no mode fans probes out across accounts. Sequential mode
+		// additionally never probes an idle account at all.
+		for (const profile of all) {
+			usage.set(profile.slug, await readCachedUsage(profile.slug));
+			models.set(profile.slug, await readCachedModels(profile.slug));
 		}
 		const family = familyForModel(options.modelId);
 		const now = Date.now();
@@ -1033,12 +1027,10 @@ class AcpProxy {
 		if (!modelId) return false;
 		const models = new Map<string, ModelsSnapshot | null>();
 		const usage = new Map<string, UsageSnapshot | null>();
-		await Promise.all(
-			[...this.profiles.values()].map(async candidate => {
-				models.set(candidate.slug, await this.getModels(candidate));
-				usage.set(candidate.slug, await this.getUsage(candidate));
-			}),
-		);
+		for (const candidate of this.profiles.values()) {
+			models.set(candidate.slug, await readCachedModels(candidate.slug));
+			usage.set(candidate.slug, await readCachedUsage(candidate.slug));
+		}
 		const reservable = this.reservableCatalogs(models, usage, familyForModel(modelId), Date.now());
 		return reservedProfilesFor(reservable, modelId).has(profile.slug);
 	}
@@ -1050,86 +1042,28 @@ class AcpProxy {
 		return family === "gemini" ? this.state.blocks[slug]?.["claude-gpt"] : this.state.blocks[slug]?.gemini;
 	}
 
-	private refreshUsageInBackground(profile: Profile): void {
-		if (profile.authRequiredAt || profile.bannedAt || profile.disabled) return;
-		if (this.usageInflight.has(profile.slug)) return;
-		const promise = fetchUsage(profile, undefined, this.usageAbort.signal)
-			.catch(() => null)
-			.then(snapshot => {
-				if (snapshot) {
-					this.usageCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
-				}
-				this.usageInflight.delete(profile.slug);
-				return snapshot;
-			});
-		this.usageInflight.set(profile.slug, promise);
-	}
-
 	private async getUsage(profile: Profile, force = false): Promise<UsageSnapshot | null> {
-		const now = Date.now();
-		const cached = this.usageCache.get(profile.slug);
-		if (!force && cached && now - cached.at < USAGE_TTL_MS) return cached.snapshot;
-
-		if (!force) {
-			const diskCached = await readCachedUsage(profile.slug);
-			if (diskCached) {
-				this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
-				if (now - diskCached.fetchedAt < USAGE_TTL_MS) {
-					return diskCached;
-				}
-				this.refreshUsageInBackground(profile);
-				return diskCached;
-			}
-			this.refreshUsageInBackground(profile);
-			return null;
-		}
-
-		const inflight = this.usageInflight.get(profile.slug);
-		if (inflight && !force) return inflight;
-		const promise = fetchUsage(profile, undefined, this.usageAbort.signal)
-			.catch(() => null)
-			.then(snapshot => {
-				if (snapshot) {
-					this.usageCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
-				}
-				this.usageInflight.delete(profile.slug);
-				return snapshot;
-			});
-		this.usageInflight.set(profile.slug, promise);
-		return promise;
+		// Cached answers only; a stale or missing entry queues a serial refresh.
+		if (force) return await this.probes.refreshUsage(profile).catch(() => null);
+		return await this.probes.usage(profile);
 	}
 
-	private refreshModelsInBackground(profile: Profile): void {
-		if (profile.authRequiredAt || profile.bannedAt || profile.disabled) return;
-		if (this.modelsInflight.has(profile.slug)) return;
-		const promise = fetchModels(profile, undefined, this.usageAbort.signal)
-			.catch(() => null)
-			.then(snapshot => {
-				if (snapshot) {
-					this.modelsCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
-				}
-				this.modelsInflight.delete(profile.slug);
-				return snapshot;
-			});
-		this.modelsInflight.set(profile.slug, promise);
+	/**
+	 * Refresh the account that just served work. The cache TTL decides whether a
+	 * probe runs at all, so a short session costs nothing while a long one leaves
+	 * a fresh snapshot behind. Idle accounts are never touched.
+	 */
+	private refreshServedAccount(slug: string | undefined): void {
+		if (!slug) return;
+		const profile = this.profiles.get(slug);
+		if (!profile) return;
+		this.probes.usage(profile).catch(() => {});
 	}
 
 	private async getModels(profile: Profile): Promise<ModelsSnapshot | null> {
-		const now = Date.now();
-		const cached = this.modelsCache.get(profile.slug);
-		if (cached && now - cached.at < MODELS_TTL_MS) return cached.snapshot;
-
-		const diskCached = await readCachedModels(profile.slug);
-		if (diskCached) {
-			this.modelsCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
-			if (now - diskCached.fetchedAt < MODELS_TTL_MS) {
-				return diskCached;
-			}
-			this.refreshModelsInBackground(profile);
-			return diskCached;
-		}
-		this.refreshModelsInBackground(profile);
-		return null;
+		const snapshot = await this.probes.models(profile);
+		if (snapshot) this.modelsCache.set(profile.slug, { snapshot, at: snapshot.fetchedAt });
+		return snapshot;
 	}
 
 	private recordDiscoveredModels(profile: Profile, result: Record<string, unknown>): void {
@@ -1152,7 +1086,7 @@ class AcpProxy {
 			this.modelsCache.set(profile.slug, { snapshot: updated, at: updated.fetchedAt });
 			await writeCachedModels(updated).catch(() => {});
 		}
-		this.refreshModelsInBackground(profile);
+		this.probes.refreshModels(profile).catch(() => {});
 	}
 
 	private mergeSessionModelsResult(result: Record<string, unknown>): Record<string, unknown> {
@@ -1312,7 +1246,7 @@ class AcpProxy {
 				this.broadcastAvailableCommands(session);
 				// Prime the usage cache for the account in use so the client's meter has
 				// data. Only the served account is ever read here.
-				this.refreshUsageInBackground(profile);
+				this.probes.usage(profile).catch(() => {});
 				return;
 			} catch (error) {
 				const raw = error instanceof AcpRpcError ? error.rpcError : error;
@@ -1543,6 +1477,7 @@ class AcpProxy {
 		}
 		await this.saveStore();
 		this.releaseCandidates.add(record.profile);
+		this.refreshServedAccount(record.profile);
 		this.respond(request.id, {});
 	}
 
@@ -1841,31 +1776,6 @@ class AcpProxy {
 		await this.runPrompt(request.id, session, userText, target, handoff, 0);
 	}
 
-	private async getMultiUsageSnapshot(
-		profile: Profile,
-		forceRefresh: boolean,
-		allowLive = true,
-	): Promise<UsageSnapshot | null> {
-		if (!forceRefresh) {
-			const now = Date.now();
-			const cached = this.usageCache.get(profile.slug);
-			if (cached && now - cached.at < USAGE_TTL_MS) return cached.snapshot;
-			const diskCached = await readCachedUsage(profile.slug);
-			if (diskCached) {
-				this.usageCache.set(profile.slug, { snapshot: diskCached, at: diskCached.fetchedAt });
-				if (now - diskCached.fetchedAt < USAGE_TTL_MS) return diskCached;
-			}
-		}
-		if (!allowLive) {
-			// Sequential mode never authenticates as an idle account just to report
-			// its numbers; stale cache is the honest answer here.
-			return this.usageCache.get(profile.slug)?.snapshot ?? (await readCachedUsage(profile.slug));
-		}
-		const live = await this.getUsage(profile, true);
-		if (live) return live;
-		return this.usageCache.get(profile.slug)?.snapshot ?? (await readCachedUsage(profile.slug));
-	}
-
 	private async handleMultiUsageCommand(
 		clientId: JsonRpcId,
 		session: SessionState,
@@ -1878,15 +1788,21 @@ class AcpProxy {
 			: this.pinnedProfile
 				? [this.pinnedProfile]
 				: [];
-		const entries = await Promise.all(
-			profiles.map(async profile => {
-				if (profile.disabled || profile.bannedAt || profile.authRequiredAt) {
-					return { profile, snapshot: null };
-				}
-				const snapshot = await this.getMultiUsageSnapshot(profile, forceRefresh, !this.sequential);
-				return { profile, snapshot };
-			}),
-		);
+		// An explicit refresh is the only place this command probes accounts, and it
+		// does so one at a time. Sequential mode keeps reporting cached numbers: it
+		// never authenticates as an idle account just to fill a table.
+		const probeTargets = this.allowAccountPool && this.sequential ? [] : profiles;
+		if (forceRefresh && probeTargets.length) {
+			await this.probes.syncStale(probeTargets, { usage: true, force: true }).catch(() => {});
+		}
+		const entries: Array<{ profile: Profile; snapshot: UsageSnapshot | null }> = [];
+		for (const profile of profiles) {
+			const snapshot =
+				profile.disabled || profile.bannedAt || profile.authRequiredAt
+					? null
+					: await readCachedUsage(profile.slug);
+			entries.push({ profile, snapshot });
+		}
 		const report = formatMultiUsageReport(entries);
 		this.sendToClient({
 			jsonrpc: "2.0",
@@ -2165,6 +2081,9 @@ class AcpProxy {
 			}
 
 			this.respond(clientId, response.result ?? { stopReason });
+			// The turn is what consumes quota: leave a fresh snapshot behind, unless
+			// the cache is still within its TTL.
+			this.refreshServedAccount(session.profile);
 		} catch (error) {
 			session.activeTurn = undefined;
 			this.respondFailure(clientId, error);

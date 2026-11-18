@@ -1,3 +1,4 @@
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { AGY_BIN, profileDir } from "./paths";
 import { profileEnvOf } from "./registry";
@@ -90,7 +91,66 @@ export function blockingReset(snapshot: UsageSnapshot | null, family: Family, no
 	return resets.length ? Math.min(...resets) : undefined;
 }
 
-export async function fetchUsage(profile: Profile, timeoutMs = 30_000, signal?: AbortSignal): Promise<UsageSnapshot | null> {
+/** The CLI writes this line when silent auth fails and it starts a browser login. */
+export const OAUTH_FALLBACK_MARKER = "triggering interactive OAuth";
+
+export interface FetchUsageOptions {
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	/** Called once when the CLI abandons silent auth and starts an interactive login. */
+	onNeedsLogin?: () => void;
+}
+
+/** Byte length of an append-only log, used to ignore markers from earlier runs. */
+export function logOffset(logPath: string): number {
+	try {
+		return statSync(logPath).size;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Watch an append-only CLI log for the interactive-login marker.
+ *
+ * A quota probe must never open a browser, so the caller kills the child the
+ * moment this fires. Reading starts at `from` so a marker written by a previous,
+ * already-abandoned run cannot abort a healthy check.
+ */
+export function watchLogForOAuthFallback(
+	logPath: string,
+	onFallback: () => void,
+	options: { from?: number; intervalMs?: number } = {},
+): () => void {
+	let offset = options.from ?? 0;
+	let stopped = false;
+	const timer = setInterval(() => {
+		if (stopped) return;
+		let text: string;
+		try {
+			text = readFileSync(logPath, "utf8");
+		} catch {
+			return;
+		}
+		if (text.length < offset) offset = 0; // rotated or truncated
+		if (text.length === offset) return;
+		const chunk = text.slice(offset);
+		offset = text.length;
+		if (!chunk.includes(OAUTH_FALLBACK_MARKER)) return;
+		stopped = true;
+		clearInterval(timer);
+		onFallback();
+	}, Math.max(20, options.intervalMs ?? 250));
+	timer.unref?.();
+	return () => {
+		stopped = true;
+		clearInterval(timer);
+	};
+}
+
+export async function fetchUsage(profile: Profile, options: FetchUsageOptions = {}): Promise<UsageSnapshot | null> {
+	const timeoutMs = options.timeoutMs ?? 30_000;
+	const signal = options.signal;
 	if (signal?.aborted || profile.authRequiredAt || profile.bannedAt || profile.disabled) return null;
 	// Do not run interactive agy usage check if account has no credentials (avoids unexpected browser popups)
 	if (!(await hasValidAuth(profile))) {
@@ -99,6 +159,7 @@ export async function fetchUsage(profile: Profile, timeoutMs = 30_000, signal?: 
 	// Shutdown can happen while the credential-presence check is pending.
 	if (signal?.aborted) return null;
 	const logPath = join(profileDir(profile.slug), "usage.log");
+	const startOffset = logOffset(logPath);
 	const proc = Bun.spawn(
 		[AGY_BIN, "-p", "/usage", "--output-format", "json", "--log-file", logPath],
 		{
@@ -131,6 +192,11 @@ export async function fetchUsage(profile: Profile, timeoutMs = 30_000, signal?: 
 		}
 	};
 	const timer = setTimeout(cancel, timeoutMs);
+	let needsLogin = false;
+	const stopWatch = watchLogForOAuthFallback(logPath, () => {
+		needsLogin = true;
+		cancel();
+	}, { from: startOffset });
 	signal?.addEventListener("abort", cancel, { once: true });
 	if (signal?.aborted) cancel();
 	try {
@@ -139,6 +205,10 @@ export async function fetchUsage(profile: Profile, timeoutMs = 30_000, signal?: 
 			new Response(proc.stderr).text(),
 		]);
 		const exitCode = await proc.exited;
+		if (needsLogin) {
+			options.onNeedsLogin?.();
+			return null;
+		}
 		if (cancelled || exitCode !== 0) return null;
 		if (stderr.trim() && !stdout.trim()) return null;
 		let parsed: { status?: string; response?: string };
@@ -157,6 +227,7 @@ export async function fetchUsage(profile: Profile, timeoutMs = 30_000, signal?: 
 		await writeCachedUsage(snapshot).catch(() => {});
 		return snapshot;
 	} finally {
+		stopWatch();
 		clearTimeout(timer);
 		signal?.removeEventListener("abort", cancel);
 	}

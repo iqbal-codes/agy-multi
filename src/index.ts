@@ -7,12 +7,44 @@ import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, s
 import { listProfiles, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
 import { loadState, saveState, setDefaultProfile } from "./state";
-import { fetchUsage, formatMultiUsageReport } from "./usage";
+import { formatMultiUsageReport, readCachedUsage } from "./usage";
 import { fetchModels, readCachedModels } from "./models";
-import { MODELS_TTL_MS } from "./paths";
+import { MODELS_TTL_MS, PROBE_SPACING_MS } from "./paths";
+import { ProbeSync } from "./probe-sync";
+import { SerialQueue } from "./serial-queue";
+import type { Profile, UsageSnapshot } from "./types";
 import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
 import { runUpdateCommand } from "./update";
 import { VERSION } from "./version";
+
+/** Short age for cache lines: `42s`, `7m`, `3h`, `2d`. */
+function ageText(ms: number): string {
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return `${hours}h`;
+	return `${Math.round(hours / 24)}d`;
+}
+
+/**
+ * Record the first quota snapshot right after a log in. The account was just
+ * verified, so one probe here means `agy-multi quota` is never empty for an
+ * account the user has open in front of them.
+ */
+async function primeQuotaAfterLogin(profile: Profile): Promise<void> {
+	if (profile.bannedAt || profile.authRequiredAt || profile.disabled) return;
+	const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
+	const snapshot = await probes.refreshUsage(profile).catch(() => null);
+	if (!snapshot || snapshot.windows.length === 0) {
+		console.log(`quota: not recorded yet — \`agy-multi quota --profile ${profile.slug} --refresh\` when needed`);
+		return;
+	}
+	console.log(
+		`quota: ${snapshot.windows.map(window => `${window.family} ${window.window} ${window.remainingPct}%`).join(", ")}`,
+	);
+}
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
 
@@ -24,8 +56,8 @@ Usage:
   agy-multi profile enable <slug>
   agy-multi profile sync [<slug>]
   agy-multi profile remove <slug>
-  agy-multi quota [--profile <slug>]
-  agy-multi multi-usage [--profile <slug>]
+  agy-multi quota [--profile <slug>] [--refresh]
+  agy-multi multi-usage [--profile <slug>] [--refresh]
   agy-multi models [--profile <slug>] [--refresh]
   agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
   agy-multi use <slug>
@@ -43,6 +75,12 @@ Update:
   installed agy-multi and agy-multi-acp binaries in place. --check reports
   without installing; --force reinstalls the same version. Sessions that are
   already running keep the previous binary until they restart.
+
+Quota:
+  quota and multi-usage print the cached snapshot and never start a check on
+  their own. The proxy refreshes an account when it starts and finishes serving
+  work, one account at a time; idle accounts are never probed. --refresh probes
+  now.
 
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
@@ -176,6 +214,7 @@ async function main(): Promise<void> {
 						? "ok"
 						: "unknown";
 			console.log(`${profile.slug}\t${profile.email ?? "(no email)"}\t${status}`);
+			if (!values["no-login"]) await primeQuotaAfterLogin(profile);
 			return;
 		}
 		if (subcommand === "login") {
@@ -187,6 +226,7 @@ async function main(): Promise<void> {
 				canary: !values["no-canary"],
 			});
 			console.log(`logged in ${profile.slug}\t${profile.email ?? "(no email)"}`);
+			await primeQuotaAfterLogin(profile);
 			return;
 		}
 		if (subcommand === "list") {
@@ -264,36 +304,49 @@ async function main(): Promise<void> {
 	}
 
 	if (command === "quota") {
-		await ensureAgy();
 		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
 		if (!profiles.length) {
 			console.log("no profiles");
 			return;
 		}
+		if (values.refresh) {
+			await ensureAgy();
+			const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
+			await probes.syncStale(profiles, { usage: true, force: true });
+		}
+		let oldest: number | undefined;
 		for (const profile of profiles) {
-			const snapshot = await fetchUsage(profile).catch(() => null);
+			const snapshot = await readCachedUsage(profile.slug);
 			if (!snapshot) {
-				console.log(`${profile.slug}\t(unavailable)`);
+				console.log(`${profile.slug}\t(no cached usage; run with --refresh)`);
 				continue;
 			}
+			oldest = Math.min(oldest ?? snapshot.fetchedAt, snapshot.fetchedAt);
 			for (const window of snapshot.windows) {
 				console.log(
 					`${profile.slug}\t${window.family}\t${window.window}\t${window.remainingPct}%\t${window.resetsAt}`,
 				);
 			}
 		}
+		if (oldest !== undefined) {
+			console.error(
+				`# cached ${ageText(Date.now() - oldest)} ago; ${values.refresh ? "refreshed one account at a time" : "--refresh syncs one account at a time"}`,
+			);
+		}
 		return;
 	}
 
 	if (command === "multi-usage") {
-		await ensureAgy();
 		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
-		const entries = await Promise.all(
-			profiles.map(async profile => ({
-				profile,
-				snapshot: await fetchUsage(profile).catch(() => null),
-			})),
-		);
+		if (values.refresh) {
+			await ensureAgy();
+			const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
+			await probes.syncStale(profiles, { usage: true, force: true });
+		}
+		const entries: Array<{ profile: Profile; snapshot: UsageSnapshot | null }> = [];
+		for (const profile of profiles) {
+			entries.push({ profile, snapshot: await readCachedUsage(profile.slug) });
+		}
 		console.log(formatMultiUsageReport(entries));
 		return;
 	}
