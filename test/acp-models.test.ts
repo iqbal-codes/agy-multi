@@ -25,6 +25,7 @@ const home = process.env.HOME ?? "";
 const isPro = home.includes("acct-pro");
 const promptLog = process.env.FAKE_AGY_LOG;
 const probeLog = process.env.FAKE_AGY_PROBE_LOG;
+const extendedCatalog = process.env.FAKE_AGY_EXTENDED_CATALOG === "1";
 
 const BASIC_MODELS = [
   { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
@@ -60,8 +61,25 @@ const PRO_CONFIG = [
   },
 ];
 
+if (extendedCatalog) {
+  for (const [id, name] of [
+    ["gemini-4-carbon", "Gemini 4 Carbon"],
+    ["gemini-5-flash", "Gemini 5 Flash"],
+    ["claude-opus-5-5", "Claude Opus 5.5"],
+    ["gpt-oss-120b", "GPT-OSS"],
+    ["gemini-pro-orchestrator", "Orchestrator"],
+  ]) {
+    PRO_MODELS.push({ modelId: id, name });
+    PRO_CONFIG[0].options.push({ value: id, name });
+  }
+}
+
 function modelConfig(modelId) {
   const selector = { ...(isPro ? PRO_CONFIG[0] : BASIC_CONFIG[0]), currentValue: modelId };
+  if (extendedCatalog) {
+    selector.options = [{ group: "models", name: "Models", options: selector.options }];
+    return [selector];
+  }
   if (!probeLog) return isPro ? PRO_CONFIG : BASIC_CONFIG;
   const levels = modelId === "gemini-4-hydrogen" ? ["medium", "high"] : ["low", "high"];
   return [selector, {
@@ -160,6 +178,12 @@ lines.on("line", line => {
       const s = sessions.get(message.params?.sessionId);
       if (s) s.modelId = value;
       if (probeLog) appendFileSync(probeLog, value + "\\n");
+      if (extendedCatalog) {
+        send({ jsonrpc: "2.0", method: "session/update", params: {
+          sessionId: message.params.sessionId,
+          update: { sessionUpdate: "config_option_update", configOptions: modelConfig(value) },
+        }});
+      }
       if (probeLog && value === "gemini-4-hydrogen") {
         send({ jsonrpc: "2.0", id: message.id, result: {} });
         send({ jsonrpc: "2.0", method: "session/update", params: {
@@ -238,17 +262,25 @@ async function setupTieredEnv(adopted = false) {
 	return { root, projectRoot, fake, promptLog };
 }
 
-function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: string, probeLog?: string) {
+function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: string, probeLog?: string, extendedCatalog = false) {
 	// Cross-profile model routing is enabled in the default account pool.
 	const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--switch-delay", "0"], {
 		cwd: projectRoot,
-		env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: promptLog, FAKE_AGY_PROBE_LOG: probeLog },
+		env: {
+			...process.env,
+			AGY_MULTI_ROOT: root,
+			AGY_BIN: fake,
+			FAKE_AGY_LOG: promptLog,
+			FAKE_AGY_PROBE_LOG: probeLog,
+			FAKE_AGY_EXTENDED_CATALOG: extendedCatalog ? "1" : undefined,
+		},
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
 	});
 	const stdin = proxy.stdin!;
 	const pending = new Map<number, (message: unknown) => void>();
+	const notifications: Record<string, unknown>[] = [];
 	let nextId = 1;
 	const send = async <T>(method: string, params: unknown): Promise<T> => {
 		const id = nextId++;
@@ -270,11 +302,62 @@ function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: 
 			pending.delete(message.id);
 			resolve(message);
 		}
+		if (isRecord(message) && message.method === "session/update") notifications.push(message);
 	});
-	return { proxy, send };
+	return { proxy, send, notifications };
 }
 
 describe("ACP proxy model capability routing", () => {
+	test("ACP and CLI model catalogs surface public Gemini families, including future releases", async () => {
+		const { root, projectRoot, fake, promptLog } = await setupTieredEnv(true);
+		const basicProfile = join(root, "profiles/acct-basic/profile.json");
+		await writeFile(basicProfile, JSON.stringify({ ...JSON.parse(await readFile(basicProfile, "utf8")), disabled: true }));
+		const { proxy, send, notifications } = spawnProxy(projectRoot, root, fake, promptLog, undefined, true);
+		const modelIds = [
+			"gemini-3.8-flash-high", "gemini-4-argon-high", "gemini-4-carbon", "gemini-4-hydrogen-high", "gemini-5-flash",
+		];
+		const selectorIds = [
+			"gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-5-flash",
+		];
+		try {
+			await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
+			const { result } = await send<{
+				result: { sessionId: string; models: { availableModels: Array<{ modelId: string }> }; configOptions: unknown[] };
+			}>("session/new", { cwd: root, mcpServers: [] });
+			expect(result.models.availableModels.map(model => model.modelId).sort()).toEqual(modelIds);
+			const choiceValues = (options: unknown[]) => {
+				const model = options.find(option => isRecord(option) && option.id === "model") as { options: Array<{ value?: string; options?: Array<{ value: string }> }> };
+				return model.options.flatMap(option => option.options?.map(choice => choice.value) ?? [option.value]).sort();
+			};
+			expect(choiceValues(result.configOptions)).toEqual(selectorIds);
+
+			const switched = await send<{ result: { configOptions: unknown[] } }>("session/set_config_option", {
+				sessionId: result.sessionId,
+				configId: "model",
+				value: "gemini-4-hydrogen",
+			});
+			expect(choiceValues(switched.result.configOptions)).toEqual(selectorIds);
+			const updates = notifications.flatMap(message => {
+				const params = message.params;
+				if (!isRecord(params) || !isRecord(params.update) || params.update.sessionUpdate !== "config_option_update") return [];
+				return [params.update.configOptions as unknown[]];
+			});
+			expect(updates.map(choiceValues)).toEqual([selectorIds]);
+
+			const list = Bun.spawn([process.execPath, join(projectRoot, "src/index.ts"), "models", "--profile", "acct-pro"], {
+				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake },
+				stdout: "pipe",
+			});
+			const stdout = await new Response(list.stdout).text();
+			expect(await list.exited).toBe(0);
+			expect(stdout.trim().split("\n").map(line => line.split("\t")[1]).sort()).toEqual(modelIds);
+		} finally {
+			proxy.kill();
+			await proxy.exited;
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("session/new reads reasoning cached by another process and matches the model selector IDs", async () => {
 		const { root, projectRoot, fake, promptLog } = await setupTieredEnv(true);
 		const { proxy, send } = spawnProxy(projectRoot, root, fake, promptLog);

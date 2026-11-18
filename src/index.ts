@@ -9,7 +9,7 @@ import { listProfiles, loadProfile, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
 import { loadState } from "./state";
 import { formatMultiUsageReport, readCachedUsage } from "./usage";
-import { fetchModels, readCachedModels } from "./models";
+import { fetchModels, isPublicGeminiModel, readCachedModels } from "./models";
 import { MODELS_TTL_MS, PROBE_SPACING_MS } from "./paths";
 import { ProbeSync } from "./probe-sync";
 import { SerialQueue } from "./serial-queue";
@@ -348,7 +348,9 @@ async function main(): Promise<void> {
 				console.log(`${profile.slug}\t(unavailable)`);
 				continue;
 			}
-			for (const model of snapshot.models) {
+			const models = snapshot.models.filter(model => isPublicGeminiModel(model.modelId));
+			if (!models.length) console.log(`${profile.slug}\t(no Gemini models available)`);
+			for (const model of models) {
 				console.log(`${profile.slug}\t${model.modelId}\t${model.name ?? ""}`);
 			}
 		}

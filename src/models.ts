@@ -37,6 +37,11 @@ export async function writeCachedModelReasoning(slug: string, entries: ModelReas
 
 const EFFORT_SUFFIX_RE = /^-(low|medium|high|xhigh|max|thinking)$/i;
 
+/** Public Gemini releases have versioned IDs, including their effort variants. */
+export function isPublicGeminiModel(modelId: unknown): modelId is string {
+	return typeof modelId === "string" && /^gemini-\d+(?:\.\d+)*(?:-[a-z0-9]+)*$/i.test(modelId);
+}
+
 export function profileModelsPath(slug: string): string {
 	return join(profileDir(slug), "models.json");
 }

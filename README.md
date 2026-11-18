@@ -451,6 +451,10 @@ bin\agy-multi-acp.cmd
 
 ## ACP host (t3code, Zed, OMP, any ACP client)
 
+`agy-multi models` and the ACP catalog list the versioned Gemini models that
+Antigravity advertises for your accounts. This includes new Gemini releases
+as they become available to the account pool.
+
 `agy-multi acp` is a stdio ACP server. An ACP host sees **one** Antigravity
 provider backed by your account pool (rotating automatically on
 quota/ban/auth); pass `--sequential` to keep only one account active at a time.

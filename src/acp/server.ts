@@ -48,6 +48,7 @@ import {
 	nextWaitMs,
 } from "./daemon-tasks";
 import { isRecord } from "./guards";
+import { filterModelCatalog } from "./model-catalog";
 import { buildHandoffPrompt, promptToText, type HistoryEntry } from "./prompt";
 import {
 	isNotification,
@@ -291,7 +292,7 @@ class AcpProxy {
 	}
 
 	private respond(id: JsonRpcId, result: unknown): void {
-		this.sendToClient({ jsonrpc: "2.0", id, result });
+		this.sendToClient({ jsonrpc: "2.0", id, result: filterModelCatalog(result) });
 	}
 
 	private respondError(id: JsonRpcId, code: number, message: string, data?: unknown): void {
@@ -499,6 +500,10 @@ class AcpProxy {
 			const augmented = this.buildAvailableCommands(session.cwd, commands);
 			const augmentedUpdate = { ...update, availableCommands: augmented };
 			deliver({ ...outMessage, params: { ...outParams, update: augmentedUpdate } });
+			return;
+		}
+		if (kind === "config_option_update") {
+			deliver({ ...outMessage, params: { ...outParams, update: filterModelCatalog(update) } });
 			return;
 		}
 		deliver(outMessage);

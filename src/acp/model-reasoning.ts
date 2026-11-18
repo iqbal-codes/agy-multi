@@ -7,6 +7,7 @@ import { hasValidAuth } from "../profile";
 import {
 	deriveBaseConfigOptions,
 	extractAcpModelsFromResult,
+	isPublicGeminiModel,
 	readAcpSelectChoices,
 	readCachedModelReasoning,
 	readCachedModels,
@@ -79,10 +80,11 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 	const [catalog, cached] = await Promise.all([readCachedModels(profile.slug), readCachedModelReasoning(profile.slug)]);
 	const cutoff = Date.now() - MODELS_TTL_MS;
 	const fresh = new Set(force ? [] : cached.filter(entry => entry.fetchedAt >= cutoff).map(entry => entry.modelId));
-	const previousChoices = catalog?.configOptions ?? deriveBaseConfigOptions(catalog?.models ?? []);
+	const previousChoices = (catalog?.configOptions ?? deriveBaseConfigOptions(catalog?.models ?? []))
+		.filter(choice => isPublicGeminiModel(choice.value));
 	if (!force && catalog && catalog.fetchedAt >= cutoff && previousChoices.length &&
 		previousChoices.every(choice => fresh.has(choice.value))) {
-		return cached.filter(entry => entry.meta.reasoningEfforts?.length).length;
+		return cached.filter(entry => isPublicGeminiModel(entry.modelId) && entry.meta.reasoningEfforts?.length).length;
 	}
 
 	const entries = new Map(cached.map(entry => [entry.modelId, entry]));
@@ -137,21 +139,23 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 		if (models.length === 0) throw new Error("Missing model catalog");
 		await writeCachedModels({ profile: profile.slug, fetchedAt: Date.now(), models, configOptions: choices });
 
-		const modelIds = new Set([...models.map(model => model.modelId), ...choices.map(choice => choice.value)]);
+		const modelIds = new Set([...models.map(model => model.modelId), ...choices.map(choice => choice.value)]
+			.filter(isPublicGeminiModel));
 		for (const id of entries.keys()) if (!modelIds.has(id)) entries.delete(id);
 		for (const model of extracted.models) {
+			if (!modelIds.has(model.modelId)) continue;
 			const meta = nativeReasoningMeta(model._meta);
 			if (meta) remember(model.modelId, meta);
 		}
 		const current = selector?.currentValue;
-		if (typeof current === "string" && Array.isArray(result.configOptions)) {
+		if (isPublicGeminiModel(current) && Array.isArray(result.configOptions)) {
 			const meta = reasoningMeta(result.configOptions);
 			if (meta || !verified.has(current)) remember(current, meta ?? { supportsReasoningEffort: false });
 		}
 		try {
 			if (typeof selector?.id === "string") {
 				for (const { value } of choices) {
-					if (verified.has(value) || !agent.alive) continue;
+					if (!modelIds.has(value) || verified.has(value) || !agent.alive) continue;
 					const update = Promise.withResolvers<unknown[]>();
 					watchUpdate = options => {
 						if (findModelSelector(options)?.currentValue === value) update.resolve(options);
