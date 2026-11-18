@@ -18,6 +18,13 @@ tagged by the release workflow on merge to `main`.
   until they restart, and `~/.agy-multi` state is never touched.
 - `agy-multi --version` prints the version this build reports. `package.json` is
   inlined at bundle time, so a compiled single-file binary can answer it.
+
+## [0.4.0] - 2026-11-18
+
+This release stops starting a CLI just to read a number: quota and usage come
+from a cached snapshot the proxy keeps for the accounts that actually run, and
+no probe ever fans out across accounts.
+
 ### Changed
 
 - Quota reads are cache-only. `agy-multi quota` and `agy-multi multi-usage`
