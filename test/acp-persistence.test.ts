@@ -112,10 +112,9 @@ async function fixture() {
 	const control = (value: Record<string, unknown>) => writeFile(join(root, "control.json"), JSON.stringify(value));
 	await control({});
 	const clients: { close(): Promise<void> }[] = [];
-	// These tests exercise the opt-in legacy account pool (failover/rotation and
-	// cross-account handoff). The default proxy serves one pinned account.
+	// These tests exercise account-pool failover/rotation and cross-account handoff.
 	const start = async () => {
-		const proc = Bun.spawn(["bun", "run", join(project, "src/index.ts"), "acp", "--allow-account-pool", "--switch-delay", "0"], {
+		const proc = Bun.spawn(["bun", "run", join(project, "src/index.ts"), "acp", "--switch-delay", "0"], {
 			cwd: project,
 			env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake },
 			stdin: "pipe", stdout: "pipe", stderr: "pipe",

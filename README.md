@@ -5,10 +5,9 @@
 
 > [!NOTE]
 > **Requires an ACP Client / Host**:
-> `agy-multi` is an **ACP (Agent Client Protocol) Proxy Server**, not an interactive terminal chat replacement or patch for `agy`. It is designed to be connected to an **ACP Client / AI Editor** (such as **T3 Code**, **Zed**, or any interactive ACP client). Each proxy process serves exactly one Google account, selected by you; quota and suspension failures are reported back to you rather than routed to another account.
+> `agy-multi` is an **ACP (Agent Client Protocol) Proxy Server**, not an interactive terminal chat replacement or patch for `agy`. It is designed to be connected to an **ACP Client / AI Editor** (such as **T3 Code**, **Zed**, or any interactive ACP client). It runs in **account-pool mode** by default (automatic quota failover and parallel multi-account routing); pass `--sequential` to keep only one account active at a time.
 
-Run the official Antigravity CLI (`agy`) with isolated Google accounts, one
-account per process, chosen by you — without patching the binary, proxying
+Run the official Antigravity CLI (`agy`) across isolated Google accounts — without patching the binary, proxying
 traffic, or reimplementing the protocol.
 
 ## Why an isolated HOME
@@ -80,7 +79,7 @@ flowchart TD
 
     IDE -->|"stdio (JSON-RPC)"| Proxy
     Proxy -->|"Route Turn"| P1
-    Proxy -.->|"Legacy pool only (--allow-account-pool)"| P2
+    Proxy -.->|"Pool failover (default)"| P2
     P1 --> Bin1
     P2 --> Bin2
     Bin1 -->|"Run tools & terminal"| SB
@@ -111,8 +110,7 @@ What that means for this tool:
 
 | Mode | Where it stands |
 |---|---|
-| One account, selected with `agy-multi use` or `--profile`, interactive turns | Closest to the permitted shape described above |
-| Pooled failover between accounts (`--allow-account-pool`) | Automatic account rotation — explicitly not supported on consumer plans |
+| Pooled failover between accounts (default, or `--sequential`) | Automatic account rotation — explicitly not supported on consumer plans |
 | `gemini-api-key` / `agent-platform` auth via `agy` itself | The path Google recommends for automation and higher concurrency |
 
 `agy-multi` still launches the unmodified official binary, never decrypts
@@ -134,14 +132,13 @@ Still true, and still worth keeping:
 5. **Transparent Developer Shell Bridge**:
    - The isolated `HOME` is confined to `agy`'s internal auth. Child commands spawned by the agent (`gh`, `git`, `ssh`, `docker`) automatically map to your primary user's environment, avoiding missing SSH keys or broken developer tool credentials.
 
-## Legacy: pooled failover (`--allow-account-pool`)
+## Account pool (default) and sequential mode
 
 > [!WARNING]
-> This flow is **not permitted** on consumer Antigravity plans: the FAQ says
+> Automatic rotation is **not permitted** on consumer Antigravity plans: the FAQ says
 > wrapping `agy` inside third-party coding agents and automating account rotation
-> are unsupported, and Terms §6 makes third-party access a breach. It stays behind
-> `--allow-account-pool` so the previous behaviour is not lost; running it is
-> account risk you accept.
+> are unsupported, and Terms §6 makes third-party access a breach. Running
+> `agy-multi` is at your own account risk.
 
 `--switch-delay <seconds>` (default 20 in pool mode, `0` disables) pauses before a
 turn is handed to another account. It is **pacing**, so a fresh account is not hit
@@ -301,17 +298,14 @@ agy-multi multi-usage [--profile <slug>] [--refresh]
 # Check token usage & Gemini 3.8 Flash cost analytics
 agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
 
-# Choose the account this process serves (one at a time)
-agy-multi use work
+# Start ACP proxy server (account-pool by default)
+agy-multi acp [--clean] [-- agy acp args...]
 
-# Start ACP proxy server for t3code, Zed, or any interactive ACP client
-agy-multi acp [--profile <slug>] [--clean] [-- agy acp args...]
+# Start ACP proxy in sequential pool mode (one active account at a time)
+agy-multi acp --sequential
 
-# Run a non-interactive prompt on the selected account
+# Run a non-interactive prompt (account-pool by default)
 agy-multi run --prompt "fix the failing test" --model gemini-3.8-flash [--profile <slug>]
-
-# Legacy pooled failover (see the warning above — ToS risk)
-agy-multi acp --allow-account-pool
 
 # Run in clean subagent mode with manual injections (ala Pi Agent)
 agy-multi run --prompt "review this diff" --clean --skills "git,diagnosing-bugs" \
@@ -413,18 +407,11 @@ When running `agy-multi profile add <slug>` on a remote machine, VPS, or over SS
 5. Paste it back into the remote terminal and press Enter. The account is now authenticated and ready!
 
 
-By default `run` and `acp` touch exactly one account: the one you selected. A
-quota, suspension, or sign-out failure is classified and reported — with the
-reset time and the command to switch accounts by hand — and is never retried on
-another account. Nothing probes a second account's `/usage` or `models`; `/multi-usage`
-reports only the account in use.
+`acp` and `run` rank candidates from the cached `/usage` and `models` snapshots
+(refreshed in the background through one serial queue), pin conversations, and
+fail over on quota/ban/auth.
 
-The ranking and rotation described below is the **legacy pool mode**:
-`--allow-account-pool` ranks candidates from the cached `/usage` and `models`
-snapshots (refreshed in the background through one serial queue) and fails over
-on quota/ban/auth.
-
-## Legacy failover rules (`--allow-account-pool`)
+## Pool failover rules
 
 | Signal | Action |
 |---|---|
@@ -462,16 +449,15 @@ bin\agy-multi-acp.cmd
 ## ACP host (t3code, Zed, OMP, any ACP client)
 
 `agy-multi acp` is a stdio ACP server. An ACP host sees **one** Antigravity
-agent backed by **one** account: select it with `agy-multi use <slug>` (or pass
-`--profile <slug>`). When that account is out of quota or suspended, the turn
-fails with a message naming the fix; the proxy does not switch accounts.
+provider backed by your account pool (rotating automatically on
+quota/ban/auth); pass `--sequential` to keep only one account active at a time.
 
 In t3code: **Settings → Providers → Add provider → Local ACP command**.
 
 | Field | Value |
 |---|---|
 | Executable | `agy-multi` (or absolute path: `~/.local/bin/agy-multi`) |
-| Arguments | `acp` — or `acp --profile <slug>` to pin explicitly |
+| Arguments | `acp` (pool default) or `acp --sequential` |
 | Environment | none — installed standalone binary handles execution |
 
 `install.sh` / `install.ps1` compiles standalone single-binary executables and places them directly into `~/.local/bin/` (`$HOME/.local/bin/agy-multi` and `agy-multi-acp`).
@@ -571,9 +557,8 @@ Per-profile: auth token/keychain, accounts, settings, caches, logs,
 - One account per running process; conversations are single-writer.
 - A banned account still reports 100% on `/usage`; only a generation canary or a
   real turn detects it. `profile add` runs a canary by default.
-- Automatic multi-account rotation is not permitted under the Antigravity Terms.
-  It now requires `--allow-account-pool`; selecting an account with `agy-multi
-  use` (or `--profile`) is the supported path.
+- Automatic multi-account rotation is not permitted under the Antigravity Terms;
+  using `agy-multi` is at your own account risk.
 
 ## Tests
 
@@ -583,7 +568,6 @@ bun run typecheck
 ```
 
 `test/acp-proxy.test.ts` drives the real proxy against a fake `agy` process. It
-covers both modes: in the default single-account mode a `RESOURCE_EXHAUSTED` turn
-is reported to the client and no other account is ever spawned; with
-`--allow-account-pool`, `acct-a` is blocked and the turn completes on `acct-b`
-with a handoff prompt.
+covers both pool modes: in the default pool mode, `acct-a` is blocked on
+`RESOURCE_EXHAUSTED` and the turn completes on `acct-b`; with `--sequential`,
+only one account child runs at a time and idle accounts are never probed.

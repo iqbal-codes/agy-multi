@@ -61,14 +61,9 @@ export interface Checkpoint {
 }
 
 export interface WrapperState {
-	/** 1 = legacy shape from before `defaultProfile`; `loadState` normalises to 2. */
+	/** 1 = legacy shape; `loadState` normalises to 2. */
 	version: 1 | 2;
-	/**
-	 * Profile used when no `--profile` is passed. Accounts are selected by the
-	 * operator, never by the wrapper: `agy-multi use <slug>` writes this.
-	 */
-	defaultProfile?: string;
-	/** Legacy pool mode only: conversation -> owning profile. */
+	/** Conversation -> owning profile. */
 	pins: Record<string, string>;
 	blocks: Record<string, Partial<Record<Family, number>>>;
 	checkpoints: Record<string, Checkpoint>;

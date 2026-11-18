@@ -131,7 +131,7 @@ describe("agy-multi auto-compaction guard", () => {
 
 		// Threshold set to 50,000; simulation emits 60,000 tokens
 		const proxy = Bun.spawn(
-			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--profile", "acct-test", "--compaction-threshold", "50000"],
+			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--compaction-threshold", "50000"],
 			{
 				cwd: projectRoot,
 				env: {
@@ -225,7 +225,7 @@ describe("agy-multi auto-compaction guard", () => {
 
 		// Threshold 50,000; simulation emits 10,000 tokens
 		const proxy = Bun.spawn(
-			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--profile", "acct-test", "--compaction-threshold", "50000"],
+			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--compaction-threshold", "50000"],
 			{
 				cwd: projectRoot,
 				env: {
@@ -298,7 +298,7 @@ describe("agy-multi auto-compaction guard", () => {
 
 		// Threshold 0 (disabled); tokens 60,000
 		const proxy = Bun.spawn(
-			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--profile", "acct-test", "--compaction-threshold", "0"],
+			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--compaction-threshold", "0"],
 			{
 				cwd: projectRoot,
 				env: {
@@ -371,7 +371,7 @@ describe("agy-multi auto-compaction guard", () => {
 		await chmod(fake, 0o755);
 
 		const proxy = Bun.spawn(
-			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--profile", "acct-test", "--compaction-threshold", "50000"],
+			["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--compaction-threshold", "50000"],
 			{
 				cwd: projectRoot,
 				env: {
