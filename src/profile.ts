@@ -78,26 +78,21 @@ async function ensureKeychain(home: string): Promise<void> {
 }
 
 /**
- * Check whether a profile has valid credentials without invoking interactive browser popups.
- * On macOS, checks for `antigravity-oauth-token` file, or verifies that the item exists
- * in the isolated keychain without querying plaintext password (no `-w`), which avoids macOS GUI prompts.
+ * Whether the profile looks signed in, decided from the filesystem alone.
+ *
+ * This runs on every usage/model probe, so it must never execute `security`:
+ * querying a locked per-profile keychain raises the macOS "agy-multi wants to
+ * use the keychain" password prompt. Treat an existing keychain as evidence of
+ * stored credentials and let the CLI answer for itself — a stale token comes
+ * back as an auth error, which the caller already classifies and records.
  */
 export async function hasValidAuth(profile: Profile): Promise<boolean> {
 	if (profile.home) return true; // Adopted profile uses system-wide credentials
 	const home = profileHome(profile.slug);
 	const tokenFile = join(home, ".gemini/antigravity-cli/antigravity-oauth-token");
 	if (await exists(tokenFile)) return true;
-
 	if (process.platform === "darwin") {
-		const keychain = join(home, "Library/Keychains/login.keychain-db");
-		if (!(await exists(keychain))) return false;
-
-		// Check if token exists in keychain WITHOUT -w flag (avoids SecurityAgent GUI prompt)
-		const findRes = await run(
-			["/usr/bin/security", "find-generic-password", "-s", "gemini", "-a", "antigravity", keychain],
-			{ env: profileEnvOf(home) },
-		);
-		return findRes.exitCode === 0;
+		return await exists(join(home, "Library/Keychains/login.keychain-db"));
 	}
 	return false;
 }
