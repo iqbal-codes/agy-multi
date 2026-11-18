@@ -360,238 +360,6 @@ function promptHomes(invocations: Invocation[]): string[] {
 	return invocations.filter(entry => entry.method === "session/prompt").map(entry => entry.home);
 }
 
-describe("agy-multi ACP proxy (single pinned account)", () => {
-	test(
-		"serves only the pinned profile: with two accounts configured, one HOME is ever used",
-		async () => {
-			// `acct-aa` sorts first, so a ranking implementation would prefer it.
-			const f = await fixture(["acct-aa", "acct-zz"]);
-			const client = f.proxy(["--profile", "acct-zz"]);
-			try {
-				const initialized = await client.send<Reply>("initialize", {
-					protocolVersion: 1,
-					clientCapabilities: {},
-					clientInfo: { name: "test", version: "1.0.0" },
-				});
-				expect(initialized.result?.protocolVersion).toBe(1);
-
-				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
-				const sessionId = created.result?.sessionId;
-				expect(typeof sessionId).toBe("string");
-
-				const prompted = await client.send<Reply>("session/prompt", {
-					sessionId,
-					prompt: [{ type: "text", text: "hello" }],
-				});
-				expect(prompted.error).toBeUndefined();
-				expect(prompted.result?.stopReason).toBe("end_turn");
-
-				const invocations = await f.invocations();
-				const pinnedHome = homeOf(f.root, "acct-zz");
-				expect(new Set(invocations.map(entry => entry.home))).toEqual(new Set([pinnedHome]));
-				expect(invocations.filter(entry => entry.home.includes("acct-aa"))).toEqual([]);
-
-				// The wrapper flags are consumed by the proxy, never forwarded to `agy acp`.
-				for (const entry of invocations.filter(entry => entry.event === "start")) {
-					expect(entry.argv).not.toContain("--profile");
-					expect(entry.argv).not.toContain("--allow-account-pool");
-				}
-
-				const newSessions = invocations.filter(entry => entry.method === "session/new");
-				expect(newSessions).toHaveLength(1);
-				expect(newSessions[0]!.home).toBe(pinnedHome);
-			} finally {
-				await stop(client);
-				await f.cleanup();
-			}
-		},
-		30_000,
-	);
-
-	test(
-		"quota failure answers the client with a quota error instead of switching accounts",
-		async () => {
-			const f = await fixture(["acct-a", "acct-b"], { env: { FAKE_AGY_MODE: "quota" } });
-			const client = f.proxy(["--profile", "acct-a"]);
-			try {
-				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
-				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
-				const prompted = await client.send<Reply>("session/prompt", {
-					sessionId: created.result?.sessionId,
-					prompt: [{ type: "text", text: "TRIGGER" }],
-				});
-
-				expect(prompted.result).toBeUndefined();
-				expect(prompted.error?.message).toMatch(/quota/i);
-
-				const invocations = await f.invocations();
-				expect(new Set(invocations.map(entry => entry.home))).toEqual(new Set([homeOf(f.root, "acct-a")]));
-				const newSessions = invocations.filter(entry => entry.method === "session/new");
-				expect(newSessions).toHaveLength(1);
-				expect(newSessions[0]!.home).toBe(homeOf(f.root, "acct-a"));
-				// No retry: the turn was attempted exactly once.
-				expect(promptHomes(invocations)).toEqual([homeOf(f.root, "acct-a")]);
-			} finally {
-				await stop(client);
-				await f.cleanup();
-			}
-		},
-		30_000,
-	);
-
-	test(
-		"banned account explains the Terms of Service and points at manual account selection",
-		async () => {
-			const f = await fixture(["acct-a", "acct-b"], { env: { FAKE_AGY_MODE: "banned" } });
-			const client = f.proxy(["--profile", "acct-a"]);
-			try {
-				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
-				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
-				const prompted = await client.send<Reply>("session/prompt", {
-					sessionId: created.result?.sessionId,
-					prompt: [{ type: "text", text: "TRIGGER" }],
-				});
-
-				expect(prompted.result).toBeUndefined();
-				expect(prompted.error?.message).toContain("Terms of Service");
-				expect(prompted.error?.message).toContain("agy-multi use");
-
-				const invocations = await f.invocations();
-				expect(invocations.filter(entry => entry.home.includes("acct-b"))).toEqual([]);
-				expect(promptHomes(invocations)).toEqual([homeOf(f.root, "acct-a")]);
-			} finally {
-				await stop(client);
-				await f.cleanup();
-			}
-		},
-		30_000,
-	);
-
-	test(
-		"auth failure tells the operator to log the pinned profile in",
-		async () => {
-			const f = await fixture(["acct-a", "acct-b"], { env: { FAKE_AGY_MODE: "auth" } });
-			const client = f.proxy(["--profile", "acct-a"]);
-			try {
-				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
-				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
-				const prompted = await client.send<Reply>("session/prompt", {
-					sessionId: created.result?.sessionId,
-					prompt: [{ type: "text", text: "TRIGGER" }],
-				});
-
-				expect(prompted.result).toBeUndefined();
-				expect(prompted.error?.message).toContain("agy-multi profile login");
-
-				const invocations = await f.invocations();
-				expect(invocations.filter(entry => entry.home.includes("acct-b"))).toEqual([]);
-			} finally {
-				await stop(client);
-				await f.cleanup();
-			}
-		},
-		30_000,
-	);
-
-	test(
-		"initialize hands control to the agent without a blocking /usage preflight",
-		async () => {
-			const f = await fixture(["acct-1", "acct-2", "acct-3"]);
-			const client = f.proxy(["--profile", "acct-1"]);
-			try {
-				const initialized = await client.send<Reply>("initialize", {
-					protocolVersion: 1,
-					clientCapabilities: {},
-				});
-				expect(initialized.result?.protocolVersion).toBe(1);
-
-				const usageProbes = (await f.invocations()).filter(
-					entry => entry.event === "start" && entry.argv?.includes("/usage"),
-				);
-				expect(usageProbes).toEqual([]);
-			} finally {
-				await stop(client);
-				await f.cleanup();
-			}
-		},
-		30_000,
-	);
-
-	test(
-		"fails closed when neither --profile nor a recorded default exists",
-		async () => {
-			const f = await fixture(["acct-a", "acct-b"]);
-			const result = await f.cli(["acp"]);
-
-			expect(result.exitCode).not.toBe(0);
-			expect(result.stderr).toContain("agy-multi use");
-			// The wrapper must not authenticate any account before the operator picks one.
-			expect(await f.invocations()).toEqual([]);
-			await f.cleanup();
-		},
-		20_000,
-	);
-
-	test(
-		"`use <slug>` records the default profile a bare `acp` then serves",
-		async () => {
-			const f = await fixture(["acct-first", "acct-second"]);
-			try {
-				// Legacy pool bookkeeping must survive a `use`: pins, blocks and
-				// checkpoints still back `agy-multi acp --allow-account-pool`.
-				await writeFile(
-					join(f.root, "state.json"),
-					JSON.stringify({
-						version: 2,
-						pins: { "conv-1": "acct-first" },
-						blocks: { "acct-first": { gemini: 4_102_444_800_000 } },
-						checkpoints: {
-							"conv-1": { prompt: "legacy", slug: "acct-first", updatedAt: "2026-01-01T00:00:00Z" },
-						},
-					}),
-				);
-
-				const used = await f.cli(["use", "acct-second"]);
-				expect(used.exitCode, used.stderr).toBe(0);
-
-				const state = JSON.parse(await readFile(join(f.root, "state.json"), "utf8")) as {
-					version?: number;
-					defaultProfile?: string;
-					pins?: Record<string, string>;
-					blocks?: Record<string, { gemini?: number }>;
-					checkpoints?: Record<string, { slug?: string }>;
-				};
-				expect(state).toMatchObject({ version: 2, defaultProfile: "acct-second" });
-				expect(state.pins).toEqual({ "conv-1": "acct-first" });
-				expect(state.blocks?.["acct-first"]?.gemini).toBe(4_102_444_800_000);
-				expect(state.checkpoints?.["conv-1"]?.slug).toBe("acct-first");
-
-				const client = f.proxy([]);
-				try {
-					await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
-					const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
-					const prompted = await client.send<Reply>("session/prompt", {
-						sessionId: created.result?.sessionId,
-						prompt: [{ type: "text", text: "hello" }],
-					});
-					expect(prompted.result?.stopReason).toBe("end_turn");
-				} finally {
-					await stop(client);
-				}
-
-				const invocations = await f.invocations();
-				expect(new Set(invocations.map(entry => entry.home))).toEqual(
-					new Set([homeOf(f.root, "acct-second")]),
-				);
-				expect(invocations.filter(entry => entry.home.includes("acct-first"))).toEqual([]);
-			} finally {
-				await f.cleanup();
-			}
-		},
-		30_000,
-	);
-});
-
 /** Seeds a profile's cached `/usage` and model catalog, as a refresh would have. */
 async function seedProfile(
 	root: string,
@@ -622,12 +390,12 @@ async function seedProfile(
 	}
 }
 
-describe("agy-multi ACP proxy (legacy account pool)", () => {
+describe("agy-multi ACP proxy (account pool default)", () => {
 	test(
-		"legacy pooling is opt-in and warns about the Terms of Service before serving requests",
+		"account pool is the default and warns about the Terms of Service before serving requests",
 		async () => {
 			const f = await fixture(["acct-a", "acct-b"]);
-			const client = f.proxy(["--allow-account-pool"]);
+			const client = f.proxy([]);
 			try {
 				await client.waitForStderr(line => line.includes("Terms of Service"));
 				expect(client.stderrLines.join("\n")).toContain("not supported");
@@ -648,12 +416,12 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 	);
 
 	test(
-		"legacy pooling completes a quota-blocked turn on the next account",
+		"default account pool completes a quota-blocked turn on the next account",
 		async () => {
 			const f = await fixture(["acct-a", "acct-b"], {
 				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a" },
 			});
-			const client = f.proxy(["--allow-account-pool", "--switch-delay", "0"]);
+			const client = f.proxy(["--switch-delay", "0"]);
 			try {
 				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
 				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
@@ -695,12 +463,12 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 	);
 
 	test(
-		"legacy pooling paces the handoff to the next account",
+		"default account pool paces the handoff to the next account",
 		async () => {
 			const f = await fixture(["acct-a", "acct-b"], {
 				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a" },
 			});
-			const client = f.proxy(["--allow-account-pool", "--switch-delay", "1"]);
+			const client = f.proxy(["--switch-delay", "1"]);
 			try {
 				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
 				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
@@ -734,7 +502,7 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 			const f = await fixture(["acct-a", "acct-b"], {
 				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a" },
 			});
-			const client = f.proxy(["--allow-account-pool", "--switch-delay", "0"]);
+			const client = f.proxy(["--switch-delay", "0"]);
 			try {
 				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
 				const prompted = await client.send<Reply>("session/prompt", {
@@ -775,7 +543,7 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 			const f = await fixture(["acct-a", "acct-b"], {
 				env: { FAKE_AGY_MODE: "quota", FAKE_AGY_FAIL_SLUG: "acct-a", FAKE_AGY_LIVE_DIR: liveDir },
 			});
-			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			const client = f.proxy(["--sequential", "--switch-delay", "0"]);
 			try {
 				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
 				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
@@ -822,7 +590,7 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 				models: ["gemini-3.8-flash-high", "gemini-4-argon-high"],
 			});
 
-			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			const client = f.proxy(["--sequential", "--switch-delay", "0"]);
 			try {
 				const first = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
 				// Hold a turn on acct-a so a switch would have to kill it.
@@ -865,7 +633,7 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 			});
 			await seedProfile(f.root, "acct-basic", { usagePct: 60, models: ["gemini-3.8-flash-high"] });
 
-			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			const client = f.proxy(["--sequential", "--switch-delay", "0"]);
 			try {
 				const main = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
 				const mainOnArgon = await client.send<Reply>("session/set_model", {
@@ -939,7 +707,7 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 				}),
 			);
 
-			const client = f.proxy(["--allow-account-pool"]);
+			const client = f.proxy([]);
 			try {
 				const session = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
 				expect(session.error).toBeUndefined();
@@ -970,7 +738,7 @@ describe("agy-multi ACP proxy (legacy account pool)", () => {
 			await seedProfile(f.root, "acct-a", { usagePct: 90 });
 			for (const slug of slugs.slice(1)) await seedProfile(f.root, slug, { usagePct: 5 });
 
-			const client = f.proxy(["--allow-account-pool", "--sequential", "--switch-delay", "0"]);
+			const client = f.proxy(["--sequential", "--switch-delay", "0"]);
 			try {
 				const first = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
 				expect(first.error).toBeUndefined();
@@ -1111,13 +879,13 @@ function isToolCallNotification(message: unknown, toolCallId: string): boolean {
 	return isRecord(update) && update.toolCallId === toolCallId;
 }
 
-describe("agy-multi ACP proxy (single-account features)", () => {
+describe("agy-multi ACP proxy (daemon tasks and /multi-usage)", () => {
 	test(
 		"holds the turn open while a daemon task is still running instead of reporting end_turn",
 		async () => {
 			const f = await fixture(["acct-1"], { agent: FAKE_DAEMON_AGY });
 			const turnsLog = join(f.root, "turns.log");
-			const client = f.proxy(["--profile", "acct-1"], { FAKE_DAEMON_LOG: turnsLog });
+			const client = f.proxy([], { FAKE_DAEMON_LOG: turnsLog });
 			try {
 				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
 				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
@@ -1147,7 +915,7 @@ describe("agy-multi ACP proxy (single-account features)", () => {
 			const f = await fixture(["acct-1"], { agent: FAKE_DAEMON_AGY });
 			const turnsLog = join(f.root, "turns.log");
 			// Long enough that the turn is still held when the client cancels.
-			const client = f.proxy(["--profile", "acct-1"], {
+			const client = f.proxy([], {
 				FAKE_DAEMON_LOG: turnsLog,
 				FAKE_DAEMON_TIMER: "30",
 			});
@@ -1178,7 +946,7 @@ describe("agy-multi ACP proxy (single-account features)", () => {
 	);
 
 	test(
-		"/multi-usage reports only the pinned account and never probes another one",
+		"/multi-usage averages quota across active accounts in the pool",
 		async () => {
 			const f = await fixture(["acct-a", "acct-b"], {
 				env: {
@@ -1210,7 +978,7 @@ describe("agy-multi ACP proxy (single-account features)", () => {
 				);
 			}
 
-			const client = f.proxy(["--profile", "acct-a"]);
+			const client = f.proxy([]);
 			try {
 				const chunks: string[] = [];
 				const advertised: string[] = [];
@@ -1238,18 +1006,14 @@ describe("agy-multi ACP proxy (single-account features)", () => {
 					if (typeof params.update.content.text === "string") chunks.push(params.update.content.text);
 				}
 				expect(advertised).toContain("multi-usage");
-				// Cached usage for the pinned account only: no averaging, no sibling probe.
 				expect(chunks.join("")).toBe(
 					[
-						"Gemini Models\tWeekly Limit Remaining\t60%\t2099-01-01T00:00:00Z",
-						"Gemini Models\tFive Hour Limit Remaining\t80%\t2099-01-01T00:00:00Z",
-						"Claude and GPT models\tWeekly Limit Remaining\t20%\t2099-01-01T00:00:00Z",
-						"Claude and GPT models\tFive Hour Limit Remaining\t40%\t2099-01-01T00:00:00Z",
+						"Gemini Models\tWeekly Limit Remaining\t70%\t2099-01-01T00:00:00Z",
+						"Gemini Models\tFive Hour Limit Remaining\t90%\t2099-01-01T00:00:00Z",
+						"Claude and GPT models\tWeekly Limit Remaining\t30%\t2099-01-01T00:00:00Z",
+						"Claude and GPT models\tFive Hour Limit Remaining\t50%\t2099-01-01T00:00:00Z",
 					].join("\n"),
 				);
-
-				const invocations = await f.invocations();
-				expect(invocations.filter(entry => entry.home.includes("acct-b"))).toEqual([]);
 			} finally {
 				await stop(client);
 				await f.cleanup();

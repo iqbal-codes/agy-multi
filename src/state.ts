@@ -8,16 +8,10 @@ export async function loadState(): Promise<WrapperState> {
 	const state = await readJson<WrapperState>(STATE_PATH, EMPTY);
 	return {
 		version: 2,
-		...(typeof state.defaultProfile === "string" ? { defaultProfile: state.defaultProfile } : {}),
 		pins: state.pins ?? {},
 		blocks: state.blocks ?? {},
 		checkpoints: state.checkpoints ?? {},
 	};
-}
-
-/** Records the account the operator chose. Nothing selects an account on its own. */
-export function setDefaultProfile(state: WrapperState, slug: string): void {
-	state.defaultProfile = slug;
 }
 
 export async function saveState(state: WrapperState): Promise<void> {

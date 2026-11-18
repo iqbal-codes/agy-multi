@@ -105,7 +105,7 @@ describe("CLI run model capability selection", () => {
 			);
 
 			const proc = Bun.spawn(
-				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--allow-account-pool", "--switch-delay", "0", "--prompt", "hi", "--model", "gemini-4-hydrogen-high"],
+				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--switch-delay", "0", "--prompt", "hi", "--model", "gemini-4-hydrogen-high"],
 				{
 					cwd: projectRoot,
 					env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_RUN_LOG: runLog },
@@ -140,7 +140,7 @@ describe("CLI run model capability selection", () => {
 			}
 
 			const proc = Bun.spawn(
-				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--allow-account-pool", "--switch-delay", "0", "--prompt", "hi", "--model", "gemini-4-argon-high"],
+				["bun", "run", join(projectRoot, "src/index.ts"), "run", "--switch-delay", "0", "--prompt", "hi", "--model", "gemini-4-argon-high"],
 				{
 					cwd: projectRoot,
 					env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_RUN_LOG: runLog },
@@ -189,7 +189,7 @@ describe("CLI run model capability selection", () => {
 				]);
 				expect(code, stderr).not.toBe(0);
 				expect(`${stderr}${stdout}`).toContain(failure.kind);
-				// Exactly one attempt, on the pinned account.
+				// Exactly one attempt, on the requested profile.
 				expect((await readFile(runLog, "utf8")).trim().split("\n")).toEqual(["acct-basic:"]);
 			} finally {
 				await rm(root, { recursive: true, force: true });

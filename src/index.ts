@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
+import { parseAcpProxyOptions } from "./acp/cli-args";
 import { runAcpProxy } from "./acp/server";
-import { extractCompactionThresholdArg, extractFlagArg } from "./acp/token-usage";
 import { ensureAgy } from "./setup";
 import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, syncProfiles } from "./profile";
 import { listProfiles, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
-import { loadState, saveState, setDefaultProfile } from "./state";
+import { loadState } from "./state";
 import { formatMultiUsageReport, readCachedUsage } from "./usage";
 import { fetchModels, readCachedModels } from "./models";
 import { MODELS_TTL_MS, PROBE_SPACING_MS } from "./paths";
@@ -60,12 +60,12 @@ Usage:
   agy-multi multi-usage [--profile <slug>] [--refresh]
   agy-multi models [--profile <slug>] [--refresh]
   agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
-  agy-multi use <slug>
-  agy-multi acp [--profile <slug>] [--clean] [--compaction-threshold <tokens>] [-- agy acp args...]
+  agy-multi acp [--sequential] [--clean] [--compaction-threshold <tokens>]
+                [--switch-delay <seconds>] [--handoff-context <chars>] [-- agy acp args...]
   agy-multi run --prompt <text> [--clean] [--no-skills] [--skills <list>]
                  [--system-prompt <text|file>] [--append-system-prompt <text|file>]
                  [--conversation <id>] [--model <id>] [--profile <slug>]
-                 [--cwd <dir>] [--json] [--allow-account-pool] [--max-switches <n>]
+                 [--cwd <dir>] [--json] [--max-switches <n>]
   agy-multi state
   agy-multi update [--check] [--force]
   agy-multi --version
@@ -85,9 +85,9 @@ Quota:
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
   --compaction-threshold <tokens> Auto-compacts conversation when context reaches this limit (default: 300000, 0 to disable).
-  --switch-delay <seconds>       Pool mode only: pause before handing a turn to another account (default: 20).
+  --switch-delay <seconds>       Pause before handing a turn to another account (default: 20).
   --handoff-context <chars>      Cap the transcript replayed when a conversation cannot be resumed (default: all of it).
-  --sequential                   Pool mode only: one account active at a time; no cross-account probing.
+  --sequential                   Keep only one account active at a time; no cross-account probing.
 
 Subagent Clean Mode & Manual Injections (ala Pi Agent):
   --clean / --no-skills          Bypasses default skills, plugins, rules bloat and slash commands.
@@ -98,49 +98,20 @@ Subagent Clean Mode & Manual Injections (ala Pi Agent):
 Each profile is a separate HOME; the official agy binary and its OAuth client
 are never modified.
 
-One account is served per process, chosen by you: pass --profile, or record a
-default with \`agy-multi use <slug>\`. When that account runs out of quota or is
-suspended, the wrapper reports it and stops; it never switches accounts itself.
+By default, \`acp\` and \`run\` use the account pool (automatic quota failover and
+parallel sessions across accounts). Pass \`--sequential\` to \`acp\` to keep only
+one account active at a time with automatic switching.
 
---allow-account-pool restores the previous automatic failover. Google's
-Antigravity Terms (§6) and FAQ do not permit wrapping agy inside third-party
-coding agents or automating account rotation on consumer plans, so that mode is
-kept only for compatibility, and the account risk is yours.
+Note: Google's Antigravity Terms (§6) and FAQ do not permit wrapping agy inside
+third-party coding agents or automating account rotation on consumer plans;
+pool mode is used at your own account risk.
 `;
 
 async function main(): Promise<void> {
 	const rawArgs = Bun.argv.slice(2);
 	if (rawArgs[0] === "acp" && rawArgs[1] !== "--help" && rawArgs[1] !== "-h") {
 		await ensureAgy({ autoInstall: true });
-		const clean = rawArgs.includes("--clean");
-		const allowAccountPool = rawArgs.includes("--allow-account-pool");
-		const sequential = rawArgs.includes("--sequential");
-		const baseArgs = rawArgs
-			.slice(1)
-			.filter(
-				(arg: string) =>
-					arg !== "--" && arg !== "--clean" && arg !== "--allow-account-pool" && arg !== "--sequential",
-			);
-		const { value: profileSlug, rest: profiledArgs } = extractFlagArg(baseArgs, "--profile");
-		const { value: switchDelay, rest: pacedArgs } = extractFlagArg(profiledArgs, "--switch-delay");
-		const { value: handoffContext, rest: replayArgs } = extractFlagArg(pacedArgs, "--handoff-context");
-		const { threshold, remainingArgs } = extractCompactionThresholdArg(replayArgs);
-		const extraArgs = clean
-			? ["--include-default-customizations=false", "--disable-slash-commands", ...remainingArgs]
-			: remainingArgs;
-		const switchDelayMs = switchDelay === undefined ? undefined : Math.round(Number(switchDelay) * 1000);
-		const handoffContextChars = handoffContext === undefined ? undefined : Number(handoffContext);
-		await runAcpProxy({
-			compactionThreshold: threshold,
-			extraArgs,
-			allowAccountPool,
-			sequential,
-			...(profileSlug ? { profile: profileSlug } : {}),
-			...(switchDelayMs !== undefined && Number.isFinite(switchDelayMs) ? { switchDelayMs } : {}),
-			...(handoffContextChars !== undefined && Number.isFinite(handoffContextChars)
-				? { handoffContextChars }
-				: {}),
-		});
+		await runAcpProxy(parseAcpProxyOptions(rawArgs.slice(1)));
 		return;
 	}
 
@@ -287,22 +258,6 @@ async function main(): Promise<void> {
 		throw new Error(`unknown profile command: ${subcommand ?? "(none)"}`);
 	}
 
-	if (command === "use") {
-		const slug = subcommand ?? rest[0];
-		if (!slug) throw new Error("usage: agy-multi use <slug>");
-		const profiles = await listProfiles();
-		const profile = profiles.find(candidate => candidate.slug === slug);
-		if (!profile) throw new Error(`unknown profile: ${slug} — list accounts with \`agy-multi profile list\``);
-		const state = await loadState();
-		setDefaultProfile(state, slug);
-		await saveState(state);
-		console.log(`default account: ${profile.slug}${profile.email ? ` (${profile.email})` : ""}`);
-		if (profile.disabled || profile.bannedAt || profile.authRequiredAt) {
-			console.error("warning: this account is not usable right now; fix it before starting the proxy");
-		}
-		return;
-	}
-
 	if (command === "quota") {
 		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
 		if (!profiles.length) {
@@ -404,30 +359,6 @@ async function main(): Promise<void> {
 	if (command === "run") {
 		if (!values.prompt) throw new Error("usage: agy-multi run --prompt <text>");
 		await ensureAgy();
-		// Accounts are chosen by the operator. Without the legacy pool flag the run
-		// is pinned to one account and gets exactly one attempt (maxSwitches: 0), so
-		// a quota/ban/auth failure surfaces instead of rotating.
-		const allowAccountPool = Boolean(values["allow-account-pool"]);
-		const pinnedSlug = values.profile ?? (await loadState()).defaultProfile;
-		if (!allowAccountPool && !pinnedSlug) {
-			throw new Error("no account selected: pass `--profile <slug>` or run `agy-multi use <slug>`");
-		}
-		if (!allowAccountPool && pinnedSlug) {
-			// Report the account's state up front instead of letting the ranking
-			// filter drop it and surface a generic "no attempt was made".
-			const profile = (await listProfiles()).find(candidate => candidate.slug === pinnedSlug);
-			if (!profile) throw new Error(`unknown profile: ${pinnedSlug}`);
-			if (profile.disabled || profile.bannedAt || profile.authRequiredAt) {
-				const reason = profile.disabled
-					? `is disabled — enable it with \`agy-multi profile enable ${pinnedSlug}\``
-					: profile.bannedAt
-						? "is suspended for a Terms of Service violation — switch by hand with `agy-multi use <slug>`"
-						: `is signed out — run \`agy-multi profile login ${pinnedSlug}\``;
-				console.error(`account ${pinnedSlug} ${reason}`);
-				process.exitCode = 1;
-				return;
-			}
-		}
 		try {
 			const skills = values.skills
 				? values.skills
@@ -441,17 +372,11 @@ async function main(): Promise<void> {
 				conversationId: values.conversation,
 				model: values.model,
 				cwd: values.cwd,
-				maxSwitches: allowAccountPool
-					? values["max-switches"]
-						? Number(values["max-switches"])
-						: undefined
-					: 0,
-				onlyProfile: allowAccountPool ? values.profile : pinnedSlug,
-				switchDelayMs: allowAccountPool
-					? values["switch-delay"]
-						? Math.round(Number(values["switch-delay"]) * 1000)
-						: 20_000
-					: 0,
+				maxSwitches: values["max-switches"] ? Number(values["max-switches"]) : undefined,
+				onlyProfile: values.profile,
+				switchDelayMs: values["switch-delay"]
+					? Math.round(Number(values["switch-delay"]) * 1000)
+					: 20_000,
 				clean: Boolean(values.clean || values["no-skills"]),
 				systemPrompt: values["system-prompt"],
 				appendSystemPrompt: values["append-system-prompt"],
