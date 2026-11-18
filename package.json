@@ -14,8 +14,7 @@
     "acp": "bun run src/index.ts acp",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "release:plan": "bun src/release-plan.ts plan",
-    "release:prepare": "bun src/release-plan.ts prepare"
+    "release:plan": "bun src/release-plan.ts plan"
   },
   "repository": {
     "type": "git",

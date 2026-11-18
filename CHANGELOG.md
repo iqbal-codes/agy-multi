@@ -1,9 +1,8 @@
 # Changelog
 
 All notable changes to this project are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases are
-published when a Release PR (`chore(release): vX.Y.Z`) is merged to `main` or
-triggered manually via `workflow_dispatch`.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0), and releases are
+published only by running `.github/workflows/release.yml` via `workflow_dispatch`.
 
 ## [Unreleased]
 
