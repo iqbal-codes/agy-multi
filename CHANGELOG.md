@@ -6,6 +6,27 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-18
+
+### Breaking Changes
+
+- default to account-pool and remove manual mode (#10)
+
+### Maintenance
+
+- **release**: make workflow dispatch the only release path (#11)
+  - Drop the push-triggered Release PR flow and release:* bump labels.
+  - Derive the bump from Conventional Commit titles only; remove detect-release-pr, pick, and --pr-labels-json.
+  - Commit the version and changelog, tag, build, and publish in one workflow run.
+  - Update the /release skill, PR template, and release docs to match.
+- run CI checks on ubuntu-latest only (#9)
+- **release**: deterministic range-based release pipeline (#8)
+  * ci(release): deterministic range-based release pipeline
+
+  * ci(release): remove PR release plan workflow
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v0.5.2...v1.0.0)
+
 ## [0.5.2] - 2026-11-18
 
 ### Fixed
