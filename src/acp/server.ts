@@ -2081,6 +2081,9 @@ class AcpProxy {
 			}
 
 			this.respond(clientId, response.result ?? { stopReason });
+			// The turn is what consumes quota: leave a fresh snapshot behind, unless
+			// the cache is still within its TTL.
+			this.refreshServedAccount(session.profile);
 		} catch (error) {
 			session.activeTurn = undefined;
 			this.respondFailure(clientId, error);
