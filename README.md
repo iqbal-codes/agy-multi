@@ -140,7 +140,7 @@ Still true, and still worth keeping:
 > are unsupported, and Terms §6 makes third-party access a breach. Running
 > `agy-multi` is at your own account risk.
 
-`--switch-delay <seconds>` (default 20 in pool mode, `0` disables) pauses before a
+`--switch-delay <seconds>` (default 10 in pool mode, `0` disables) pauses before a
 turn is handed to another account. It is **pacing**, so a fresh account is not hit
 the instant the previous one returns 429. It is not a detection countermeasure:
 the switch's timing is not what identifies a harness, and this does not make
