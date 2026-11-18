@@ -4,5 +4,5 @@
 
 ## Release Bump
 
-<!-- Automatically read by .github/workflows/release.yml on merge to main: -->
-<!-- Apply label `release:major` (breaking), `release:minor` (new feature), or leave unlabeled for `patch`. -->
+<!-- Optional override aggregated on the next release by .github/workflows/release.yml: -->
+<!-- Apply label `release:major` (breaking), `release:minor` (new feature), or rely on Conventional Commit titles (`feat:`, `feat!:`, `fix:`). -->
