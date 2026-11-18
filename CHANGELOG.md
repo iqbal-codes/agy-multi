@@ -6,6 +6,16 @@ tagged by the release workflow on merge to `main`.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-18
+
+### Fixed
+
+- `agy-multi` no longer asks macOS for the per-profile keychain. The auth check
+  behind every usage/model probe ran `security find-generic-password`, which
+  raises the "agy-multi wants to use the keychain" password dialog as soon as
+  that keychain locks. The check is filesystem-only now; a stale token shows up
+  as an auth error from the CLI, which the proxy already classifies.
+
 ## [0.5.1] - 2026-11-18
 
 ### Changed
