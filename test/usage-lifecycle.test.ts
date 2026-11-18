@@ -188,4 +188,66 @@ describe.skipIf(process.platform === "win32")("quota subprocess lifecycle", () =
 			await rm(root, { recursive: true, force: true });
 		}
 	}, 8000);
+
+	test("only the account that serves work is probed", async () => {
+		const root = await mkdtemp(join(tmpdir(), "agy-acp-quota-scope-"));
+		const cli = join(root, "agy");
+		await writeFile(cli, CLI);
+		await chmod(cli, 0o755);
+		const slugs = ["served", "idle"];
+		for (const slug of slugs) {
+			await mkdir(join(root, "profiles", slug), { recursive: true });
+			await writeFile(
+				join(root, "profiles", slug, "profile.json"),
+				JSON.stringify({ slug, home: join(root, `home-${slug}`), createdAt: "now" }),
+			);
+			const tokenDir = join(root, `home-${slug}`, ".gemini", "antigravity-cli");
+			await mkdir(tokenDir, { recursive: true });
+			await writeFile(join(tokenDir, "antigravity-oauth-token"), "stub");
+		}
+		const proxy = Bun.spawn([process.execPath, join(import.meta.dir, "../src/index.ts"), "acp", "--allow-account-pool"], {
+			detached: true,
+			env: {
+				...process.env,
+				AGY_BIN: cli,
+				AGY_MULTI_ROOT: root,
+				SCENARIO: "normal",
+				STARTED_MARKER: join(root, "started"),
+				BROWSER_MARKER: join(root, "browser"),
+				NEEDS_LOGIN_MARKER: join(root, "needs-login"),
+			},
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const replies = new Map<number, (value: unknown) => void>();
+		new LineReader(proxy.stdout, line => {
+			const message = JSON.parse(line);
+			if (typeof message.id === "number") replies.get(message.id)?.(message);
+		});
+		const request = (id: number, method: string, params: unknown) => new Promise(resolve => {
+			replies.set(id, resolve);
+			proxy.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+			void proxy.stdin.flush();
+		});
+		const cachedProfiles = async () =>
+			(await Promise.all(slugs.map(slug => Bun.file(join(root, "profiles", slug, "usage.json")).exists()))).filter(Boolean).length;
+		try {
+			await request(1, "initialize", { protocolVersion: 1, clientCapabilities: {} });
+			await request(2, "session/new", { cwd: root, mcpServers: [] });
+			const deadline = Date.now() + 6000;
+			while ((await cachedProfiles()) === 0) {
+				if (Date.now() > deadline) throw new Error("served account was never probed");
+				await Bun.sleep(20);
+			}
+			// A sweep would keep going and give the idle account a snapshot too.
+			await Bun.sleep(400);
+			expect(await cachedProfiles()).toBe(1);
+		} finally {
+			proxy.stdin.end();
+			try { await proxy.exited; } catch {}
+			try { process.kill(-proxy.pid, "SIGKILL"); } catch {}
+			await rm(root, { recursive: true, force: true });
+		}
+	}, 15000);
 });

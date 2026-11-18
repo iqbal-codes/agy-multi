@@ -12,6 +12,9 @@ tagged by the release workflow on merge to `main`.
   print the snapshot the proxy already synced (milliseconds, no child process);
   `--refresh` re-probes on demand, still one account at a time. A cold cache says
   so instead of quietly starting a check.
+- Nothing sweeps the account list any more. An account is refreshed when it
+  starts serving work and again when that session or child ends, and the cache
+  TTL decides whether a probe runs at all; idle accounts are never touched.
 
 ### Fixed
 

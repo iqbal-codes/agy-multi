@@ -50,8 +50,9 @@ Usage:
 
 Quota:
   quota and multi-usage print the cached snapshot and never start a check on
-  their own; the proxy keeps that cache warm in the background, one account at
-  a time. --refresh probes now, still one account at a time.
+  their own. The proxy refreshes an account when it starts and finishes serving
+  work, one account at a time; idle accounts are never probed. --refresh probes
+  now.
 
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.

@@ -269,7 +269,8 @@ agy-multi profile list
 agy-multi profile remove work
 
 # Print the cached quota snapshot (rolling 5h & weekly remaining).
-# The proxy keeps that cache warm in the background, one account at a time;
+# The proxy refreshes an account when it starts and finishes serving work,
+# one account at a time; idle accounts are never probed.
 # --refresh probes now, still one account at a time.
 agy-multi quota [--profile <slug>] [--refresh]
 agy-multi multi-usage [--profile <slug>] [--refresh]

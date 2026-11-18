@@ -242,12 +242,8 @@ class AcpProxy {
 			const diskModels = await readCachedModels(profile.slug);
 			if (diskModels) this.modelsCache.set(profile.slug, { snapshot: diskModels, at: diskModels.fetchedAt });
 		}
-		// Warm the caches from disk first, then refresh whatever is stale in the
-		// background, one account at a time. Pinned mode never probes another account.
-		const syncTargets = this.allowAccountPool
-			? [...this.profiles.values()]
-			: [this.pinnedProfile].filter((profile): profile is Profile => Boolean(profile));
-		if (syncTargets.length) void this.probes.syncStale(syncTargets, { usage: true, models: true }).catch(() => {});
+		// Nothing is probed at startup: the cache is read from disk, and an account
+		// is only refreshed once it has actually served work (session start/end).
 		this.log(
 			`ready — ${this.profiles.size} profile(s), ${Object.keys(this.store.sessions).length} stored session(s), ` +
 				`account: ${this.allowAccountPool ? `pool (legacy opt-in${this.sequential ? ", sequential" : ""})` : `${this.pinnedProfile?.slug ?? "-"} (pinned)`}, ` +
@@ -783,6 +779,9 @@ class AcpProxy {
 			this.children.delete(slug);
 			if (this.controlChild === child) this.controlChild = undefined;
 			child.loadedSessions.clear();
+			// The account just finished a stretch of work: leave a fresh snapshot
+			// behind, unless its cache is still within the TTL.
+			this.refreshServedAccount(slug);
 			await child.stop();
 			this.log(`stopped agent ${slug}: sequential mode keeps one account active`);
 		}
@@ -927,7 +926,6 @@ class AcpProxy {
 			usage.set(profile.slug, await readCachedUsage(profile.slug));
 			models.set(profile.slug, await readCachedModels(profile.slug));
 		}
-		if (!this.sequential) void this.probes.syncStale(all, { usage: true, models: true }).catch(() => {});
 		const family = familyForModel(options.modelId);
 		const now = Date.now();
 		// Reservation is a pool-only contest: it is worth keeping a wider catalog for
@@ -1048,6 +1046,18 @@ class AcpProxy {
 		// Cached answers only; a stale or missing entry queues a serial refresh.
 		if (force) return await this.probes.refreshUsage(profile).catch(() => null);
 		return await this.probes.usage(profile);
+	}
+
+	/**
+	 * Refresh the account that just served work. The cache TTL decides whether a
+	 * probe runs at all, so a short session costs nothing while a long one leaves
+	 * a fresh snapshot behind. Idle accounts are never touched.
+	 */
+	private refreshServedAccount(slug: string | undefined): void {
+		if (!slug) return;
+		const profile = this.profiles.get(slug);
+		if (!profile) return;
+		this.probes.usage(profile).catch(() => {});
 	}
 
 	private async getModels(profile: Profile): Promise<ModelsSnapshot | null> {
@@ -1236,7 +1246,7 @@ class AcpProxy {
 				this.broadcastAvailableCommands(session);
 				// Prime the usage cache for the account in use so the client's meter has
 				// data. Only the served account is ever read here.
-				this.probes.refreshUsage(profile).catch(() => {});
+				this.probes.usage(profile).catch(() => {});
 				return;
 			} catch (error) {
 				const raw = error instanceof AcpRpcError ? error.rpcError : error;
@@ -1467,6 +1477,7 @@ class AcpProxy {
 		}
 		await this.saveStore();
 		this.releaseCandidates.add(record.profile);
+		this.refreshServedAccount(record.profile);
 		this.respond(request.id, {});
 	}
 
