@@ -6,6 +6,17 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-18
+
+### Fixed
+
+- cache reasoning and publish Gemini-only model catalogs (#13)
+  * fix: cache ACP model reasoning levels per profile
+
+  * fix: show only Gemini releases in model catalogs
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v1.0.1...v1.0.2)
+
 ## [1.0.1] - 2026-11-18
 
 ### Fixed
