@@ -242,6 +242,28 @@ bun install
 ./install.sh       # compiles standalone binaries to ~/.local/bin
 ```
 
+### Updating
+
+```bash
+agy-multi update           # install the latest GitHub release
+agy-multi update --check   # only report what is available
+agy-multi --version        # the version this binary reports
+```
+
+`update` reads the latest release, picks the archive for your platform
+(`agy-multi-darwin-arm64.tar.gz`, `agy-multi-linux-x64.tar.gz`, …), verifies its
+SHA-256 against the release digest (or `SHA256SUMS.txt`), and only then replaces
+`agy-multi` and `agy-multi-acp` in place. The downloaded binary's `--version`
+must match the release before anything is swapped, so a corrupt or mismatched
+archive leaves the installed copy untouched. Running ACP sessions keep the
+previous binary until they restart; profile state under `~/.agy-multi` is never
+modified. `--force` reinstalls the current version.
+
+Bun-global or source installs have no installed binary to replace: `update` says
+so instead of guessing — rebuild a checkout with `./install.sh`, or re-run
+`bun install -g`. For forks and mirrors, point it elsewhere with
+`AGY_MULTI_REPO_SLUG` (and `AGY_MULTI_GITHUB_API` for GitHub Enterprise).
+
 ## Commands
 
 ```bash
@@ -297,6 +319,9 @@ agy-multi run --prompt "review this diff" --clean --skills "git,diagnosing-bugs"
 
 agy-multi run --conversation <id> --prompt "continue"
 agy-multi state
+
+# Update the installed binaries to the latest GitHub release
+agy-multi update [--check] [--force]
 ```
 
 ### Token Usage & Cost Analytics (`usage`)

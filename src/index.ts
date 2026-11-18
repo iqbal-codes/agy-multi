@@ -14,6 +14,8 @@ import { ProbeSync } from "./probe-sync";
 import { SerialQueue } from "./serial-queue";
 import type { Profile, UsageSnapshot } from "./types";
 import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
+import { runUpdateCommand } from "./update";
+import { VERSION } from "./version";
 
 /** Short age for cache lines: `42s`, `7m`, `3h`, `2d`. */
 function ageText(ms: number): string {
@@ -65,6 +67,14 @@ Usage:
                  [--conversation <id>] [--model <id>] [--profile <slug>]
                  [--cwd <dir>] [--json] [--allow-account-pool] [--max-switches <n>]
   agy-multi state
+  agy-multi update [--check] [--force]
+  agy-multi --version
+
+Update:
+  Reads the latest GitHub release, verifies its SHA-256, and replaces the
+  installed agy-multi and agy-multi-acp binaries in place. --check reports
+  without installing; --force reinstalls the same version. Sessions that are
+  already running keep the previous binary until they restart.
 
 Quota:
   quota and multi-usage print the cached snapshot and never start a check on
@@ -160,13 +170,25 @@ async function main(): Promise<void> {
 			weekly: { type: "boolean" },
 			monthly: { type: "boolean" },
 			refresh: { type: "boolean" },
+			check: { type: "boolean" },
+			force: { type: "boolean" },
+			version: { type: "boolean", short: "v" },
 			help: { type: "boolean", short: "h" },
 		},
 	});
 
 	const [command, subcommand, ...rest] = positionals;
+	if (values.version) {
+		console.log(VERSION);
+		return;
+	}
 	if (!command || values.help) {
 		console.log(HELP);
+		return;
+	}
+
+	if (command === "update") {
+		await runUpdateCommand({ check: Boolean(values.check), force: Boolean(values.force) });
 		return;
 	}
 

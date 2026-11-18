@@ -6,6 +6,30 @@ tagged by the release workflow on merge to `main`.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-18
+
+This release lets an installed copy update itself and answer `--version` without
+guessing.
+
+### Added
+
+- `agy-multi update` replaces the installed `agy-multi` and `agy-multi-acp`
+  binaries with the latest GitHub release. It picks the archive for the running
+  platform, verifies its SHA-256 against the release digest (falling back to
+  `SHA256SUMS.txt`), and refuses to install when the downloaded binary does not
+  report the release's version — so a corrupt or mismatched archive leaves the
+  installed copy untouched. `--check` reports without installing; `--force`
+  reinstalls the current version. Running sessions keep the previous binary
+  until they restart, and `~/.agy-multi` state is never touched.
+- `agy-multi --version` prints the version this build reports. `package.json` is
+  inlined at bundle time, so a compiled single-file binary can answer it.
+
+## [0.4.0] - 2026-11-18
+
+This release stops starting a CLI just to read a number: quota and usage come
+from a cached snapshot the proxy keeps for the accounts that actually run, and
+no probe ever fans out across accounts.
+
 ### Changed
 
 - Quota reads are cache-only. `agy-multi quota` and `agy-multi multi-usage`
