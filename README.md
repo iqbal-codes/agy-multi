@@ -282,8 +282,11 @@ agy-multi profile login work --remote
 # Adopt the existing main installation (no login, no canary).
 agy-multi profile add main --home "$HOME" --no-login
 
-# Resync shared MCP servers, skills, and settings to all profiles.
+# Resync shared configuration for all isolated profiles.
 agy-multi profile sync
+
+# Refresh missing or stale reasoning levels for one profile.
+agy-multi profile sync work
 
 agy-multi profile list
 agy-multi profile remove work
@@ -448,6 +451,10 @@ bin\agy-multi-acp.cmd
 
 ## ACP host (t3code, Zed, OMP, any ACP client)
 
+`agy-multi models` and the ACP catalog list the versioned Gemini models that
+Antigravity advertises for your accounts. This includes new Gemini releases
+as they become available to the account pool.
+
 `agy-multi acp` is a stdio ACP server. An ACP host sees **one** Antigravity
 provider backed by your account pool (rotating automatically on
 quota/ban/auth); pass `--sequential` to keep only one account active at a time.
@@ -464,6 +471,11 @@ In t3code: **Settings → Providers → Add provider → Local ACP command**.
 
 `agy-multi acp -- --dangerously-skip-permissions` forwards extra args to the
 `agy acp` child it runs.
+
+After login and on `agy-multi profile sync <slug>`, the wrapper caches the reasoning
+levels advertised by each model. For accounts already set up, run `agy-multi
+profile sync <slug>` for each account you want to refresh, then refresh the provider catalog in your
+ACP client. Catalog requests read this metadata from disk.
 
 For **OMP (Oh My Pi)** or harnesses expecting a dedicated ACP executable:
 ```bash

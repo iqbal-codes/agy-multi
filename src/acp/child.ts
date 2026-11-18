@@ -20,6 +20,7 @@ export interface AcpChildOptions {
 	profile: Profile;
 	agyBin: string;
 	extraArgs: string[];
+	env?: NodeJS.ProcessEnv;
 	log: (message: string) => void;
 	onRequest: (child: AcpChild, request: JsonRpcRequest) => void;
 	onNotification: (child: AcpChild, notification: JsonRpcMessage) => void;
@@ -64,7 +65,7 @@ export class AcpChild {
 			// Own an isolated process group so MCP servers and their descendants
 			// can be reclaimed without signalling the host or another account.
 			detached: process.platform !== "win32",
-			env: profileEnvOf(options.profile),
+			env: profileEnvOf(options.profile, options.env),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",

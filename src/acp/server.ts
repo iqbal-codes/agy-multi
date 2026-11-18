@@ -32,6 +32,7 @@ import {
 	isModelKnownUnsupported,
 	mergeConfigOptionLists,
 	mergeModelLists,
+	readCachedModelReasoning,
 	readCachedModels,
 	reservedProfilesFor,
 	withoutUnsupportedModel,
@@ -47,6 +48,7 @@ import {
 	nextWaitMs,
 } from "./daemon-tasks";
 import { isRecord } from "./guards";
+import { filterModelCatalog } from "./model-catalog";
 import { buildHandoffPrompt, promptToText, type HistoryEntry } from "./prompt";
 import {
 	isNotification,
@@ -290,7 +292,7 @@ class AcpProxy {
 	}
 
 	private respond(id: JsonRpcId, result: unknown): void {
-		this.sendToClient({ jsonrpc: "2.0", id, result });
+		this.sendToClient({ jsonrpc: "2.0", id, result: filterModelCatalog(result) });
 	}
 
 	private respondError(id: JsonRpcId, code: number, message: string, data?: unknown): void {
@@ -498,6 +500,10 @@ class AcpProxy {
 			const augmented = this.buildAvailableCommands(session.cwd, commands);
 			const augmentedUpdate = { ...update, availableCommands: augmented };
 			deliver({ ...outMessage, params: { ...outParams, update: augmentedUpdate } });
+			return;
+		}
+		if (kind === "config_option_update") {
+			deliver({ ...outMessage, params: { ...outParams, update: filterModelCatalog(update) } });
 			return;
 		}
 		deliver(outMessage);
@@ -991,10 +997,21 @@ class AcpProxy {
 		this.probes.refreshModels(profile).catch(() => {});
 	}
 
-	private mergeSessionModelsResult(result: Record<string, unknown>): Record<string, unknown> {
-		const healthySnapshots = [...this.profiles.values()]
-			.filter(p => !p.bannedAt && !p.authRequiredAt && !p.disabled)
-			.map(p => this.modelsCache.get(p.slug)?.snapshot)
+	private async mergeSessionModelsResult(result: Record<string, unknown>, activeProfile: string): Promise<Record<string, unknown>> {
+		const healthy = [...this.profiles.values()].filter(profile => !profile.bannedAt && !profile.authRequiredAt && !profile.disabled);
+		const catalogs = await Promise.all(healthy.map(async profile => {
+			const [disk, reasoning] = await Promise.all([
+				readCachedModels(profile.slug),
+				readCachedModelReasoning(profile.slug),
+			]);
+			const memory = this.modelsCache.get(profile.slug)?.snapshot;
+			return {
+				slug: profile.slug,
+				snapshot: disk && disk.fetchedAt > (memory?.fetchedAt ?? 0) ? disk : memory,
+				reasoning,
+			};
+		}));
+		const healthySnapshots = catalogs.map(catalog => catalog.snapshot)
 			.filter((s): s is ModelsSnapshot => Boolean(s && s.models.length > 0));
 		if (healthySnapshots.length === 0) return result;
 
@@ -1007,12 +1024,34 @@ class AcpProxy {
 			...healthySnapshots.map(s => s.configOptions ?? deriveBaseConfigOptions(s.models)),
 			extracted.configOptions,
 		]);
+		const reasoning = new Map(
+			catalogs.toSorted((a, b) => Number(a.slug === activeProfile) - Number(b.slug === activeProfile))
+				.flatMap(catalog => catalog.reasoning.map(entry => [entry.modelId, entry.meta] as const)),
+		);
+		const cachedReasoningModels = mergedConfigChoices.flatMap(choice => {
+			const meta = reasoning.get(choice.value);
+			return meta ? [{ modelId: choice.value, name: choice.name ?? choice.value, _meta: { ...meta } }] : [];
+		});
 
 		let nextResult: Record<string, unknown> = result;
-		if (mergedAvailable.length > 0 && isRecord(result.models)) {
+		const models = isRecord(result.models) ? result.models : undefined;
+		const modelConfig = Array.isArray(result.configOptions)
+			? result.configOptions.find(opt => isRecord(opt) && opt.id === "model")
+			: undefined;
+		const currentModelId = models?.currentModelId ?? modelConfig?.currentValue;
+		if ((models && mergedAvailable.length > 0) || (cachedReasoningModels.length > 0 && typeof currentModelId === "string")) {
+			const nativeModels = new Map(extracted.models.map(model => [model.modelId, model]));
+			const availableModels = mergeModelLists([mergedAvailable, cachedReasoningModels]).map(model => {
+				const native = nativeModels.get(model.modelId)?._meta;
+				const meta = reasoning.get(model.modelId);
+				const hasNativeReasoning = native?.supportsReasoningEffort === false || Array.isArray(native?.reasoningEfforts);
+				return meta && !hasNativeReasoning
+					? { ...model, _meta: { ...native, ...meta } }
+					: native ? { ...model, _meta: native } : model;
+			});
 			nextResult = {
 				...nextResult,
-				models: { ...result.models, availableModels: mergedAvailable },
+				models: { ...models, currentModelId, availableModels },
 			};
 		}
 		if (mergedConfigChoices.length > 0 && Array.isArray(result.configOptions)) {
@@ -1143,7 +1182,7 @@ class AcpProxy {
 					this.unknownUpdates.delete(key);
 					for (const message of buffered) this.handleAgentNotification(child, message);
 				}
-				this.respond(request.id, { ...this.mergeSessionModelsResult(result), sessionId: proxySessionId });
+				this.respond(request.id, { ...await this.mergeSessionModelsResult(result, profile.slug), sessionId: proxySessionId });
 				this.drainPendingOut(session);
 				this.broadcastAvailableCommands(session);
 				// Prime the usage cache for the account in use so the client's meter has

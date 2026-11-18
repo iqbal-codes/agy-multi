@@ -18,6 +18,8 @@ export interface UsageSnapshot {
 export interface ModelInfo {
 	modelId: string;
 	name?: string;
+	description?: string;
+	_meta?: Record<string, unknown>;
 }
 
 export interface ModelsSnapshot {

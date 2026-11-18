@@ -1,14 +1,15 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
 import { parseAcpProxyOptions } from "./acp/cli-args";
+import { syncProfileModelReasoning } from "./acp/model-reasoning";
 import { runAcpProxy } from "./acp/server";
 import { ensureAgy } from "./setup";
 import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, syncProfiles } from "./profile";
-import { listProfiles, removeProfile } from "./registry";
+import { listProfiles, loadProfile, removeProfile } from "./registry";
 import { runWithFailover, RunFailure } from "./runner";
 import { loadState } from "./state";
 import { formatMultiUsageReport, readCachedUsage } from "./usage";
-import { fetchModels, readCachedModels } from "./models";
+import { fetchModels, isPublicGeminiModel, readCachedModels } from "./models";
 import { MODELS_TTL_MS, PROBE_SPACING_MS } from "./paths";
 import { ProbeSync } from "./probe-sync";
 import { SerialQueue } from "./serial-queue";
@@ -44,6 +45,19 @@ async function primeQuotaAfterLogin(profile: Profile): Promise<void> {
 	console.log(
 		`quota: ${snapshot.windows.map(window => `${window.family} ${window.window} ${window.remainingPct}%`).join(", ")}`,
 	);
+}
+
+async function syncModelReasoning(profile: Profile, force = false): Promise<void> {
+	try {
+		const count = await syncProfileModelReasoning(profile, force);
+		if (count === undefined) {
+			console.log(`reasoning: skipped ${profile.slug}; requires an enabled, authenticated account and the agy CLI`);
+			return;
+		}
+		console.log(`reasoning: ${profile.slug} has cached levels for ${count} model(s)`);
+	} catch {
+		console.error(`reasoning: could not refresh ${profile.slug}; retry with agy-multi profile sync ${profile.slug}`);
+	}
 }
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
@@ -185,7 +199,10 @@ async function main(): Promise<void> {
 						? "ok"
 						: "unknown";
 			console.log(`${profile.slug}\t${profile.email ?? "(no email)"}\t${status}`);
-			if (!values["no-login"]) await primeQuotaAfterLogin(profile);
+			if (!values["no-login"]) {
+				await primeQuotaAfterLogin(profile);
+				await syncModelReasoning(profile, true);
+			}
 			return;
 		}
 		if (subcommand === "login") {
@@ -198,6 +215,7 @@ async function main(): Promise<void> {
 			});
 			console.log(`logged in ${profile.slug}\t${profile.email ?? "(no email)"}`);
 			await primeQuotaAfterLogin(profile);
+			await syncModelReasoning(profile, true);
 			return;
 		}
 		if (subcommand === "list") {
@@ -239,12 +257,17 @@ async function main(): Promise<void> {
 		if (subcommand === "sync") {
 			const slug = rest[0];
 			if (slug) {
-				const ok = await syncProfile(slug);
-				if (!ok) throw new Error(`profile not found or has custom home: ${slug}`);
-				console.log(`synced ${slug}`);
+				const profile = await loadProfile(slug);
+				if (!profile) throw new Error(`profile not found: ${slug}`);
+				if (!profile.home) {
+					if (!(await syncProfile(slug))) throw new Error(`could not sync profile: ${slug}`);
+					console.log(`synced ${slug}`);
+				}
+				await syncModelReasoning(profile);
 			} else {
 				const synced = await syncProfiles();
 				console.log(`synced ${synced.length} profile(s): ${synced.join(", ")}`);
+				console.log("Run agy-multi profile sync <slug> to refresh reasoning for one account.");
 			}
 			return;
 		}
@@ -325,7 +348,9 @@ async function main(): Promise<void> {
 				console.log(`${profile.slug}\t(unavailable)`);
 				continue;
 			}
-			for (const model of snapshot.models) {
+			const models = snapshot.models.filter(model => isPublicGeminiModel(model.modelId));
+			if (!models.length) console.log(`${profile.slug}\t(no Gemini models available)`);
+			for (const model of models) {
 				console.log(`${profile.slug}\t${model.modelId}\t${model.name ?? ""}`);
 			}
 		}
