@@ -246,9 +246,10 @@ bun install
 
 ```bash
 # New isolated account (interactive Google login + generation canary).
+# The first quota snapshot is recorded right after the login check.
 agy-multi profile add work
 
-# Re-authenticate or login to an existing profile
+# Re-authenticate or login to an existing profile (also records a snapshot)
 agy-multi profile login work
 
 # Temporarily disable / enable a profile from rotation

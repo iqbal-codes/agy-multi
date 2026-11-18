@@ -8,6 +8,12 @@ import { LineReader } from "../src/acp/rpc";
 // causes its parent to attempt interactive OAuth. No real browser is used.
 const CLI = String.raw`#!/usr/bin/env bun
 import { writeFileSync } from "node:fs";
+if (process.argv.includes("--login")) {
+  const at = process.argv.indexOf("--log-file");
+  const logPath = at >= 0 ? process.argv[at + 1] : undefined;
+  if (logPath) writeFileSync(logPath, "I] applyAuthResult: email=quota@example.com, authMethod=consumer, quotaProject=\n");
+  process.exit(0);
+}
 if (process.argv.includes("acp")) {
   for await (const chunk of Bun.stdin.stream()) {
     for (const line of new TextDecoder().decode(chunk).trim().split("\n")) {
@@ -250,4 +256,36 @@ describe.skipIf(process.platform === "win32")("quota subprocess lifecycle", () =
 			await rm(root, { recursive: true, force: true });
 		}
 	}, 15000);
+
+	test("a fresh login records the first quota snapshot", async () => {
+		const root = await mkdtemp(join(tmpdir(), "agy-login-quota-"));
+		const cli = join(root, "agy");
+		const home = join(root, "home");
+		await mkdir(home, { recursive: true });
+		await writeFile(cli, CLI);
+		await chmod(cli, 0o755);
+		const proc = Bun.spawn(
+			[process.execPath, join(import.meta.dir, "../src/index.ts"), "profile", "add", "fresh", "--home", home, "--no-canary"],
+			{
+				env: {
+					...process.env,
+					AGY_BIN: cli,
+					AGY_MULTI_ROOT: root,
+					SCENARIO: "normal",
+					STARTED_MARKER: join(root, "started"),
+					BROWSER_MARKER: join(root, "browser"),
+					NEEDS_LOGIN_MARKER: join(root, "needs-login"),
+				},
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+		expect(await proc.exited, err).toBe(0);
+		expect(out).toContain("quota: gemini fiveHour 40%");
+		const snapshot = JSON.parse(await Bun.file(join(root, "profiles", "fresh", "usage.json")).text());
+		expect(snapshot.windows[0].remainingPct).toBe(40);
+		await rm(root, { recursive: true, force: true });
+	}, 20000);
 });

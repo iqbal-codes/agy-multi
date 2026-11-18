@@ -15,6 +15,9 @@ tagged by the release workflow on merge to `main`.
 - Nothing sweeps the account list any more. An account is refreshed when it
   starts serving work and again when that session or child ends, and the cache
   TTL decides whether a probe runs at all; idle accounts are never touched.
+- `agy-multi profile add` and `profile login` record the account's first quota
+  snapshot right after the login check, so a freshly added account already shows
+  its headroom instead of `(no cached usage)`.
 
 ### Fixed
 

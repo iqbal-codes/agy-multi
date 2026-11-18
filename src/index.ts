@@ -26,6 +26,24 @@ function ageText(ms: number): string {
 	return `${Math.round(hours / 24)}d`;
 }
 
+/**
+ * Record the first quota snapshot right after a log in. The account was just
+ * verified, so one probe here means `agy-multi quota` is never empty for an
+ * account the user has open in front of them.
+ */
+async function primeQuotaAfterLogin(profile: Profile): Promise<void> {
+	if (profile.bannedAt || profile.authRequiredAt || profile.disabled) return;
+	const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
+	const snapshot = await probes.refreshUsage(profile).catch(() => null);
+	if (!snapshot || snapshot.windows.length === 0) {
+		console.log(`quota: not recorded yet — \`agy-multi quota --profile ${profile.slug} --refresh\` when needed`);
+		return;
+	}
+	console.log(
+		`quota: ${snapshot.windows.map(window => `${window.family} ${window.window} ${window.remainingPct}%`).join(", ")}`,
+	);
+}
+
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
 
 Usage:
@@ -174,6 +192,7 @@ async function main(): Promise<void> {
 						? "ok"
 						: "unknown";
 			console.log(`${profile.slug}\t${profile.email ?? "(no email)"}\t${status}`);
+			if (!values["no-login"]) await primeQuotaAfterLogin(profile);
 			return;
 		}
 		if (subcommand === "login") {
@@ -185,6 +204,7 @@ async function main(): Promise<void> {
 				canary: !values["no-canary"],
 			});
 			console.log(`logged in ${profile.slug}\t${profile.email ?? "(no email)"}`);
+			await primeQuotaAfterLogin(profile);
 			return;
 		}
 		if (subcommand === "list") {
