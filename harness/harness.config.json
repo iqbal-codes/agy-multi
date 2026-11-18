@@ -1,8 +1,0 @@
-{
-  "static": "bun run typecheck",
-  "unit": "bun run test",
-  "unit_count_pattern": "Tests\\s+(\\d+)\\s+passed|(\\d+)\\s+pass",
-  "required_checks": "none",
-  "protected_paths": "harness/**,.animus/**,.claude/settings.json,.ignore,.agents/skills/**,AGENTS.md",
-  "description": "Ordinary project checks configured by animus setup (typescript-bun)."
-}

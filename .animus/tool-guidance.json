@@ -1,6 +1,0 @@
-{
-  "test": "bun run test",
-  "lint": "bun run typecheck",
-  "typecheck": "bun run typecheck",
-  "verify": "bun run typecheck"
-}
