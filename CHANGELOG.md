@@ -6,6 +6,14 @@ tagged by the release workflow on merge to `main`.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-18
+
+### Changed
+
+- The proxy no longer probes an account when a session closes. The turn-end
+  refresh already covers it, and the extra check only fired for sessions that
+  never did any work.
+
 ## [0.5.0] - 2026-11-18
 
 This release lets an installed copy update itself and answer `--version` without

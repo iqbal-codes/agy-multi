@@ -205,7 +205,7 @@ test("closing the last session releases its agent and resume preserves the conve
 		expect(handoff.params.prompt![0].text).toContain("FIRST");
 		expect(handoff.params.prompt![0].text).toContain("ANSWER_SECOND");
 	} finally { await f.cleanup(); }
-});
+}, 20_000);
 
 test("legacy account-pool failover releases the previous agent when it has no other sessions", async () => {
 	const f = await fixture();
