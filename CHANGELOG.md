@@ -6,6 +6,19 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-18
+
+### Fixed
+
+- **acp**: safe concurrent provisioning and 10s handoff pacing (#12)
+  * fix(acp): make shared conversation provisioning safe under concurrency
+
+  * fix(acp): default handoff pacing to 10 seconds
+
+  * test(acp): cover concurrent shared-store provisioning
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v1.0.0...v1.0.1)
+
 ### Changed
 
 - handoff pacing defaults to 10 seconds instead of 20, for `acp` and `run`;
