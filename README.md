@@ -282,8 +282,11 @@ agy-multi profile login work --remote
 # Adopt the existing main installation (no login, no canary).
 agy-multi profile add main --home "$HOME" --no-login
 
-# Resync shared MCP servers, skills, and settings to all profiles.
+# Resync shared configuration for all isolated profiles.
 agy-multi profile sync
+
+# Refresh missing or stale reasoning levels for one profile.
+agy-multi profile sync work
 
 agy-multi profile list
 agy-multi profile remove work
@@ -464,6 +467,11 @@ In t3code: **Settings → Providers → Add provider → Local ACP command**.
 
 `agy-multi acp -- --dangerously-skip-permissions` forwards extra args to the
 `agy acp` child it runs.
+
+After login and on `agy-multi profile sync <slug>`, the wrapper caches the reasoning
+levels advertised by each model. For accounts already set up, run `agy-multi
+profile sync <slug>` for each account you want to refresh, then refresh the provider catalog in your
+ACP client. Catalog requests read this metadata from disk.
 
 For **OMP (Oh My Pi)** or harnesses expecting a dedicated ACP executable:
 ```bash

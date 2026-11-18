@@ -24,6 +24,7 @@ const argv = Bun.argv.slice(2);
 const home = process.env.HOME ?? "";
 const isPro = home.includes("acct-pro");
 const promptLog = process.env.FAKE_AGY_LOG;
+const probeLog = process.env.FAKE_AGY_PROBE_LOG;
 
 const BASIC_MODELS = [
   { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
@@ -59,6 +60,16 @@ const PRO_CONFIG = [
   },
 ];
 
+function modelConfig(modelId) {
+  const selector = { ...(isPro ? PRO_CONFIG[0] : BASIC_CONFIG[0]), currentValue: modelId };
+  if (!probeLog) return isPro ? PRO_CONFIG : BASIC_CONFIG;
+  const levels = modelId === "gemini-4-hydrogen" ? ["medium", "high"] : ["low", "high"];
+  return [selector, {
+    id: "thinking", name: "Thinking", category: "thought_level", type: "select",
+    currentValue: levels[0], options: levels.map(value => ({ value, name: value.toUpperCase() })),
+  }];
+}
+
 if (argv.includes("/usage")) {
   const pct = isPro ? "70%" : "95%";
   process.stdout.write(JSON.stringify({
@@ -82,6 +93,11 @@ if (argv[0] === "models") {
 if (argv[0] !== "acp") {
   process.stderr.write("unexpected args: " + argv.join(" ") + "\\n");
   process.exit(2);
+}
+
+if (argv.includes("--disable-slash-commands")) {
+  process.stderr.write("unsupported ACP flag: --disable-slash-commands\\n");
+  process.exit(1);
 }
 
 const sessions = new Map();
@@ -119,7 +135,7 @@ lines.on("line", line => {
         currentModelId: defaultModel,
         availableModels: isPro ? PRO_MODELS : BASIC_MODELS,
       },
-      configOptions: isPro ? PRO_CONFIG : BASIC_CONFIG,
+      configOptions: modelConfig((isPro ? PRO_CONFIG[0] : BASIC_CONFIG[0]).currentValue),
     }});
     return;
   }
@@ -143,8 +159,17 @@ lines.on("line", line => {
       }
       const s = sessions.get(message.params?.sessionId);
       if (s) s.modelId = value;
+      if (probeLog) appendFileSync(probeLog, value + "\\n");
+      if (probeLog && value === "gemini-4-hydrogen") {
+        send({ jsonrpc: "2.0", id: message.id, result: {} });
+        send({ jsonrpc: "2.0", method: "session/update", params: {
+          sessionId: message.params.sessionId,
+          update: { sessionUpdate: "config_option_update", configOptions: modelConfig(value) },
+        }});
+        return;
+      }
     }
-    send({ jsonrpc: "2.0", id: message.id, result: { configOptions: isPro ? PRO_CONFIG : BASIC_CONFIG } });
+    send({ jsonrpc: "2.0", id: message.id, result: { configOptions: modelConfig(message.params?.value) } });
     return;
   }
   if (message.method === "session/prompt") {
@@ -170,7 +195,7 @@ lines.on("line", line => {
 });
 `;
 
-async function setupTieredEnv() {
+async function setupTieredEnv(adopted = false) {
 	const root = await mkdtemp(join(tmpdir(), "agy-multi-models-acp-"));
 	const projectRoot = join(import.meta.dir, "..");
 	const fake = join(root, "fake-agy");
@@ -179,7 +204,8 @@ async function setupTieredEnv() {
 	for (const slug of ["acct-basic", "acct-pro"]) {
 		const dir = join(root, "profiles", slug);
 		await mkdir(dir, { recursive: true });
-		await writeFile(join(dir, "profile.json"), JSON.stringify({ slug, createdAt: new Date().toISOString() }));
+		const home = adopted ? join(dir, "home") : undefined;
+		await writeFile(join(dir, "profile.json"), JSON.stringify({ slug, home, createdAt: new Date().toISOString() }));
 	}
 	// Pre-seed usage so acct-basic (95%) ranks ahead of acct-pro (70%) when model capability is ignored
 	await writeFile(
@@ -212,11 +238,11 @@ async function setupTieredEnv() {
 	return { root, projectRoot, fake, promptLog };
 }
 
-function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: string) {
+function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: string, probeLog?: string) {
 	// Cross-profile model routing is enabled in the default account pool.
 	const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--switch-delay", "0"], {
 		cwd: projectRoot,
-		env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: promptLog },
+		env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_LOG: promptLog, FAKE_AGY_PROBE_LOG: probeLog },
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -249,6 +275,86 @@ function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: 
 }
 
 describe("ACP proxy model capability routing", () => {
+	test("session/new reads reasoning cached by another process and matches the model selector IDs", async () => {
+		const { root, projectRoot, fake, promptLog } = await setupTieredEnv(true);
+		const { proxy, send } = spawnProxy(projectRoot, root, fake, promptLog);
+		try {
+			await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
+			const create = () => send<{
+				result: { models: { currentModelId: string; availableModels: Array<{ modelId: string; name?: string; _meta?: unknown }> } };
+			}>("session/new", { cwd: root, mcpServers: [] });
+			const initial = await create();
+			const high = { reasoningEfforts: [{ value: "high", label: "High" }], reasoningEffort: "high" };
+			await writeFile(join(root, "profiles", "acct-pro", "models.json"), JSON.stringify({
+				profile: "acct-pro",
+				fetchedAt: Date.now(),
+				models: [{ modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" }],
+				configOptions: [{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }],
+			}));
+			await writeFile(join(root, "profiles", "acct-pro", "model-reasoning.json"), JSON.stringify([
+				{ modelId: "gemini-4-hydrogen", fetchedAt: Date.now(), meta: high },
+			]));
+			const next = await create();
+			expect(next.result.models.currentModelId).toBe(initial.result.models.currentModelId);
+			expect(next.result.models.availableModels).toContainEqual({
+				modelId: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", _meta: high,
+			});
+			expect(await Bun.file(promptLog).exists()).toBe(false);
+		} finally {
+			proxy.kill();
+			await proxy.exited;
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("profile sync probes reasoning only for the named account and caches the levels", async () => {
+		const { root, projectRoot, fake, promptLog } = await setupTieredEnv(true);
+		const probeLog = join(root, "model-switches.log");
+		const { proxy, send } = spawnProxy(projectRoot, root, fake, promptLog, probeLog);
+		const sync = async (slug?: string) => {
+			const proc = Bun.spawn([process.execPath, join(projectRoot, "src/index.ts"), "profile", "sync", ...(slug ? [slug] : [])], {
+				cwd: projectRoot,
+				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_PROBE_LOG: probeLog },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const stderr = await new Response(proc.stderr).text();
+			expect(await proc.exited, stderr).toBe(0);
+		};
+		try {
+			await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
+			await sync();
+			expect(await Bun.file(probeLog).exists()).toBe(false);
+			expect(await Bun.file(join(root, "profiles", "acct-basic", "model-reasoning.json")).exists()).toBe(false);
+			await sync("acct-pro");
+			await sync("acct-pro");
+			const created = await send<{
+				result: {
+					models: { availableModels: Array<{ modelId: string; _meta?: unknown }> };
+					configOptions: Array<{ category: string; currentValue: string }>;
+				};
+			}>("session/new", { cwd: root, mcpServers: [] });
+			const models = created.result.models.availableModels;
+			expect(created.result.configOptions.find(option => option.category === "model")?.currentValue).toBe("gemini-3.8-flash");
+			expect(created.result.configOptions.find(option => option.category === "thought_level")?.currentValue).toBe("low");
+			expect(models.find(model => model.modelId === "gemini-4-hydrogen")?._meta).toEqual({
+				reasoningEfforts: [{ value: "medium", label: "MEDIUM" }, { value: "high", label: "HIGH" }],
+				reasoningEffort: "medium",
+			});
+			expect(models.find(model => model.modelId === "gemini-4-argon")?._meta).toEqual({
+				reasoningEfforts: [{ value: "low", label: "LOW" }, { value: "high", label: "HIGH" }],
+				reasoningEffort: "low",
+			});
+			expect((await readFile(probeLog, "utf8")).trim().split("\n")).toEqual(["gemini-4-hydrogen", "gemini-3.8-flash"]);
+			expect(await Bun.file(join(root, "profiles", "acct-basic", "model-reasoning.json")).exists()).toBe(false);
+			expect(await Bun.file(promptLog).exists()).toBe(false);
+		} finally {
+			proxy.kill();
+			await proxy.exited;
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test(
 		"session/new merges cached models across profiles and session/set_model switches to a capable profile",
 		async () => {

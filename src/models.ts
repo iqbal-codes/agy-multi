@@ -4,6 +4,36 @@ import { profileEnvOf } from "./registry";
 import type { ModelConfigOption, ModelInfo, ModelsSnapshot, Profile } from "./types";
 import { readJson, writeJsonAtomic } from "./fs-utils";
 import { hasValidAuth } from "./profile";
+import { isRecord } from "./acp/guards";
+
+export interface ModelReasoningMeta {
+	reasoningEfforts?: Array<{ value: string; label: string }>;
+	reasoningEffort?: string;
+	supportsReasoningEffort?: false;
+}
+
+export interface ModelReasoningEntry {
+	modelId: string;
+	fetchedAt: number;
+	meta: ModelReasoningMeta;
+}
+
+function modelReasoningPath(slug: string): string {
+	return join(profileDir(slug), "model-reasoning.json");
+}
+
+export async function readCachedModelReasoning(slug: string): Promise<ModelReasoningEntry[]> {
+	const entries = await readJson<unknown>(modelReasoningPath(slug), []);
+	if (!Array.isArray(entries)) return [];
+	return entries.filter(entry =>
+		isRecord(entry) && typeof entry.modelId === "string" &&
+		typeof entry.fetchedAt === "number" && isRecord(entry.meta),
+	) as ModelReasoningEntry[];
+}
+
+export async function writeCachedModelReasoning(slug: string, entries: ModelReasoningEntry[]): Promise<void> {
+	await writeJsonAtomic(modelReasoningPath(slug), entries);
+}
 
 const EFFORT_SUFFIX_RE = /^-(low|medium|high|xhigh|max|thinking)$/i;
 
@@ -127,17 +157,19 @@ export function withoutUnsupportedModel(
 }
 
 export function mergeModelLists(lists: Array<ModelInfo[] | undefined>): ModelInfo[] {
-	const merged: ModelInfo[] = [];
-	const seen = new Set<string>();
+	const merged = new Map<string, ModelInfo>();
 	for (const list of lists) {
 		if (!list) continue;
 		for (const item of list) {
-			if (!item.modelId || seen.has(item.modelId)) continue;
-			seen.add(item.modelId);
-			merged.push(item);
+			if (!item.modelId) continue;
+			const existing = merged.get(item.modelId);
+			merged.set(item.modelId, existing === undefined ? item : {
+				...item,
+				...existing,
+			});
 		}
 	}
-	return merged;
+	return [...merged.values()];
 }
 
 export function mergeConfigOptionLists(lists: Array<ModelConfigOption[] | undefined>): ModelConfigOption[] {
@@ -181,11 +213,12 @@ export function extractAcpModelsFromResult(result: Record<string, unknown>): {
 				if (!entry || typeof entry !== "object") continue;
 				const rec = entry as Record<string, unknown>;
 				if (typeof rec.modelId !== "string" || !rec.modelId) continue;
-				models.push(
-					typeof rec.name === "string" && rec.name
-						? { modelId: rec.modelId, name: rec.name }
-						: { modelId: rec.modelId },
-				);
+				models.push({
+					modelId: rec.modelId,
+					...(typeof rec.name === "string" && rec.name ? { name: rec.name } : {}),
+					...(typeof rec.description === "string" ? { description: rec.description } : {}),
+					...(isRecord(rec._meta) ? { _meta: rec._meta } : {}),
+				});
 			}
 		}
 	}
@@ -196,20 +229,25 @@ export function extractAcpModelsFromResult(result: Record<string, unknown>): {
 			if (!opt || typeof opt !== "object") continue;
 			const rec = opt as Record<string, unknown>;
 			if (rec.id !== "model" || !Array.isArray(rec.options)) continue;
-			for (const choice of rec.options) {
-				if (!choice || typeof choice !== "object") continue;
-				const c = choice as Record<string, unknown>;
-				if (typeof c.value !== "string" || !c.value) continue;
-				configOptions.push(
-					typeof c.name === "string" && c.name
-						? { value: c.value, name: c.name }
-						: { value: c.value },
-				);
-			}
+			configOptions.push(...readAcpSelectChoices(rec.options));
 		}
 	}
 
 	return { models, configOptions };
+}
+
+/** ACP select options may be flat or grouped. */
+export function readAcpSelectChoices(options: unknown): ModelConfigOption[] {
+	if (!Array.isArray(options)) return [];
+	return options.flatMap(option => {
+		if (!isRecord(option)) return [];
+		if (Array.isArray(option.options)) return readAcpSelectChoices(option.options);
+		if (typeof option.value !== "string" || !option.value) return [];
+		return [{
+			value: option.value,
+			...(typeof option.name === "string" && option.name ? { name: option.name } : {}),
+		}];
+	});
 }
 
 export async function fetchModels(
