@@ -6,6 +6,8 @@ tagged by the release workflow on merge to `main`.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-18
+
 ### Changed
 
 - The proxy no longer probes an account when a session closes. The turn-end
