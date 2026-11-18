@@ -94,6 +94,12 @@ export const USAGE_TTL_MS = 5 * 60_000;
 /** Model capability cache TTL (12 hours). */
 export const MODELS_TTL_MS = 12 * 60 * 60_000;
 
+/**
+ * Pause between two usage/model probes. Accounts sync one at a time, and this
+ * keeps consecutive probes from landing back to back.
+ */
+export const PROBE_SPACING_MS = 1_500;
+
 export function profileDir(slug: string): string {
 	const root = process.env.AGY_MULTI_ROOT ?? ROOT;
 	return join(root, "profiles", slug);

@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases are
 tagged by the release workflow on merge to `main`.
 
+## [Unreleased]
+
+### Changed
+
+- Quota reads are cache-only. `agy-multi quota` and `agy-multi multi-usage`
+  print the snapshot the proxy already synced (milliseconds, no child process);
+  `--refresh` re-probes on demand, still one account at a time. A cold cache says
+  so instead of quietly starting a check.
+- Nothing sweeps the account list any more. An account is refreshed when it
+  starts serving work and again when that session or child ends, and the cache
+  TTL decides whether a probe runs at all; idle accounts are never touched.
+- `agy-multi profile add` and `profile login` record the account's first quota
+  snapshot right after the login check, so a freshly added account already shows
+  its headroom instead of `(no cached usage)`.
+
+### Fixed
+
+- Nothing probes more than one account at a time. Ranking, reservation, the
+  ACP `/multi-usage` command, and one-shot runs read caches and hand refreshes
+  to a single serial queue, replacing the `Promise.all` fan-outs that could boot
+  a CLI per account at once.
+- A quota probe that hits the CLI's interactive-login fallback is killed at once
+  and its account is marked signed-out, instead of hanging until the 30 s
+  timeout while a browser login may start. The marker is only honoured past the
+  probe's own start offset, so an old line cannot poison a healthy check.
+
 ## [0.3.0] - 2026-11-17
 
 This release makes one account per process the default, keeps the previous
