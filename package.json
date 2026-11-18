@@ -1,6 +1,6 @@
 {
   "name": "agy-multi",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Unofficial single-account ACP proxy for Google Antigravity CLI (agy), with isolated per-account HOMEs and quota diagnostics",
   "type": "module",
   "license": "MIT",
