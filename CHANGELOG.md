@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases are
 tagged by the release workflow on merge to `main`.
 
+## [Unreleased]
+
+### Added
+
+- `agy-multi update` replaces the installed `agy-multi` and `agy-multi-acp`
+  binaries with the latest GitHub release. It picks the archive for the running
+  platform, verifies its SHA-256 against the release digest (falling back to
+  `SHA256SUMS.txt`), and refuses to install when the downloaded binary does not
+  report the release's version — so a corrupt or mismatched archive leaves the
+  installed copy untouched. `--check` reports without installing; `--force`
+  reinstalls the current version. Running sessions keep the previous binary
+  until they restart, and `~/.agy-multi` state is never touched.
+- `agy-multi --version` prints the version this build reports. `package.json` is
+  inlined at bundle time, so a compiled single-file binary can answer it.
+
 ## [0.3.0] - 2026-11-17
 
 This release makes one account per process the default, keeps the previous

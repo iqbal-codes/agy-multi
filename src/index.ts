@@ -11,6 +11,8 @@ import { fetchUsage, formatMultiUsageReport } from "./usage";
 import { fetchModels, readCachedModels } from "./models";
 import { MODELS_TTL_MS } from "./paths";
 import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
+import { runUpdateCommand } from "./update";
+import { VERSION } from "./version";
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
 
@@ -33,6 +35,14 @@ Usage:
                  [--conversation <id>] [--model <id>] [--profile <slug>]
                  [--cwd <dir>] [--json] [--allow-account-pool] [--max-switches <n>]
   agy-multi state
+  agy-multi update [--check] [--force]
+  agy-multi --version
+
+Update:
+  Reads the latest GitHub release, verifies its SHA-256, and replaces the
+  installed agy-multi and agy-multi-acp binaries in place. --check reports
+  without installing; --force reinstalls the same version. Sessions that are
+  already running keep the previous binary until they restart.
 
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
@@ -122,13 +132,25 @@ async function main(): Promise<void> {
 			weekly: { type: "boolean" },
 			monthly: { type: "boolean" },
 			refresh: { type: "boolean" },
+			check: { type: "boolean" },
+			force: { type: "boolean" },
+			version: { type: "boolean", short: "v" },
 			help: { type: "boolean", short: "h" },
 		},
 	});
 
 	const [command, subcommand, ...rest] = positionals;
+	if (values.version) {
+		console.log(VERSION);
+		return;
+	}
 	if (!command || values.help) {
 		console.log(HELP);
+		return;
+	}
+
+	if (command === "update") {
+		await runUpdateCommand({ check: Boolean(values.check), force: Boolean(values.force) });
 		return;
 	}
 
