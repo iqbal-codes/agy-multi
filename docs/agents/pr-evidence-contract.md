@@ -92,10 +92,10 @@ None.
 
 ## Release Bump Classification
 
-When creating or updating a PR targeting `main`, classify the semver impact from the diff and apply the matching GitHub PR label (used by `.github/workflows/release.yml` on merge):
+When creating or updating a PR targeting `main`, classify the semver impact from the diff and apply the matching GitHub PR label (used by `src/release-plan.ts` and `.github/workflows/release.yml` when aggregating unreleased changes on `main` for the next release):
 
 - `release:major`: Breaking change to CLI commands/flags, persisted state/session schema, or public contracts.
 - `release:minor`: Backward-compatible new CLI command, flag, or user-visible feature.
 - *(no label)*: `patch` — bug fix, refactor, docs, chore, or test-only change.
 
-Ensure the label exists before attaching (`gh label create release:minor --color 0e8a16 --force` / `release:major --color d93f0b --force`), and include `[minor]` or `[major]` in the PR title when squash-merging.
+Ensure the label exists before attaching (`gh label create release:minor --color 0e8a16 --force` / `release:major --color d93f0b --force`). Normal PR merges accumulate on `main`; releases are published by merging a Release PR (`chore(release): vX.Y.Z`) or triggering `.github/workflows/release.yml` via `workflow_dispatch`.

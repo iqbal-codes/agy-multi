@@ -13,7 +13,9 @@
     "build": "bun build --compile --minify src/index.ts --outfile dist/agy-multi && bun build --compile --minify src/acp-bin.ts --outfile dist/agy-multi-acp",
     "acp": "bun run src/index.ts acp",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "release:plan": "bun src/release-plan.ts plan",
+    "release:prepare": "bun src/release-plan.ts prepare"
   },
   "repository": {
     "type": "git",

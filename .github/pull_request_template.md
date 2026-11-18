@@ -4,5 +4,5 @@
 
 ## Release Bump
 
-<!-- Automatically read by .github/workflows/release.yml on merge to main: -->
+<!-- Read by .github/workflows/pr-release.yml and aggregated on the next release: -->
 <!-- Apply label `release:major` (breaking), `release:minor` (new feature), or leave unlabeled for `patch`. -->
