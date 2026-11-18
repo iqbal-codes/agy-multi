@@ -85,7 +85,7 @@ Quota:
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
   --compaction-threshold <tokens> Auto-compacts conversation when context reaches this limit (default: 300000, 0 to disable).
-  --switch-delay <seconds>       Pause before handing a turn to another account (default: 20).
+  --switch-delay <seconds>       Pause before handing a turn to another account (default: 10).
   --handoff-context <chars>      Cap the transcript replayed when a conversation cannot be resumed (default: all of it).
   --sequential                   Keep only one account active at a time; no cross-account probing.
 
@@ -376,7 +376,7 @@ async function main(): Promise<void> {
 				onlyProfile: values.profile,
 				switchDelayMs: values["switch-delay"]
 					? Math.round(Number(values["switch-delay"]) * 1000)
-					: 20_000,
+					: 10_000,
 				clean: Boolean(values.clean || values["no-skills"]),
 				systemPrompt: values["system-prompt"],
 				appendSystemPrompt: values["append-system-prompt"],

@@ -6,6 +6,18 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+### Changed
+
+- handoff pacing defaults to 10 seconds instead of 20, for `acp` and `run`;
+  `--switch-delay <seconds>` still overrides it and `0` disables the pause.
+
+### Fixed
+
+- `agy-multi acp` no longer dies when concurrent agents provision the same
+  profile HOME: the shared conversation store tolerated neither a competing
+  `rename` nor a competing `symlink`, so the loser exited 1 and ACP clients
+  reported a failed test session instead of the real error.
+
 ## [1.0.0] - 2026-11-18
 
 ### Breaking Changes

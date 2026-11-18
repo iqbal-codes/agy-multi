@@ -25,12 +25,30 @@ export function sharedConversationsRoot(root = process.env.AGY_MULTI_ROOT || ROO
 	return join(root, "shared", "gemini");
 }
 
+/** In-flight provisioning per HOME, so two callers in one process never race. */
+const provisioning = new Map<string, Promise<void>>();
+
 /**
  * Points one profile HOME's conversation artifacts at the shared store, carrying
  * over whatever that HOME already had. Running this twice is a no-op; a HOME that
  * already shares the store is left untouched.
+ *
+ * Callers serialize per HOME here because an ACP client can start several agents
+ * at once; separate processes are covered by the tolerant steps below.
  */
-export async function linkSharedConversations(home: string, root?: string): Promise<void> {
+export function linkSharedConversations(home: string, root?: string): Promise<void> {
+	const key = `${home}\0${root ?? ""}`;
+	const previous = provisioning.get(key) ?? Promise.resolve();
+	const run = previous.then(() => provisionSharedConversations(home, root));
+	const settled = run.catch(() => undefined);
+	provisioning.set(key, settled);
+	void settled.then(() => {
+		if (provisioning.get(key) === settled) provisioning.delete(key);
+	});
+	return run;
+}
+
+async function provisionSharedConversations(home: string, root?: string): Promise<void> {
 	const shared = sharedConversationsRoot(root);
 	for (const entry of CONVERSATION_ENTRIES) {
 		const source = join(shared, entry.path.replace(/^\.gemini\//, ""));
@@ -46,22 +64,39 @@ export async function linkSharedConversations(home: string, root?: string): Prom
 	}
 }
 
+/** Staging names stay unique per process, so two provisioners never share one. */
+let stagingCounter = 0;
+
 /**
  * Links with a relative target so the whole root can be moved (as `~/.agy` was,
  * to `~/.agy-multi`) without leaving every profile HOME pointing at a path that
  * no longer exists. Windows junctions need an absolute target.
  */
 async function linkToShared(link: string, source: string, dir: boolean): Promise<void> {
-	const existing = await lstat(link).catch(() => null);
-	if (existing?.isSymbolicLink()) {
-		const resolved = await realpath(link).catch(() => null);
-		const expected = await realpath(source).catch(() => null);
-		if (resolved && expected && resolved === expected) return;
-	}
-	await mkdir(dirname(link), { recursive: true });
-	await rm(link, { recursive: true, force: true });
+	if (await linkedTo(link, source)) return;
 	const target = process.platform === "win32" ? source : relative(dirname(link), source);
-	await symlink(target, link, dir ? (process.platform === "win32" ? "junction" : "dir") : "file");
+	const kind = dir ? (process.platform === "win32" ? "junction" : "dir") : "file";
+	await mkdir(dirname(link), { recursive: true });
+	// Build the link beside its destination and rename it into place: `rename` is
+	// atomic, so a concurrent provisioner of the same HOME never observes (or
+	// trips over) a link that is still being created.
+	const staging = join(dirname(link), `.${basename(link)}.${process.pid}.${stagingCounter++}.tmp`);
+	await rm(staging, { force: true });
+	await symlink(target, staging, kind);
+	try {
+		await rename(staging, link);
+	} catch (error) {
+		await rm(staging, { force: true });
+		// Windows cannot replace an existing entry with a rename.
+		if (!(await linkedTo(link, source))) throw error;
+	}
+}
+
+/** True when `link` already resolves to the shared `source`. */
+async function linkedTo(link: string, source: string): Promise<boolean> {
+	const resolved = await realpath(link).catch(() => null);
+	const expected = await realpath(source).catch(() => null);
+	return Boolean(resolved && expected && resolved === expected);
 }
 
 /**
@@ -72,42 +107,62 @@ async function mergeIntoShared(link: string, source: string, shared: string): Pr
 	const linkStat = await lstat(link).catch(() => null);
 	if (!linkStat) return true;
 	if (linkStat.isSymbolicLink()) {
-		const current = await realpath(link).catch(() => null);
-		const expected = await realpath(source).catch(() => null);
-		if (current && expected && current === expected) return true;
+		if (await linkedTo(link, source)) return true;
 		// A dangling link has nothing to preserve, so it is ours to repoint.
-		if (!current) return true;
-		return false;
+		return (await realpath(link).catch(() => null)) === null;
 	}
 
 	const sourceStat = await lstat(source).catch(() => null);
 	if (!sourceStat) {
 		await mkdir(dirname(source), { recursive: true });
-		await rename(link, source);
+		await moveIntoShared(link, source);
 		return true;
 	}
 	if (linkStat.isDirectory() && sourceStat.isDirectory()) {
-		for (const name of await readdir(link)) {
+		const names = await readdir(link).catch(() => []);
+		for (const name of names) {
 			const from = join(link, name);
 			const to = join(source, name);
 			if (await lstat(to).catch(() => null)) {
 				// Two accounts wrote the same conversation id; keep the shared one
 				// aside instead of deleting either.
-				await quarantine(from, shared);
+				await quarantineIfPresent(from, shared);
 				continue;
 			}
-			await rename(from, to);
+			await moveIntoShared(from, to);
 		}
 		await rm(link, { recursive: true, force: true });
 		return true;
 	}
 	if (linkStat.isFile() && sourceStat.isFile() && link.endsWith(".jsonl")) {
-		await appendFile(source, await readFile(link));
+		// A peer may have appended and removed it first; appending nothing is correct.
+		const content = await readFile(link).catch(() => null);
+		if (content) await appendFile(source, content);
 		await rm(link, { force: true });
 		return true;
 	}
 	await quarantine(link, shared);
 	return true;
+}
+
+/**
+ * A concurrent provisioner of the same HOME may move the same artifact first,
+ * which surfaces as ENOENT (source gone) or EEXIST/ENOTEMPTY (destination already
+ * holds it). Both leave the artifact in the shared store, which is the point.
+ */
+async function moveIntoShared(from: string, to: string): Promise<void> {
+	try {
+		await rename(from, to);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "ENOENT" && code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
+	}
+}
+
+/** Quarantines a collision unless a peer already moved the artifact away. */
+async function quarantineIfPresent(path: string, shared: string): Promise<void> {
+	if (!(await lstat(path).catch(() => null))) return;
+	await quarantine(path, shared);
 }
 
 /** Preserves an artifact that cannot be merged, instead of dropping it. */

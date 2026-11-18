@@ -73,7 +73,7 @@ import {
  * Default pause between account handoffs in pool mode. Pacing only: it keeps a
  * fresh account from absorbing a burst the instant the previous one ran out.
  */
-const DEFAULT_SWITCH_DELAY_MS = 20_000;
+const DEFAULT_SWITCH_DELAY_MS = 10_000;
 /** `0` replays the whole conversation: a handoff must not rewrite what the user saw. */
 const DEFAULT_HANDOFF_CONTEXT_CHARS = 0;
 
@@ -2086,6 +2086,8 @@ class AcpProxy {
 }
 
 export async function runAcpProxy(options: AcpProxyOptions = {}): Promise<void> {
+	// Provisioning failures stay fatal: a keychain that cannot be unlocked must be
+	// reported, never silently skipped. The shared store is race-tolerant instead.
 	await syncProfiles();
 	const proxy = new AcpProxy(options);
 	await proxy.start();

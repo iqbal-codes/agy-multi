@@ -68,6 +68,24 @@ describe("shared conversation store", () => {
 		expect(await readdir(join(root, "shared", "gemini", "migrated"))).toContain("conv-1.db");
 	});
 
+	test("provisions the same HOME concurrently without failing", async () => {
+		const root = await mkdtemp(join(tmpdir(), "agy-store-"));
+		const a = await seedHome(root, "a", {
+			".gemini/antigravity-cli/brain/conv-1/transcript.jsonl": "TURN_A\n",
+			".gemini/antigravity-cli/conversations/conv-1.db": "DB_A",
+		});
+
+		// Every agent process provisions every profile HOME, and a client may start
+		// several agents at once: the same HOME must not provision twice into a
+		// half-moved state (ENOENT/EEXIST) that kills the process.
+		await Promise.all([linkSharedConversations(a, root), linkSharedConversations(a, root), linkSharedConversations(a, root)]);
+
+		expect(await readFile(join(a, ".gemini/antigravity-cli/brain/conv-1/transcript.jsonl"), "utf8")).toBe("TURN_A\n");
+		expect(await realpath(join(a, ".gemini/antigravity-cli/conversations"))).toBe(
+			await realpath(join(root, "shared", "gemini", "antigravity-cli", "conversations")),
+		);
+	});
+
 	test("relative links survive moving the whole root", async () => {
 		const root = await mkdtemp(join(tmpdir(), "agy-store-"));
 		const a = await seedHome(root, "a", { ".gemini/antigravity-cli/brain/conv-1/transcript.jsonl": "TURN_A\n" });
