@@ -1477,7 +1477,6 @@ class AcpProxy {
 		}
 		await this.saveStore();
 		this.releaseCandidates.add(record.profile);
-		this.refreshServedAccount(record.profile);
 		this.respond(request.id, {});
 	}
 
