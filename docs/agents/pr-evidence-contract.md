@@ -1,7 +1,7 @@
 # Canonical PR Evidence and Review Contract
 
 - **Status:** Active
-- **Last verified:** 2026-11-10
+- **Last verified:** 2026-11-18
 
 Authoritative specification for human-friendly PR bodies (`.agents/skills/pr/SKILL.md`), Before/After captures, inline diff findings, and status comments across Animus.
 
@@ -90,12 +90,6 @@ None.
 - **Quiet When Clean (`approved` / `merged`)**: When QA and Code Review pass with zero findings, the PR review comment is a concise 3–5 line LGTM summary with Auto-Merge / Critical Impact gate status.
 - **Sharp When Fixing (`sent-back`)**: When the Code Reviewer identifies defects on specific diff lines (`L<line>:`), the host publishes inline GitHub PR review comments directly on the affected `file` and `line` (with optional ````suggestion```` blocks) plus a summary checklist at the bottom of the PR.
 
-## Release Bump Classification
+## Releases
 
-When creating or updating a PR targeting `main`, classify the semver impact from the diff and apply the matching GitHub PR label (used by `src/release-plan.ts` and `.github/workflows/release.yml` when aggregating unreleased changes on `main` for the next release):
-
-- `release:major`: Breaking change to CLI commands/flags, persisted state/session schema, or public contracts.
-- `release:minor`: Backward-compatible new CLI command, flag, or user-visible feature.
-- *(no label)*: `patch` — bug fix, refactor, docs, chore, or test-only change.
-
-Ensure the label exists before attaching (`gh label create release:minor --color 0e8a16 --force` / `release:major --color d93f0b --force`). Normal PR merges accumulate on `main`; releases are published by merging a Release PR (`chore(release): vX.Y.Z`) or triggering `.github/workflows/release.yml` via `workflow_dispatch`.
+Releases are cut only by running `.github/workflows/release.yml` via `workflow_dispatch`. Merged commits accumulate on `main` until a maintainer dispatches the workflow with `bump=auto|patch|minor|major` or an explicit `version`; the workflow derives the next version from Conventional Commit titles (`feat:`, `feat!:`, `fix:`), updates `package.json` and `CHANGELOG.md`, tags `vX.Y.Z`, builds the binaries, and publishes the GitHub Release. There are no Release PRs and no release labels.

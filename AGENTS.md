@@ -17,7 +17,7 @@
 
 ## Domain & Workflow Documentation
 
-- **PR & Evidence Contract**: Read `docs/agents/pr-evidence-contract.md` for canonical PR bodies, release bump labels (`release:minor` / `release:major`), evidence matrices, Before/After captures, and finding rechecks.
+- **PR & Evidence Contract**: Read `docs/agents/pr-evidence-contract.md` for canonical PR bodies, evidence matrices, Before/After captures, and finding rechecks.
 - **Issue Tracker, Dependencies & Triage Labels**: Read `docs/agents/issue-tracker.md` for `gh` conventions, `Depends on:` rules, and canonical triage labels (`ready-for-agent`, `needs-info`, `ready-for-human`, `needs-triage`, `wontfix`, `spec`, `needs-owner`). Labels are visibility hints; admission is frozen at import and dependency release requires verified lineage, never issue closure.
 - **Domain Models & ADRs**: Read `docs/agents/domain.md`, `GLOSSARY.md`, and `docs/adr/` before modifying domain models or architectural boundaries.
 - **Document Lifecycle**: `docs/README.md` indexes every document with `Status: Active|Draft|Historical|Superseded`. Implement only from `Active`; treat `Historical` and `Superseded` as provenance, follow the named replacement for superseded work, and never add an unindexed file under `docs/`.

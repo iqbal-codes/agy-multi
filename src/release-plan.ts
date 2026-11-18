@@ -1,6 +1,6 @@
 /**
- * Deterministic release planning, changelog generation, and Release PR detection
- * shared by local scripts, the `/release` skill, and GitHub Actions workflows.
+ * Deterministic release planning and changelog generation shared by local
+ * scripts, the `/release` skill, and the GitHub Actions release workflow.
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -12,7 +12,6 @@ export interface RangeCommit {
 	sha?: string;
 	subject: string;
 	body?: string;
-	labels?: readonly string[];
 }
 
 export interface ParsedConventionalCommit {
@@ -48,18 +47,6 @@ export function deriveBump(title: string, body = ""): ReleaseBump {
 	return match[1]!.toLowerCase() === "feat" ? "minor" : "patch";
 }
 
-/** Explicit input beats labels, labels beat the commit message, default patch. */
-export function pickBump(input: string, labels: string, commitMessage: string): ReleaseBump {
-	const bumpInput = (input ?? "").trim().toLowerCase();
-	if (bumpInput === "major" || bumpInput === "minor" || bumpInput === "patch") return bumpInput;
-	const names = new Set((labels ?? "").split(",").map(name => name.trim()));
-	if (names.has("release:major")) return "major";
-	if (names.has("release:minor")) return "minor";
-	if ((commitMessage ?? "").includes("[major]")) return "major";
-	if ((commitMessage ?? "").includes("[minor]")) return "minor";
-	return "patch";
-}
-
 export function maxBump(a: ReleaseBump, b: ReleaseBump): ReleaseBump {
 	return BUMP_RANK[a] >= BUMP_RANK[b] ? a : b;
 }
@@ -69,17 +56,8 @@ export function isReleaseCommitMessage(message: string): boolean {
 	return RELEASE_COMMIT_PREFIX.test(firstLine);
 }
 
-export function parseReleaseCommitVersion(message: string): string | undefined {
-	const firstLine = (message ?? "").split(/\r?\n/, 1)[0]?.trim() ?? "";
-	return RELEASE_COMMIT_PREFIX.exec(firstLine)?.[1];
-}
-
-export function isReleasePullRequest(title: string, branch = ""): boolean {
-	return isReleaseCommitMessage(title) || /^release\//i.test(branch.trim());
-}
-
 /**
- * Aggregate the highest semver bump across a range of commits and/or PRs.
+ * Aggregate the highest semver bump across a range of commits.
  * Release bookkeeping commits and bare branch merge commits are ignored.
  */
 export function deriveRangeBump(commits: readonly RangeCommit[]): ReleaseBump {
@@ -89,10 +67,7 @@ export function deriveRangeBump(commits: readonly RangeCommit[]): ReleaseBump {
 		if (!subject || isReleaseCommitMessage(subject) || /^Merge (?:remote-tracking )?branch /i.test(subject)) {
 			continue;
 		}
-		const labelString = (commit.labels ?? []).join(",");
-		const fromLabels = pickBump("", labelString, subject);
-		const fromCommit = deriveBump(subject, commit.body ?? "");
-		highest = maxBump(highest, maxBump(fromLabels, fromCommit));
+		highest = maxBump(highest, deriveBump(subject, commit.body ?? ""));
 		if (highest === "major") return "major";
 	}
 	return highest;
@@ -354,18 +329,6 @@ export function readGitRangeCommits(baseRef: string, headRef = "HEAD", cwd = pro
 		.filter(entry => entry.subject.length > 0);
 }
 
-function readPackageVersionAtRef(ref: string, cwd = process.cwd()): string {
-	if (!ref || /^0+$/.test(ref)) return "0.0.0";
-	const raw = runGit(["show", `${ref}:package.json`], cwd, true);
-	if (!raw) return "0.0.0";
-	try {
-		const parsed = JSON.parse(raw) as { version?: string };
-		return parsed.version ?? "0.0.0";
-	} catch {
-		return "0.0.0";
-	}
-}
-
 function readPackageVersion(cwd = process.cwd()): string {
 	const pkgPath = join(cwd, "package.json");
 	if (!existsSync(pkgPath)) return "0.0.0";
@@ -380,26 +343,6 @@ function writePackageVersion(version: string, cwd = process.cwd()): void {
 	writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
 }
 
-function tagExists(tag: string, cwd = process.cwd()): boolean {
-	const result = Bun.spawnSync({
-		cmd: ["git", "rev-parse", "--verify", "--quiet", `refs/tags/${tag}`],
-		cwd,
-		stdout: "ignore",
-		stderr: "ignore",
-	});
-	return result.exitCode === 0;
-}
-
-function parseExtraLabelCommits(jsonArg: string | undefined): RangeCommit[] {
-	if (!jsonArg) return [];
-	const parsed = JSON.parse(jsonArg) as Array<{ subject?: string; body?: string; labels?: string[] }>;
-	return parsed.map(item => ({
-		subject: item.subject ?? "",
-		body: item.body ?? "",
-		labels: item.labels ?? [],
-	}));
-}
-
 function computePlan(args: string[], cwd = process.cwd()) {
 	const previousTag = flag(args, "--from") ?? latestGitTag(cwd) ?? "";
 	const headRef = flag(args, "--to") ?? "HEAD";
@@ -409,14 +352,13 @@ function computePlan(args: string[], cwd = process.cwd()) {
 	const requestedBump = (flag(args, "--bump") ?? "auto").trim().toLowerCase();
 
 	const commits = readGitRangeCommits(previousTag, headRef, cwd);
-	const extraItems = parseExtraLabelCommits(flag(args, "--pr-labels-json"));
 	const base = releaseBase(pkgVersion, previousTag);
 
 	let bump: ReleaseBump;
 	if (requestedBump === "major" || requestedBump === "minor" || requestedBump === "patch") {
 		bump = requestedBump;
 	} else {
-		bump = deriveRangeBump([...commits, ...extraItems]);
+		bump = deriveRangeBump(commits);
 	}
 
 	const version = explicitVersion || nextVersion(base, bump);
@@ -440,64 +382,10 @@ function computePlan(args: string[], cwd = process.cwd()) {
 	};
 }
 
-function detectReleasePullRequest(args: string[], cwd = process.cwd()) {
-	const beforeRef = flag(args, "--before") ?? "";
-	const afterRef = flag(args, "--after") ?? "HEAD";
-	const prTitle = flag(args, "--pr-title") ?? "";
-	const prBranch = flag(args, "--pr-branch") ?? "";
-	const commitMessage = flag(args, "--commit-message") ?? runGit(["log", "-1", "--format=%s", afterRef], cwd, true);
-
-	const beforeVersion = readPackageVersionAtRef(beforeRef, cwd);
-	const afterVersion = readPackageVersionAtRef(afterRef, cwd);
-	const latestTag = latestGitTag(cwd);
-
-	if (compareVersions(afterVersion, beforeVersion) <= 0) {
-		return {
-			shouldRelease: false,
-			reason: `package.json version did not increase (${beforeVersion} -> ${afterVersion})`,
-		};
-	}
-
-	const intentMatched =
-		isReleaseCommitMessage(commitMessage) || isReleasePullRequest(prTitle, prBranch);
-	if (!intentMatched) {
-		return {
-			shouldRelease: false,
-			reason: "commit/PR does not carry release PR intent (chore(release): or release/ branch)",
-		};
-	}
-
-	const version = normalize(afterVersion);
-	const tag = `v${version}`;
-	if (latestTag && compareVersions(version, latestTag) <= 0) {
-		return {
-			shouldRelease: false,
-			reason: `version ${version} is not newer than latest tag ${latestTag}`,
-		};
-	}
-
-	if (tagExists(tag, cwd)) {
-		return {
-			shouldRelease: false,
-			reason: `tag ${tag} already exists`,
-		};
-	}
-
-	return {
-		shouldRelease: true,
-		version,
-		tag,
-		previousTag: latestTag ?? "",
-		reason: `Release PR bumped package.json ${beforeVersion} -> ${version}`,
-	};
-}
-
 if (import.meta.main) {
 	const [command, ...rest] = Bun.argv.slice(2);
 	if (command === "derive") {
 		console.log(deriveBump(rest[0] ?? "", rest[1] ?? ""));
-	} else if (command === "pick") {
-		console.log(pickBump(rest[0] ?? "", rest[1] ?? "", rest[2] ?? ""));
 	} else if (command === "base") {
 		console.log(releaseBase(rest[0] ?? "", rest[1]));
 	} else if (command === "next") {
@@ -536,12 +424,8 @@ if (import.meta.main) {
 				}),
 			);
 		}
-	} else if (command === "detect-release-pr") {
-		console.log(JSON.stringify(detectReleasePullRequest(rest)));
 	} else {
-		console.error(
-			"usage: release-plan.ts <derive|pick|base|next|resolve|plan|prepare|notes|detect-release-pr> [options]",
-		);
+		console.error("usage: release-plan.ts <derive|base|next|resolve|plan|prepare|notes> [options]");
 		process.exit(1);
 	}
 }
