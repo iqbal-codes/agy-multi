@@ -1,7 +1,10 @@
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "bun:test";
+import { expect, test, setDefaultTimeout } from "bun:test";
+// These tests drive real child processes; the 5 s default flakes on loaded CI runners.
+setDefaultTimeout(20_000);
+
 import { LineReader } from "../src/acp/rpc";
 
 // Disk survives agent restarts; the in-process session map deliberately does not.
@@ -205,7 +208,7 @@ test("closing the last session releases its agent and resume preserves the conve
 		expect(handoff.params.prompt![0].text).toContain("FIRST");
 		expect(handoff.params.prompt![0].text).toContain("ANSWER_SECOND");
 	} finally { await f.cleanup(); }
-}, 20_000);
+});
 
 test("legacy account-pool failover releases the previous agent when it has no other sessions", async () => {
 	const f = await fixture();

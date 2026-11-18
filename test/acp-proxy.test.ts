@@ -1,7 +1,10 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, setDefaultTimeout } from "bun:test";
+// These tests drive real child processes; the 5 s default flakes on loaded CI runners.
+setDefaultTimeout(20_000);
+
 import { isRecord } from "../src/acp/guards";
 import { LineReader } from "../src/acp/rpc";
 
