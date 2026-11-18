@@ -6,6 +6,11 @@ tagged by the release workflow on merge to `main`.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-18
+
+This release lets an installed copy update itself and answer `--version` without
+guessing.
+
 ### Added
 
 - `agy-multi update` replaces the installed `agy-multi` and `agy-multi-acp`
