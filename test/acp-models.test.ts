@@ -5,7 +5,7 @@ import { describe, expect, test, setDefaultTimeout } from "bun:test";
 // These tests drive real child processes; the 5 s default flakes on loaded CI runners.
 setDefaultTimeout(20_000);
 
-import { isRecord } from "../src/acp/guards";
+import { isRecord } from "../src/fs-utils";
 import { LineReader } from "../src/acp/rpc";
 
 /**
@@ -390,7 +390,7 @@ describe("ACP proxy model capability routing", () => {
 		}
 	});
 
-	test("profile sync probes reasoning only for the named account and caches the levels", async () => {
+	test("profile sync refreshes all healthy accounts in parallel and caches reasoning levels", async () => {
 		const { root, projectRoot, fake, promptLog } = await setupTieredEnv(true);
 		const probeLog = join(root, "model-switches.log");
 		const { proxy, send } = spawnProxy(projectRoot, root, fake, promptLog, probeLog);
@@ -406,11 +406,10 @@ describe("ACP proxy model capability routing", () => {
 		};
 		try {
 			await send("initialize", { protocolVersion: 1, clientCapabilities: {} });
+			// Bare `profile sync` syncs all accounts together in parallel.
 			await sync();
-			expect(await Bun.file(probeLog).exists()).toBe(false);
-			expect(await Bun.file(join(root, "profiles", "acct-basic", "model-reasoning.json")).exists()).toBe(false);
-			await sync("acct-pro");
-			await sync("acct-pro");
+			// Second run hits fresh caches and does not re-probe.
+			await sync();
 			const created = await send<{
 				result: {
 					models: { availableModels: Array<{ modelId: string; _meta?: unknown }> };
@@ -428,8 +427,8 @@ describe("ACP proxy model capability routing", () => {
 				reasoningEfforts: [{ value: "low", label: "LOW" }, { value: "high", label: "HIGH" }],
 				reasoningEffort: "low",
 			});
-			expect((await readFile(probeLog, "utf8")).trim().split("\n")).toEqual(["gemini-4-hydrogen", "gemini-3.8-flash"]);
-			expect(await Bun.file(join(root, "profiles", "acct-basic", "model-reasoning.json")).exists()).toBe(false);
+			expect(await Bun.file(join(root, "profiles", "acct-pro", "model-reasoning.json")).exists()).toBe(true);
+			expect(await Bun.file(join(root, "profiles", "acct-basic", "model-reasoning.json")).exists()).toBe(true);
 			expect(await Bun.file(promptLog).exists()).toBe(false);
 		} finally {
 			proxy.kill();

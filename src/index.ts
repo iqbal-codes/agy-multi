@@ -1,21 +1,19 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
+import { loadState } from "./account-pool";
 import { parseAcpProxyOptions } from "./acp/cli-args";
-import { syncProfileModelReasoning } from "./acp/model-reasoning";
 import { runAcpProxy } from "./acp/server";
-import { ensureAgy } from "./setup";
+import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
+import { isPublicGeminiModel } from "./model-catalog";
+import { DEFAULT_SWITCH_DELAY_MS } from "./paths";
+import { ProbeSync, type SyncProfileResult } from "./probe-sync";
 import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, syncProfiles } from "./profile";
 import { listProfiles, loadProfile, removeProfile } from "./registry";
-import { runWithFailover, RunFailure } from "./runner";
-import { loadState } from "./state";
-import { formatMultiUsageReport, readCachedUsage } from "./usage";
-import { fetchModels, isPublicGeminiModel, readCachedModels } from "./models";
-import { MODELS_TTL_MS, PROBE_SPACING_MS } from "./paths";
-import { ProbeSync } from "./probe-sync";
-import { SerialQueue } from "./serial-queue";
-import type { Profile, UsageSnapshot } from "./types";
-import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable } from "./analytics";
+import { RunFailure, runWithFailover } from "./runner";
+import { ensureAgy } from "./setup";
+import type { Profile } from "./types";
 import { runUpdateCommand } from "./update";
+import { formatMultiUsageReport, readCachedUsage } from "./usage";
 import { VERSION } from "./version";
 
 /** Short age for cache lines: `42s`, `7m`, `3h`, `2d`. */
@@ -29,35 +27,30 @@ function ageText(ms: number): string {
 	return `${Math.round(hours / 24)}d`;
 }
 
-/**
- * Record the first quota snapshot right after a log in. The account was just
- * verified, so one probe here means `agy-multi quota` is never empty for an
- * account the user has open in front of them.
- */
-async function primeQuotaAfterLogin(profile: Profile): Promise<void> {
-	if (profile.bannedAt || profile.authRequiredAt || profile.disabled) return;
-	const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
-	const snapshot = await probes.refreshUsage(profile).catch(() => null);
-	if (!snapshot || snapshot.windows.length === 0) {
-		console.log(`quota: not recorded yet — \`agy-multi quota --profile ${profile.slug} --refresh\` when needed`);
-		return;
-	}
-	console.log(
-		`quota: ${snapshot.windows.map(window => `${window.family} ${window.window} ${window.remainingPct}%`).join(", ")}`,
-	);
+function printSyncSummary(result: SyncProfileResult): void {
+	const quotaText =
+		result.usage && result.usage.windows.length > 0
+			? result.usage.windows.map(w => `${w.family} ${w.window} ${w.remainingPct}%`).join(", ")
+			: "unavailable";
+	const modelsCount = result.models
+		? result.models.models.filter(m => isPublicGeminiModel(m.modelId)).length
+		: 0;
+	const reasoningText =
+		result.reasoningCount !== undefined ? `${result.reasoningCount} model(s)` : "skipped";
+	console.log(`${result.slug}\tquota: ${quotaText}\tmodels: ${modelsCount}\treasoning: ${reasoningText}`);
 }
 
-async function syncModelReasoning(profile: Profile, force = false): Promise<void> {
-	try {
-		const count = await syncProfileModelReasoning(profile, force);
-		if (count === undefined) {
-			console.log(`reasoning: skipped ${profile.slug}; requires an enabled, authenticated account and the agy CLI`);
-			return;
-		}
-		console.log(`reasoning: ${profile.slug} has cached levels for ${count} model(s)`);
-	} catch {
-		console.error(`reasoning: could not refresh ${profile.slug}; retry with agy-multi profile sync ${profile.slug}`);
-	}
+/**
+ * Sync usage, models, and reasoning in parallel right after login or explicit profile sync.
+ */
+async function syncAccountCaches(profiles: Profile[], force = false): Promise<SyncProfileResult[]> {
+	const probes = new ProbeSync();
+	return await probes.syncAll(profiles, {
+		usage: true,
+		models: true,
+		reasoning: true,
+		force,
+	});
 }
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
@@ -68,7 +61,7 @@ Usage:
   agy-multi profile list
   agy-multi profile disable <slug>
   agy-multi profile enable <slug>
-  agy-multi profile sync [<slug>]
+  agy-multi profile sync [<slug>] [--force]
   agy-multi profile remove <slug>
   agy-multi quota [--profile <slug>] [--refresh]
   agy-multi multi-usage [--profile <slug>] [--refresh]
@@ -84,24 +77,18 @@ Usage:
   agy-multi update [--check] [--force]
   agy-multi --version
 
-Update:
-  Reads the latest GitHub release, verifies its SHA-256, and replaces the
-  installed agy-multi and agy-multi-acp binaries in place. --check reports
-  without installing; --force reinstalls the same version. Sessions that are
-  already running keep the previous binary until they restart.
-
-Quota:
-  quota and multi-usage print the cached snapshot and never start a check on
-  their own. The proxy refreshes an account when it starts and finishes serving
-  work, one account at a time; idle accounts are never probed. --refresh probes
-  now.
+Sync & Quota:
+  profile sync provisions shared configuration and refreshes usage, models, and
+  reasoning across all healthy accounts in parallel. ACP automatically warms stale
+  caches in the background on startup in pool mode. --refresh probes all accounts
+  in parallel on demand.
 
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
   --compaction-threshold <tokens> Auto-compacts conversation when context reaches this limit (default: 300000, 0 to disable).
   --switch-delay <seconds>       Pause before handing a turn to another account (default: 10).
   --handoff-context <chars>      Cap the transcript replayed when a conversation cannot be resumed (default: all of it).
-  --sequential                   Keep only one account active at a time; no cross-account probing.
+  --sequential                   Keep only one account active at a time; no background probing.
 
 Subagent Clean Mode & Manual Injections (ala Pi Agent):
   --clean / --no-skills          Bypasses default skills, plugins, rules bloat and slash commands.
@@ -111,14 +98,6 @@ Subagent Clean Mode & Manual Injections (ala Pi Agent):
 
 Each profile is a separate HOME; the official agy binary and its OAuth client
 are never modified.
-
-By default, \`acp\` and \`run\` use the account pool (automatic quota failover and
-parallel sessions across accounts). Pass \`--sequential\` to \`acp\` to keep only
-one account active at a time with automatic switching.
-
-Note: Google's Antigravity Terms (§6) and FAQ do not permit wrapping agy inside
-third-party coding agents or automating account rotation on consumer plans;
-pool mode is used at your own account risk.
 `;
 
 async function main(): Promise<void> {
@@ -180,7 +159,11 @@ async function main(): Promise<void> {
 	if (command === "profile") {
 		if (subcommand === "add") {
 			const slug = rest[0];
-			if (!slug) throw new Error("usage: agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary] [--clean]");
+			if (!slug) {
+				throw new Error(
+					"usage: agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary] [--clean]",
+				);
+			}
 			if (!values["no-login"] || !values["no-canary"]) {
 				await ensureAgy();
 			}
@@ -200,8 +183,8 @@ async function main(): Promise<void> {
 						: "unknown";
 			console.log(`${profile.slug}\t${profile.email ?? "(no email)"}\t${status}`);
 			if (!values["no-login"]) {
-				await primeQuotaAfterLogin(profile);
-				await syncModelReasoning(profile, true);
+				const [summary] = await syncAccountCaches([profile], true);
+				if (summary) printSyncSummary(summary);
 			}
 			return;
 		}
@@ -214,8 +197,8 @@ async function main(): Promise<void> {
 				canary: !values["no-canary"],
 			});
 			console.log(`logged in ${profile.slug}\t${profile.email ?? "(no email)"}`);
-			await primeQuotaAfterLogin(profile);
-			await syncModelReasoning(profile, true);
+			const [summary] = await syncAccountCaches([profile], true);
+			if (summary) printSyncSummary(summary);
 			return;
 		}
 		if (subcommand === "list") {
@@ -263,11 +246,16 @@ async function main(): Promise<void> {
 					if (!(await syncProfile(slug))) throw new Error(`could not sync profile: ${slug}`);
 					console.log(`synced ${slug}`);
 				}
-				await syncModelReasoning(profile);
+				const [summary] = await syncAccountCaches([profile], Boolean(values.force));
+				if (summary) printSyncSummary(summary);
 			} else {
 				const synced = await syncProfiles();
-				console.log(`synced ${synced.length} profile(s): ${synced.join(", ")}`);
-				console.log("Run agy-multi profile sync <slug> to refresh reasoning for one account.");
+				if (synced.length > 0) {
+					console.log(`synced ${synced.length} profile(s): ${synced.join(", ")}`);
+				}
+				const profiles = await listProfiles();
+				const results = await syncAccountCaches(profiles, Boolean(values.force));
+				for (const summary of results) printSyncSummary(summary);
 			}
 			return;
 		}
@@ -289,8 +277,8 @@ async function main(): Promise<void> {
 		}
 		if (values.refresh) {
 			await ensureAgy();
-			const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
-			await probes.syncStale(profiles, { usage: true, force: true });
+			const probes = new ProbeSync();
+			await probes.syncAll(profiles, { usage: true, force: true });
 		}
 		let oldest: number | undefined;
 		for (const profile of profiles) {
@@ -308,7 +296,7 @@ async function main(): Promise<void> {
 		}
 		if (oldest !== undefined) {
 			console.error(
-				`# cached ${ageText(Date.now() - oldest)} ago; ${values.refresh ? "refreshed one account at a time" : "--refresh syncs one account at a time"}`,
+				`# cached ${ageText(Date.now() - oldest)} ago; ${values.refresh ? "refreshed in parallel" : "--refresh syncs all accounts in parallel"}`,
 			);
 		}
 		return;
@@ -318,13 +306,12 @@ async function main(): Promise<void> {
 		const profiles = (await listProfiles()).filter(p => !values.profile || p.slug === values.profile);
 		if (values.refresh) {
 			await ensureAgy();
-			const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
-			await probes.syncStale(profiles, { usage: true, force: true });
+			const probes = new ProbeSync();
+			await probes.syncAll(profiles, { usage: true, force: true });
 		}
-		const entries: Array<{ profile: Profile; snapshot: UsageSnapshot | null }> = [];
-		for (const profile of profiles) {
-			entries.push({ profile, snapshot: await readCachedUsage(profile.slug) });
-		}
+		const entries = await Promise.all(
+			profiles.map(async profile => ({ profile, snapshot: await readCachedUsage(profile.slug) })),
+		);
 		console.log(formatMultiUsageReport(entries));
 		return;
 	}
@@ -336,14 +323,15 @@ async function main(): Promise<void> {
 			console.log("no profiles");
 			return;
 		}
-		const now = Date.now();
+		const probes = new ProbeSync();
+		const synced = await probes.syncAll(profiles, {
+			usage: false,
+			models: true,
+			force: Boolean(values.refresh),
+		});
+		const bySlug = new Map(synced.map(row => [row.slug, row.models]));
 		for (const profile of profiles) {
-			const cached = values.refresh ? null : await readCachedModels(profile.slug);
-			const fresh =
-				cached && now - cached.fetchedAt < MODELS_TTL_MS
-					? cached
-					: await fetchModels(profile).catch(() => null);
-			const snapshot = fresh ?? cached;
+			const snapshot = bySlug.get(profile.slug) ?? null;
 			if (!snapshot || snapshot.models.length === 0) {
 				console.log(`${profile.slug}\t(unavailable)`);
 				continue;
@@ -369,15 +357,10 @@ async function main(): Promise<void> {
 			return;
 		}
 
-		if (values.daily) {
-			console.log(renderPeriodTable(stats.today));
-		} else if (values.weekly) {
-			console.log(renderPeriodTable(stats.thisWeek));
-		} else if (values.monthly) {
-			console.log(renderPeriodTable(stats.thisMonth));
-		} else {
-			console.log(renderStatsTable(stats));
-		}
+		if (values.daily) console.log(renderPeriodTable(stats.today));
+		else if (values.weekly) console.log(renderPeriodTable(stats.thisWeek));
+		else if (values.monthly) console.log(renderPeriodTable(stats.thisMonth));
+		else console.log(renderStatsTable(stats));
 		return;
 	}
 
@@ -401,7 +384,7 @@ async function main(): Promise<void> {
 				onlyProfile: values.profile,
 				switchDelayMs: values["switch-delay"]
 					? Math.round(Number(values["switch-delay"]) * 1000)
-					: 10_000,
+					: DEFAULT_SWITCH_DELAY_MS,
 				clean: Boolean(values.clean || values["no-skills"]),
 				systemPrompt: values["system-prompt"],
 				appendSystemPrompt: values["append-system-prompt"],

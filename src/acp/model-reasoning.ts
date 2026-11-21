@@ -2,8 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { AGY_BIN, MODELS_TTL_MS } from "../paths";
-import { hasValidAuth } from "../profile";
+import { isRecord } from "../fs-utils";
 import {
 	deriveBaseConfigOptions,
 	extractAcpModelsFromResult,
@@ -15,10 +14,11 @@ import {
 	writeCachedModels,
 	type ModelReasoningEntry,
 	type ModelReasoningMeta,
-} from "../models";
+} from "../model-catalog";
+import { AGY_BIN, MODELS_TTL_MS } from "../paths";
+import { hasValidAuth } from "../profile";
 import type { Profile } from "../types";
 import { AcpChild, AcpRpcError } from "./child";
-import { isRecord } from "./guards";
 import { isNotification } from "./rpc";
 
 const PROBE_TIMEOUT_MS = 25_000;
@@ -70,20 +70,31 @@ async function within<T>(task: Promise<T>, timeoutMs: number): Promise<T | undef
 }
 
 /**
- * Only called by interactive account management commands. Each probe owns an
- * ACP process and an empty session, with no prompts or user conversation state.
+ * Discovers a profile's model catalog and reasoning-effort options via a throwaway
+ * ACP probe session, caching both `models.json` and `model-reasoning.json`.
  */
-export async function syncProfileModelReasoning(profile: Profile, force = false): Promise<number | undefined> {
-	if (profile.disabled || profile.bannedAt || profile.authRequiredAt) return;
+export async function syncProfileModelReasoning(
+	profile: Profile,
+	force = false,
+	signal?: AbortSignal,
+): Promise<number | undefined> {
+	if (signal?.aborted || profile.disabled || profile.bannedAt || profile.authRequiredAt) return;
 	if (!Bun.which(AGY_BIN) || !(await hasValidAuth(profile))) return;
+	if (signal?.aborted) return;
 
 	const [catalog, cached] = await Promise.all([readCachedModels(profile.slug), readCachedModelReasoning(profile.slug)]);
 	const cutoff = Date.now() - MODELS_TTL_MS;
 	const fresh = new Set(force ? [] : cached.filter(entry => entry.fetchedAt >= cutoff).map(entry => entry.modelId));
-	const previousChoices = (catalog?.configOptions ?? deriveBaseConfigOptions(catalog?.models ?? []))
-		.filter(choice => isPublicGeminiModel(choice.value));
-	if (!force && catalog && catalog.fetchedAt >= cutoff && previousChoices.length &&
-		previousChoices.every(choice => fresh.has(choice.value))) {
+	const previousChoices = (catalog?.configOptions ?? deriveBaseConfigOptions(catalog?.models ?? [])).filter(choice =>
+		isPublicGeminiModel(choice.value),
+	);
+	if (
+		!force &&
+		catalog &&
+		catalog.fetchedAt >= cutoff &&
+		previousChoices.length &&
+		previousChoices.every(choice => fresh.has(choice.value))
+	) {
 		return cached.filter(entry => isPublicGeminiModel(entry.modelId) && entry.meta.reasoningEfforts?.length).length;
 	}
 
@@ -99,8 +110,11 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 	let child: AcpChild | undefined;
 	let closeMethod: string | undefined;
 	let timeout: ReturnType<typeof setTimeout> | undefined;
+	const onAbort = () => child?.kill();
+	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
-		const agent = child = new AcpChild({
+		if (signal?.aborted) return;
+		const agent = (child = new AcpChild({
 			profile,
 			agyBin: AGY_BIN,
 			extraArgs: ["--include-default-customizations=false"],
@@ -117,11 +131,13 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 					watchUpdate?.(update.configOptions);
 				}
 			},
-		});
+		}));
 		timeout = setTimeout(() => agent.kill(), PROBE_TIMEOUT_MS);
 		const initialized = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
-		const capabilities = isRecord(initialized) && isRecord(initialized.agentCapabilities)
-			? initialized.agentCapabilities.sessionCapabilities : undefined;
+		const capabilities =
+			isRecord(initialized) && isRecord(initialized.agentCapabilities)
+				? initialized.agentCapabilities.sessionCapabilities
+				: undefined;
 		if (isRecord(capabilities)) {
 			closeMethod = capabilities.delete ? "session/delete" : capabilities.close ? "session/close" : undefined;
 		}
@@ -133,14 +149,16 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 		const extracted = extractAcpModelsFromResult(result);
 		const selector = findModelSelector(result.configOptions);
 		const choices = selector ? readAcpSelectChoices(selector.options) : deriveBaseConfigOptions(extracted.models);
-		const models = extracted.models.length > 0
-			? extracted.models
-			: choices.map(choice => ({ modelId: choice.value, name: choice.name }));
+		const models =
+			extracted.models.length > 0
+				? extracted.models
+				: choices.map(choice => ({ modelId: choice.value, name: choice.name }));
 		if (models.length === 0) throw new Error("Missing model catalog");
 		await writeCachedModels({ profile: profile.slug, fetchedAt: Date.now(), models, configOptions: choices });
 
-		const modelIds = new Set([...models.map(model => model.modelId), ...choices.map(choice => choice.value)]
-			.filter(isPublicGeminiModel));
+		const modelIds = new Set(
+			[...models.map(model => model.modelId), ...choices.map(choice => choice.value)].filter(isPublicGeminiModel),
+		);
 		for (const id of entries.keys()) if (!modelIds.has(id)) entries.delete(id);
 		for (const model of extracted.models) {
 			if (!modelIds.has(model.modelId)) continue;
@@ -155,7 +173,7 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 		try {
 			if (typeof selector?.id === "string") {
 				for (const { value } of choices) {
-					if (!modelIds.has(value) || verified.has(value) || !agent.alive) continue;
+					if (signal?.aborted || !modelIds.has(value) || verified.has(value) || !agent.alive) continue;
 					const update = Promise.withResolvers<unknown[]>();
 					watchUpdate = options => {
 						if (findModelSelector(options)?.currentValue === value) update.resolve(options);
@@ -163,7 +181,8 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 					const changed = await agent.request("session/set_config_option", { sessionId, configId: selector.id, value });
 					if (changed.error) continue;
 					const options = isRecord(changed.result) ? changed.result.configOptions : undefined;
-					const confirmed = Array.isArray(options) && findModelSelector(options)?.currentValue === value ? options : undefined;
+					const confirmed =
+						Array.isArray(options) && findModelSelector(options)?.currentValue === value ? options : undefined;
 					const fromResponse = confirmed && reasoningMeta(confirmed);
 					if (fromResponse) {
 						remember(value, fromResponse);
@@ -186,8 +205,9 @@ export async function syncProfileModelReasoning(profile: Profile, force = false)
 		}
 		return [...entries.values()].filter(entry => entry.meta.reasoningEfforts?.length).length;
 	} finally {
+		signal?.removeEventListener("abort", onAbort);
 		clearTimeout(timeout);
-		if (child?.alive && sessionId && closeMethod) {
+		if (child?.alive && sessionId && closeMethod && !signal?.aborted) {
 			await within(child.request(closeMethod, { sessionId }), CONFIG_UPDATE_TIMEOUT_MS).catch(() => {});
 		}
 		await child?.stop();

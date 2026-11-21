@@ -1,5 +1,5 @@
 import { readdir, rm } from "node:fs/promises";
-import { PROFILES_DIR, profileDir, profileHome, profileMetaPath } from "./paths";
+import { profileDir, profileHome, profileMetaPath, profilesDir } from "./paths";
 import type { Profile } from "./types";
 import { exists, readJson, writeJsonAtomic } from "./fs-utils";
 
@@ -47,7 +47,7 @@ export async function saveProfile(profile: Profile): Promise<void> {
 export async function listProfiles(): Promise<Profile[]> {
 	let entries: string[];
 	try {
-		entries = await readdir(PROFILES_DIR);
+		entries = await readdir(profilesDir());
 	} catch {
 		return [];
 	}

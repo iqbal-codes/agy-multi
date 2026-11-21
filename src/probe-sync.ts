@@ -1,14 +1,25 @@
-import { MODELS_TTL_MS, USAGE_TTL_MS } from "./paths";
-import { fetchModels, readCachedModels, writeCachedModels } from "./models";
-import { SerialQueue } from "./serial-queue";
-import { fetchUsage, readCachedUsage, writeCachedUsage, type FetchUsageOptions } from "./usage";
+import { syncProfileModelReasoning } from "./acp/model-reasoning";
+import { fetchModels, readCachedModels, writeCachedModels } from "./model-catalog";
+import { MODELS_TTL_MS, PROBE_SPACING_MS, USAGE_TTL_MS } from "./paths";
 import type { ModelsSnapshot, Profile, UsageSnapshot } from "./types";
+import { fetchUsage, readCachedUsage, writeCachedUsage, type FetchUsageOptions } from "./usage";
+
+export interface ProbeFetchers {
+	usage?: (profile: Profile, options: FetchUsageOptions) => Promise<UsageSnapshot | null>;
+	models?: (
+		profile: Profile,
+		options: { signal?: AbortSignal; skipCacheWrite?: boolean },
+	) => Promise<ModelsSnapshot | null>;
+	reasoning?: (profile: Profile, force: boolean, signal?: AbortSignal) => Promise<number | undefined>;
+}
 
 export interface ProbeSyncOptions {
-	/** Shared queue; probes never overlap. */
-	queue?: SerialQueue;
 	/** Cancels in-flight probes on shutdown. */
 	signal?: AbortSignal;
+	/** Optional concurrency cap (`Infinity` by default: sync all accounts in parallel). */
+	concurrency?: number;
+	/** Optional delay between tasks when `concurrency` is bounded (default: `0`). */
+	spacingMs?: number;
 	usageTtlMs?: number;
 	modelsTtlMs?: number;
 	now?: () => number;
@@ -16,70 +27,112 @@ export interface ProbeSyncOptions {
 	onModels?: (snapshot: ModelsSnapshot) => void;
 	/** The account cannot complete silent auth; callers must stop probing it. */
 	onAuthRequired?: (slug: string) => void;
-	/** Test seam: replace the child-process probes. */
-	fetchers?: {
-		usage?: (profile: Profile, options: FetchUsageOptions) => Promise<UsageSnapshot | null>;
-		models?: (profile: Profile, options: { signal?: AbortSignal }) => Promise<ModelsSnapshot | null>;
-	};
+	/** Seam: replace child-process probes (prod `agy` CLI vs test fake). */
+	fetchers?: ProbeFetchers;
 }
 
-export interface SyncStaleOptions {
+export interface SyncAllOptions {
 	usage?: boolean;
 	models?: boolean;
+	reasoning?: boolean;
 	/** Probe even when the cache is still fresh. */
 	force?: boolean;
 }
 
+export interface SyncProfileResult {
+	slug: string;
+	usage: UsageSnapshot | null;
+	models: ModelsSnapshot | null;
+	reasoningCount?: number;
+}
+
 /**
- * Keeps the on-disk usage/models caches warm without ever probing an account on
- * demand for the caller. Reads answer from cache; every child process this class
- * starts runs through one serial queue, so a status read never becomes a burst
- * of requests across accounts.
+ * Deduplicating parallel probe runner owning usage, model, and reasoning refreshes.
+ *
+ * By default probes run in parallel across all accounts with zero artificial spacing,
+ * while identical keys join the already running probe and each probe performs a
+ * single atomic cache write.
  */
 export class ProbeSync {
-	readonly queue: SerialQueue;
 	private readonly signal?: AbortSignal;
+	private readonly concurrency: number;
+	private readonly spacingMs: number;
 	private readonly usageTtlMs: number;
 	private readonly modelsTtlMs: number;
 	private readonly now: () => number;
 	private readonly onUsage?: (snapshot: UsageSnapshot) => void;
 	private readonly onModels?: (snapshot: ModelsSnapshot) => void;
 	private readonly onAuthRequired?: (slug: string) => void;
-	private readonly fetchUsage: (profile: Profile, options: FetchUsageOptions) => Promise<UsageSnapshot | null>;
-	private readonly fetchModels: (profile: Profile, options: { signal?: AbortSignal }) => Promise<ModelsSnapshot | null>;
+	private readonly fetchUsageFn: (profile: Profile, options: FetchUsageOptions) => Promise<UsageSnapshot | null>;
+	private readonly fetchModelsFn: (
+		profile: Profile,
+		options: { signal?: AbortSignal; skipCacheWrite?: boolean },
+	) => Promise<ModelsSnapshot | null>;
+	private readonly fetchReasoningFn: (
+		profile: Profile,
+		force: boolean,
+		signal?: AbortSignal,
+	) => Promise<number | undefined>;
+
+	private readonly pending = new Map<string, Promise<unknown>>();
+	private readonly waiters: Array<() => void> = [];
+	private active = 0;
 
 	constructor(options: ProbeSyncOptions = {}) {
-		this.queue = options.queue ?? new SerialQueue();
 		this.signal = options.signal;
+		this.concurrency =
+			options.concurrency !== undefined && options.concurrency >= 1
+				? Math.floor(options.concurrency)
+				: Number.POSITIVE_INFINITY;
+		this.spacingMs = Math.max(0, options.spacingMs ?? PROBE_SPACING_MS);
 		this.usageTtlMs = options.usageTtlMs ?? USAGE_TTL_MS;
 		this.modelsTtlMs = options.modelsTtlMs ?? MODELS_TTL_MS;
 		this.now = options.now ?? Date.now;
 		this.onUsage = options.onUsage;
 		this.onModels = options.onModels;
 		this.onAuthRequired = options.onAuthRequired;
-		this.fetchUsage = options.fetchers?.usage ?? fetchUsage;
-		this.fetchModels = options.fetchers?.models ?? ((profile, opts) => fetchModels(profile, undefined, opts.signal));
+		this.fetchUsageFn = options.fetchers?.usage ?? fetchUsage;
+		this.fetchModelsFn = options.fetchers?.models ?? ((profile, opts) => fetchModels(profile, opts));
+		this.fetchReasoningFn =
+			options.fetchers?.reasoning ?? ((profile, force, signal) => syncProfileModelReasoning(profile, force, signal));
 	}
 
-	/** Cached usage; a stale or missing entry schedules a serial background refresh. */
+	/** Number of unique in-flight or queued probe keys. */
+	get size(): number {
+		return this.pending.size;
+	}
+
+	/** Wait for every probe currently queued or in-flight to settle. */
+	async drain(): Promise<void> {
+		while (this.pending.size > 0) {
+			await Promise.allSettled([...this.pending.values()]);
+		}
+	}
+
+	/** Cached usage; a stale or missing entry triggers a non-blocking background refresh. */
 	async usage(profile: Profile): Promise<UsageSnapshot | null> {
 		const cached = await readCachedUsage(profile.slug);
-		if (this.isStale(cached?.fetchedAt, this.usageTtlMs)) void this.refreshUsage(profile);
+		if (this.isStale(cached?.fetchedAt, this.usageTtlMs)) {
+			void this.refreshUsage(profile).catch(() => {});
+		}
 		return cached;
 	}
 
 	/** Cached models, same contract as `usage`. */
 	async models(profile: Profile): Promise<ModelsSnapshot | null> {
 		const cached = await readCachedModels(profile.slug);
-		if (this.isStale(cached?.fetchedAt, this.modelsTtlMs)) void this.refreshModels(profile);
+		if (this.isStale(cached?.fetchedAt, this.modelsTtlMs)) {
+			void this.refreshModels(profile).catch(() => {});
+		}
 		return cached;
 	}
 
-	/** Probe one account's usage; concurrent callers join the running probe. */
+	/** Probe one account's usage; concurrent callers for the same profile join the running probe. */
 	refreshUsage(profile: Profile): Promise<UsageSnapshot | null> {
-		return this.queue.run(`usage:${profile.slug}`, async () => {
-			const snapshot = await this.fetchUsage(profile, {
+		return this.runKey(`usage:${profile.slug}`, async () => {
+			const snapshot = await this.fetchUsageFn(profile, {
 				signal: this.signal,
+				skipCacheWrite: true,
 				onNeedsLogin: () => this.onAuthRequired?.(profile.slug),
 			});
 			if (snapshot) {
@@ -90,10 +143,13 @@ export class ProbeSync {
 		});
 	}
 
-	/** Probe one account's models; concurrent callers join the running probe. */
+	/** Probe one account's models; concurrent callers for the same profile join the running probe. */
 	refreshModels(profile: Profile): Promise<ModelsSnapshot | null> {
-		return this.queue.run(`models:${profile.slug}`, async () => {
-			const snapshot = await this.fetchModels(profile, { signal: this.signal });
+		return this.runKey(`models:${profile.slug}`, async () => {
+			const snapshot = await this.fetchModelsFn(profile, {
+				signal: this.signal,
+				skipCacheWrite: true,
+			});
 			if (snapshot) {
 				await writeCachedModels(snapshot).catch(() => {});
 				this.onModels?.(snapshot);
@@ -102,34 +158,111 @@ export class ProbeSync {
 		});
 	}
 
+	/** Probe one account's reasoning metadata (also refreshes `models.json`); deduplicated per profile. */
+	refreshReasoning(profile: Profile, force = false): Promise<number | undefined> {
+		return this.runKey(`reasoning:${profile.slug}`, async () => {
+			const count = await this.fetchReasoningFn(profile, force, this.signal);
+			const updatedModels = await readCachedModels(profile.slug);
+			if (updatedModels) this.onModels?.(updatedModels);
+			return count;
+		});
+	}
+
 	/**
-	 * Serial pass over the accounts that need it, oldest cache first. This is the
-	 * only path that is allowed to talk to the backend on more than one account,
-	 * and it does so strictly one account at a time.
+	 * Sync all healthy accounts in parallel across usage, models, and reasoning.
+	 * Stale (or forced) accounts run concurrently with zero artificial pacing by default.
 	 */
-	async syncStale(profiles: Profile[], options: SyncStaleOptions = {}): Promise<void> {
+	async syncAll(profiles: Profile[], options: SyncAllOptions = {}): Promise<SyncProfileResult[]> {
 		const wantsUsage = options.usage ?? true;
 		const wantsModels = options.models ?? false;
+		const wantsReasoning = options.reasoning ?? false;
 		const force = options.force ?? false;
 		const healthy = profiles.filter(profile => !profile.disabled && !profile.bannedAt && !profile.authRequiredAt);
-		const ordered: Array<{ profile: Profile; at: number }> = [];
-		for (const profile of healthy) {
-			const usage = wantsUsage ? await readCachedUsage(profile.slug) : null;
-			const models = wantsModels ? await readCachedModels(profile.slug) : null;
-			const times = [usage?.fetchedAt, models?.fetchedAt].filter((at): at is number => at !== undefined);
-			ordered.push({ profile, at: times.length ? Math.min(...times) : 0 });
-		}
+
+		const ordered = await Promise.all(
+			healthy.map(async profile => {
+				const [usage, models] = await Promise.all([
+					wantsUsage ? readCachedUsage(profile.slug) : Promise.resolve(null),
+					wantsModels ? readCachedModels(profile.slug) : Promise.resolve(null),
+				]);
+				const times = [usage?.fetchedAt, models?.fetchedAt].filter((at): at is number => at !== undefined);
+				return { profile, usage, models, at: times.length ? Math.min(...times) : 0 };
+			}),
+		);
 		ordered.sort((a, b) => a.at - b.at);
-		for (const { profile } of ordered) {
-			const usage = wantsUsage ? await readCachedUsage(profile.slug) : null;
-			if (wantsUsage && (force || this.isStale(usage?.fetchedAt, this.usageTtlMs))) {
-				await this.refreshUsage(profile);
+
+		return await Promise.all(
+			ordered.map(async ({ profile, usage: cachedUsage, models: cachedModels }): Promise<SyncProfileResult> => {
+				const usageTask = wantsUsage
+					? force || this.isStale(cachedUsage?.fetchedAt, this.usageTtlMs)
+						? this.refreshUsage(profile).catch(() => cachedUsage)
+						: Promise.resolve(cachedUsage)
+					: Promise.resolve(cachedUsage);
+
+				const catalogTask = (async (): Promise<{ models: ModelsSnapshot | null; reasoningCount?: number }> => {
+					let reasoningCount: number | undefined;
+					let latestModels = cachedModels;
+
+					if (wantsReasoning) {
+						reasoningCount = await this.refreshReasoning(profile, force).catch(() => undefined);
+						latestModels = (await readCachedModels(profile.slug)) ?? latestModels;
+					}
+
+					if (wantsModels && (force || this.isStale(latestModels?.fetchedAt, this.modelsTtlMs))) {
+						// If reasoning discovery just populated a fresh models cache, avoid a redundant `agy models` call.
+						const refreshedByReasoning =
+							wantsReasoning && latestModels && !this.isStale(latestModels.fetchedAt, this.modelsTtlMs);
+						if (!refreshedByReasoning) {
+							latestModels = (await this.refreshModels(profile).catch(() => null)) ?? latestModels;
+						}
+					}
+
+					return { models: latestModels, reasoningCount };
+				})();
+
+				const [usage, catalog] = await Promise.all([usageTask, catalogTask]);
+				return {
+					slug: profile.slug,
+					usage,
+					models: catalog.models,
+					reasoningCount: catalog.reasoningCount,
+				};
+			}),
+		);
+	}
+
+	private runKey<T>(key: string, task: () => Promise<T>): Promise<T> {
+		const existing = this.pending.get(key);
+		if (existing) return existing as Promise<T>;
+		const promise = (async (): Promise<T> => {
+			await this.acquireSlot();
+			try {
+				return await task();
+			} finally {
+				this.pending.delete(key);
+				if (this.spacingMs > 0) {
+					await new Promise(resolve => setTimeout(resolve, this.spacingMs));
+				}
+				this.releaseSlot();
 			}
-			const models = wantsModels ? await readCachedModels(profile.slug) : null;
-			if (wantsModels && (force || this.isStale(models?.fetchedAt, this.modelsTtlMs))) {
-				await this.refreshModels(profile);
-			}
+		})();
+		this.pending.set(key, promise);
+		return promise;
+	}
+
+	private async acquireSlot(): Promise<void> {
+		if (this.active < this.concurrency) {
+			this.active += 1;
+			return;
 		}
+		await new Promise<void>(resolve => this.waiters.push(resolve));
+		this.active += 1;
+	}
+
+	private releaseSlot(): void {
+		this.active -= 1;
+		const next = this.waiters.shift();
+		if (next) next();
 	}
 
 	private isStale(fetchedAt: number | undefined, ttlMs: number): boolean {

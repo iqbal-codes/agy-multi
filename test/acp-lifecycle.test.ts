@@ -26,11 +26,14 @@ if (Bun.argv.includes("models")) {
   console.log("gemini-3.8-flash-high  Gemini Flash");
   process.exit(0);
 }
-const helper = Bun.spawn([process.execPath, "-e", ${JSON.stringify(HELPER)}], {stdout:"pipe",stderr:"ignore"});
-const reader = helper.stdout.getReader();
-const {value} = await reader.read();
-const descendants = JSON.parse(new TextDecoder().decode(value));
-writeFileSync(process.env.PIDS_FILE, JSON.stringify({agent:process.pid,...descendants}));
+const isProbe = Bun.argv.includes("--include-default-customizations=false");
+if (!isProbe) {
+  const helper = Bun.spawn([process.execPath, "-e", ${JSON.stringify(HELPER)}], {stdout:"pipe",stderr:"ignore"});
+  const reader = helper.stdout.getReader();
+  const {value} = await reader.read();
+  const descendants = JSON.parse(new TextDecoder().decode(value));
+  writeFileSync(process.env.PIDS_FILE, JSON.stringify({agent:process.pid,...descendants}));
+}
 let sequence = 0;
 const send = m => console.log(JSON.stringify(m));
 createInterface({input:process.stdin}).on("line", line => {

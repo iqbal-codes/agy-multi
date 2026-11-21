@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseAcpProxyOptions } from "../src/acp/cli-args";
+import { extractCompactionThresholdArg, extractFlagArg, parseAcpProxyOptions } from "../src/acp/cli-args";
 
 describe("parseAcpProxyOptions", () => {
 	test("defaults to account pool mode with sequential disabled", () => {
@@ -18,5 +18,24 @@ describe("parseAcpProxyOptions", () => {
 	test("enables sequential pool mode without requiring --allow-account-pool", () => {
 		const opts = parseAcpProxyOptions(["--sequential"]);
 		expect(opts.sequential).toBe(true);
+	});
+
+	test("extracts --compaction-threshold and generic flags cleanly from argv", () => {
+		expect(extractCompactionThresholdArg(["--foo", "bar"])).toEqual({
+			threshold: undefined,
+			remainingArgs: ["--foo", "bar"],
+		});
+		expect(extractCompactionThresholdArg(["--compaction-threshold", "250000", "--clean"])).toEqual({
+			threshold: 250_000,
+			remainingArgs: ["--clean"],
+		});
+		expect(extractCompactionThresholdArg(["--foo", "--compaction-threshold=400000", "--bar"])).toEqual({
+			threshold: 400_000,
+			remainingArgs: ["--foo", "--bar"],
+		});
+		expect(extractFlagArg(["--switch-delay=0", "--foo"], "--switch-delay")).toEqual({
+			value: "0",
+			rest: ["--foo"],
+		});
 	});
 });

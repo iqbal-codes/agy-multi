@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { AGY_BIN, profileDir } from "./paths";
 import { profileEnvOf } from "./registry";
 import type { Family, Profile, UsageSnapshot, UsageWindow, WindowId } from "./types";
-import { readJson, writeJsonAtomic } from "./fs-utils";
+import { killProcessGroup, readJson, writeJsonAtomic } from "./fs-utils";
 import { hasValidAuth } from "./profile";
 
 export function profileUsagePath(slug: string): string {
@@ -99,6 +99,8 @@ export interface FetchUsageOptions {
 	signal?: AbortSignal;
 	/** Called once when the CLI abandons silent auth and starts an interactive login. */
 	onNeedsLogin?: () => void;
+	/** Skip writing `usage.json` when the caller (e.g. `ProbeSync`) owns persistence. */
+	skipCacheWrite?: boolean;
 }
 
 /** Byte length of an append-only log, used to ignore markers from earlier runs. */
@@ -181,15 +183,7 @@ export async function fetchUsage(profile: Profile, options: FetchUsageOptions = 
 		cancelled = true;
 		// SIGTERM can run the CLI's interactive OAuth fallback. Kill the owned
 		// process group atomically, including credential readers and MCP children.
-		if (process.platform === "win32") {
-			proc.kill("SIGKILL");
-		} else {
-			try {
-				process.kill(-proc.pid, "SIGKILL");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-			}
-		}
+		killProcessGroup(proc);
 	};
 	const timer = setTimeout(cancel, timeoutMs);
 	let needsLogin = false;
@@ -224,7 +218,9 @@ export async function fetchUsage(profile: Profile, options: FetchUsageOptions = 
 			windows: parseUsageTable(parsed.response),
 			raw: parsed.response,
 		};
-		await writeCachedUsage(snapshot).catch(() => {});
+		if (!options.skipCacheWrite) {
+			await writeCachedUsage(snapshot).catch(() => {});
+		}
 		return snapshot;
 	} finally {
 		stopWatch();

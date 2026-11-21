@@ -38,6 +38,22 @@ export const ROOT = resolveRoot();
 export const PROFILES_DIR = join(ROOT, "profiles");
 export const STATE_PATH = join(ROOT, "state.json");
 export const ACP_SESSIONS_PATH = join(ROOT, "acp-sessions.json");
+
+export function currentRoot(): string {
+	return process.env.AGY_MULTI_ROOT || ROOT;
+}
+
+export function profilesDir(): string {
+	return join(currentRoot(), "profiles");
+}
+
+export function statePath(): string {
+	return join(currentRoot(), "state.json");
+}
+
+export function acpSessionsPath(): string {
+	return join(currentRoot(), "acp-sessions.json");
+}
 export function resolveAgyBin(): string {
 	if (process.env.AGY_BIN) return process.env.AGY_BIN;
 	const binName = process.platform === "win32" ? "agy.exe" : "agy";
@@ -94,11 +110,11 @@ export const USAGE_TTL_MS = 5 * 60_000;
 /** Model capability cache TTL (12 hours). */
 export const MODELS_TTL_MS = 12 * 60 * 60_000;
 
-/**
- * Pause between two usage/model probes. Accounts sync one at a time, and this
- * keeps consecutive probes from landing back to back.
- */
-export const PROBE_SPACING_MS = 1_500;
+/** Default pause before handing a turn to another account (10 seconds). */
+export const DEFAULT_SWITCH_DELAY_MS = 10_000;
+
+/** Default pause between probes (0ms: probes run in parallel by default). */
+export const PROBE_SPACING_MS = 0;
 
 export function profileDir(slug: string): string {
 	const root = process.env.AGY_MULTI_ROOT ?? ROOT;

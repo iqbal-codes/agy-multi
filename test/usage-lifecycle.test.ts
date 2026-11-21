@@ -198,7 +198,7 @@ describe.skipIf(process.platform === "win32")("quota subprocess lifecycle", () =
 		}
 	}, 8000);
 
-	test("only the account that serves work is probed", async () => {
+	test("pool mode auto-syncs all healthy accounts in parallel on startup", async () => {
 		const root = await mkdtemp(join(tmpdir(), "agy-acp-quota-scope-"));
 		const cli = join(root, "agy");
 		await writeFile(cli, CLI);
@@ -214,7 +214,7 @@ describe.skipIf(process.platform === "win32")("quota subprocess lifecycle", () =
 			await mkdir(tokenDir, { recursive: true });
 			await writeFile(join(tokenDir, "antigravity-oauth-token"), "stub");
 		}
-		const proxy = Bun.spawn([process.execPath, join(import.meta.dir, "../src/index.ts"), "acp", "--allow-account-pool"], {
+		const proxy = Bun.spawn([process.execPath, join(import.meta.dir, "../src/index.ts"), "acp"], {
 			detached: true,
 			env: {
 				...process.env,
@@ -243,15 +243,12 @@ describe.skipIf(process.platform === "win32")("quota subprocess lifecycle", () =
 			(await Promise.all(slugs.map(slug => Bun.file(join(root, "profiles", slug, "usage.json")).exists()))).filter(Boolean).length;
 		try {
 			await request(1, "initialize", { protocolVersion: 1, clientCapabilities: {} });
-			await request(2, "session/new", { cwd: root, mcpServers: [] });
 			const deadline = Date.now() + 6000;
-			while ((await cachedProfiles()) === 0) {
-				if (Date.now() > deadline) throw new Error("served account was never probed");
+			while ((await cachedProfiles()) < 2) {
+				if (Date.now() > deadline) throw new Error("all healthy accounts were not auto-synced");
 				await Bun.sleep(20);
 			}
-			// A sweep would keep going and give the idle account a snapshot too.
-			await Bun.sleep(400);
-			expect(await cachedProfiles()).toBe(1);
+			expect(await cachedProfiles()).toBe(2);
 		} finally {
 			proxy.stdin.end();
 			try { await proxy.exited; } catch {}

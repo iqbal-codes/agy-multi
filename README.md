@@ -10,6 +10,53 @@
 Run the official Antigravity CLI (`agy`) across isolated Google accounts — without patching the binary, proxying
 traffic, or reimplementing the protocol.
 
+## System overview
+
+The Bun entry points run either a one-shot `agy` command or a stdio ACP proxy.
+The proxy routes JSON-RPC between the host and `agy acp` child processes; the
+children, not the proxy, connect to Antigravity.
+
+## Subdirectories & system boundaries
+
+- [Source engine](./src/README.md) — CLI dispatch, profile provisioning, quota
+  and model snapshots, one-shot routing, and updates. Its
+  [ACP component](./src/acp/README.md) owns protocol routing and session state.
+- [Checkout launchers](./bin/README.md) — POSIX and Windows shims that pass
+  arguments to the source entry points under Bun.
+
+## Local interface & invariants
+
+- [`package.json`](./package.json) maps `agy-multi` and `agy-multi-acp` to
+  separate TypeScript entry points; `bun run build` compiles both.
+- [`install.sh`](./install.sh) (`install_from_prebuilt`) and
+  [`install.ps1`](./install.ps1) (`Install-FromPrebuilt`) require both executable
+  files in a prebuilt archive. A local checkout or `AGY_MULTI_FROM_SOURCE=1`
+  selects the source build. The in-app updater separately checks the archive
+  SHA-256 and the staged main executable's version before replacement
+  ([`installLatestRelease`](./src/update.ts)).
+
+## Global invariants
+
+- A child uses its profile's HOME; managed profiles may share conversation
+  files, but adopted HOMEs skip managed provisioning
+  ([`profileEnvOf`](./src/registry.ts), [`syncProfiles`](./src/profile.ts)).
+- A handoff leaves the client-facing session ID intact. The proxy does not
+  retry a failed turn on another profile after forwarding model output
+  ([`runPrompt`](./src/acp/server.ts)).
+
+## Global side effects
+
+- Profile metadata, quota blocks, and ACP session records are separate stores
+  under the wrapper root ([`profileMetaPath`](./src/paths.ts),
+  [`AccountPool`](./src/account-pool.ts), [`SessionLedger`](./src/acp/session-ledger.ts)).
+- The installers can download a release or build from a checkout, write to the
+  install directory, and add ACP rules to `~/.gemini/GEMINI.md`
+  ([`install.sh`](./install.sh), [`install.ps1`](./install.ps1)).
+
+## System verification
+
+From the repository root, run `bun test`, `bun run typecheck`, and `bun run build`.
+
 ## Why an isolated HOME
 
 `agy` keeps auth, conversations, settings and `installation_id` under
@@ -126,7 +173,7 @@ Still true, and still worth keeping:
    replayed elsewhere.
 
 4. **Quota Protection & Anti-Spam Backoff**:
-   - When an account hits `RESOURCE_EXHAUSTED` (429) or drops below the 10% reserve threshold, `agy-multi` marks it blocked and honors the reset duration.
+   - When a prompt hits `RESOURCE_EXHAUSTED` (429), `agy-multi` can block that profile and model family until the reported reset or a default backoff. ACP can retry on another eligible profile only before output is forwarded.
    - It does not hammer exhausted endpoints or retry failed calls repeatedly, ensuring standard respectful API behavior.
 
 5. **Transparent Developer Shell Bridge**:
@@ -146,10 +193,9 @@ the instant the previous one returns 429. It is not a detection countermeasure:
 the switch's timing is not what identifies a harness, and this does not make
 rotation permitted or invisible.
 
-`--sequential` keeps exactly one account active. Ranking reads cached `/usage`
-and model snapshots instead of probing every profile, and the previous `agy acp`
-child is stopped — with its exit awaited — before the next one starts, so two
-accounts are never authenticated at the same moment.
+Both ACP modes rank profiles from cached `/usage` and model snapshots.
+In `--sequential` mode, the proxy stops the previous `agy acp` child and waits
+up to five seconds for it to exit before starting the next one.
 
 Concurrent sessions on that one account are normal and run in parallel: several
 sessions, different models, one process. Only crossing to another account is
@@ -175,7 +221,7 @@ that turn to end. Two sessions on two accounts still work over time: the idle
 child is replaced, and the parked session is resumed, or handed off as a fresh
 conversation when the agent lost it.
 
-When an active account runs out of quota, pooled mode keeps the client session ID and continues the same conversation on the next available account. Because the conversation store is shared, the new account resumes that conversation by id (`session/resume`) and receives only the user's current message — no replay, no rewritten prompt. When the conversation cannot be resumed (it is not in the store, or the agent refuses it), the proxy falls back to replaying the client's transcript verbatim as `User:` / `Assistant:` turns: no framing line, no request to continue, no account narrative, no synthesized tool markers, in full by default (`--handoff-context <chars>` caps it). Tool calls cannot cross either way: ACP carries text, so only what the assistant said survives a replay.
+When an active account runs out of quota, pooled mode keeps the client session ID and continues the same conversation on the next available account. Because the conversation store is shared, the new account resumes that conversation by id (`session/resume`) and receives only the user's current message — no replay, no rewritten prompt. When the conversation cannot be resumed (it is not in the store, or the agent refuses it), the proxy falls back to replaying the client's transcript verbatim as `User:` / `Assistant:` turns: no framing line, no request to continue, no account narrative, no synthesized tool markers, in full by default (`--handoff-context <chars>` caps it). Tool calls cannot cross either way: ACP carries text, so only text survives a replay.
 
 The replay carries no tool state: tool calls themselves are not replayed, so the new account has no in-memory call history and must re-verify the workspace.
 
@@ -192,14 +238,17 @@ sequenceDiagram
     Proxy->>ActA: Forward prompt via agy acp
     ActA->>Google: Direct TLS request (Account A token)
     Google-->>ActA: 429 RESOURCE_EXHAUSTED (Quota limit)
-    Note over Proxy,ActA: Quota cap detected BEFORE output streaming
-    Proxy->>Proxy: Mark Account A blocked in state.json until reset
-    Proxy->>Proxy: Rank & select Account B (highest headroom / nearest reset)
-    Proxy->>ActB: Replay transcript verbatim (history only)
+    Note over Proxy,ActA: Quota 429 received BEFORE any output streams
+    Proxy->>Proxy: Quota-block Account A in state.json until reset
+    Proxy->>Proxy: Rank Account B from cached /usage + model snapshots
+    Proxy->>ActB: session/resume (shared conversation store)
+    alt conversation cannot be resumed
+        Proxy->>ActB: session/new + text-only transcript replay
+    end
     ActB->>Google: Direct TLS request (Account B token)
     Google-->>ActB: 200 OK (Streaming generation)
     ActB-->>Proxy: Stream assistant output & tool calls
-    Proxy-->>Dev: Seamless response (same session ID!)
+    Proxy-->>Dev: Seamless response (same proxy session ID; streamed once)
 ```
 
 ## Installation
@@ -216,7 +265,7 @@ curl -fsSL https://raw.githubusercontent.com/iqbal-codes/agy-multi/main/install.
 irm https://raw.githubusercontent.com/iqbal-codes/agy-multi/main/install.ps1 | iex
 ```
 
-*The installer automatically installs Bun if needed, compiles standalone native executables, and places them into your `~/.local/bin` (`PATH`).*
+*The installer installs the prebuilt `agy-multi` and `agy-multi-acp` binaries for your platform (macOS/Linux x64 or arm64; Windows x64) into `~/.local/bin` (`PATH`). It installs Bun and compiles from source only when run inside a checkout, with `AGY_MULTI_FROM_SOURCE=1`, or when no prebuilt release is available.*
 
 ### Option 2: Bun Global Install (`bun install -g`)
 
@@ -282,19 +331,17 @@ agy-multi profile login work --remote
 # Adopt the existing main installation (no login, no canary).
 agy-multi profile add main --home "$HOME" --no-login
 
-# Resync shared configuration for all isolated profiles.
+# Resync shared configuration, quota, models, and reasoning across all profiles in parallel.
 agy-multi profile sync
 
-# Refresh missing or stale reasoning levels for one profile.
-agy-multi profile sync work
+# Resync and force-refresh one profile (or pass --force for all profiles).
+agy-multi profile sync work --force
 
 agy-multi profile list
 agy-multi profile remove work
 
-# Print the cached quota snapshot (rolling 5h & weekly remaining).
-# The proxy refreshes an account when it starts and finishes serving work,
-# one account at a time; idle accounts are never probed.
-# --refresh probes now, still one account at a time.
+# Print cached quota snapshots, or refresh all accounts in parallel.
+# ACP automatically warms stale caches in the background on startup in pool mode.
 agy-multi quota [--profile <slug>] [--refresh]
 agy-multi multi-usage [--profile <slug>] [--refresh]
 
@@ -410,23 +457,27 @@ When running `agy-multi profile add <slug>` on a remote machine, VPS, or over SS
 5. Paste it back into the remote terminal and press Enter. The account is now authenticated and ready!
 
 
-`acp` and `run` rank candidates from the cached `/usage` and `models` snapshots
-(refreshed in the background through one serial queue), pin conversations, and
-fail over on quota/ban/auth.
+`acp` ranks candidates from cached `/usage` and model snapshots. One-shot `run`
+refreshes stale snapshots serially before ranking. Both keep track of the
+conversation's account and can fail over on quota, ban, or auth errors.
 
 ## Pool failover rules
 
 | Signal | Action |
 |---|---|
-| `SUCCESS` | pin conversation, write checkpoint, record `lastGenerationOkAt` |
+| `SUCCESS` | `run` pins the conversation and writes a checkpoint; both ACP and `run` record `lastGenerationOkAt` |
 | quota / `RESOURCE_EXHAUSTED` | block that profile+family until the reset, try the next |
 | `403` + "violation of Terms of Service" | mark profile **banned**, never select it again |
 | not logged in / auth error | mark profile `auth-required`, try the next |
 | network / transient | return the error; switching accounts cannot fix it |
 
-Failover is **handoff-only**: a conversation is never replayed under a different
-account. The next account starts a fresh conversation seeded with the previous
-turn's checkpoint (original prompt, last result, cwd, git HEAD).
+`run` failover is **checkpoint-only**: a conversation is never resumed under a
+different account. The next account starts a fresh conversation seeded with the
+previous turn's checkpoint (original prompt, last result, cwd, git HEAD).
+Cross-profile ACP handoff keeps the conversation instead: it prefers
+`session/resume` on the shared store and falls back to a text-only `session/new`
+seeded from the client transcript. A turn whose output already streamed is never
+replayed.
 
 ## Multi-platform Support
 
@@ -467,15 +518,16 @@ In t3code: **Settings → Providers → Add provider → Local ACP command**.
 | Arguments | `acp` (pool default) or `acp --sequential` |
 | Environment | none — installed standalone binary handles execution |
 
-`install.sh` / `install.ps1` compiles standalone single-binary executables and places them directly into `~/.local/bin/` (`$HOME/.local/bin/agy-multi` and `agy-multi-acp`).
+`install.sh` / `install.ps1` install the prebuilt single-binary executables into `~/.local/bin/` (`$HOME/.local/bin/agy-multi` and `agy-multi-acp`) by default; they compile from source only for a local checkout, with `AGY_MULTI_FROM_SOURCE=1`, or when no prebuilt release is available.
 
 `agy-multi acp -- --dangerously-skip-permissions` forwards extra args to the
 `agy acp` child it runs.
 
-After login and on `agy-multi profile sync <slug>`, the wrapper caches the reasoning
-levels advertised by each model. For accounts already set up, run `agy-multi
-profile sync <slug>` for each account you want to refresh, then refresh the provider catalog in your
-ACP client. Catalog requests read this metadata from disk.
+After login, on `agy-multi profile sync`, and automatically in the background
+when `agy-multi acp` starts in pool mode, `agy-multi` refreshes quota, models,
+and reasoning levels across all healthy accounts in parallel. Session responses
+(`session/new`, `session/load`, `session/resume`, `session/fork`) merge this
+cached catalog across healthy accounts automatically.
 
 For **OMP (Oh My Pi)** or harnesses expecting a dedicated ACP executable:
 ```bash
@@ -485,20 +537,25 @@ Or use `~/.local/bin/agy-multi-acp` (or `agy-multi-acp.exe` on Windows) directly
 
 What the proxy does:
 
-- `initialize` probes the highest-ranked signed-in profile.
-- `session/new` picks a profile with the same `/usage` ranking and pins the
-  session to it.
+- `initialize` selects a healthy control profile — not banned, auth-required, or
+  disabled; unblocked, `main`, and recently successful accounts first — without
+  probing `/usage`, and retries the next candidate if the handshake fails.
+- `session/new` picks the highest-ranked profile from the cached `/usage` and
+  model snapshots and pins the session to it.
 - `session/prompt` runs on the pinned profile. If that profile is blocked,
-  banned, auth-required, or under the 10% reserve, the proxy creates a fresh
-  session on the next profile and sends a handoff prompt (history, cwd, git
-  HEAD). The client keeps the same session id.
+  banned, auth-required, or under the 10% reserve, the proxy re-ranks from the
+  cached snapshots and hands the conversation to the next profile: it prefers
+  `session/resume` by conversation id on the shared store and falls back to a
+  fresh `session/new` with a text-only transcript replay. The client keeps the
+  same proxy session id.
 - If the agent fails with quota / ban / auth **before any output**, the handoff
   happens inside the running turn: the client receives the result from the new
   account.
-- If output was already streamed, the turn returns the error and the next prompt
-  performs the handoff. A turn is never replayed under another account.
-- Banned and quota-blocked profiles are stored in `state.json` and excluded from
-  selection. A 403 ToS ban is never retried.
+- If output was already streamed, the turn returns the error. Handoff is
+  deferred until the next prompt rather than retrying the failed turn.
+- Bans and auth requirements are stored in the profile's metadata
+  (`profile.json`); quota blocks live in `state.json`. All are excluded from
+  selection, and a 403 ToS ban is never retried.
 - An account with a wider model catalog is reserved for its own models: a
   baseline request goes to the account that only offers baseline models, so the
   premium catalog is not spent on work a smaller account can do. The reservation
@@ -520,23 +577,24 @@ What the proxy does:
   Idle but open sessions stay running; this does not impose an inactivity timeout.
 - Native `usage_update` events are forwarded immediately during an active prompt,
   unchanged apart from the session ID; they are not buffered until the turn ends.
-  Update frequency depends on when the official agent publishes usage, not on
-  streamed text chunks. The proxy does not invent model capacity, token occupancy,
-  or zero-dollar cost.
-  If the agent provides no usage event, a context meter is unavailable. An AGY
+  When the agent publishes none, the proxy derives a `usage_update` from the
+  latest token-bearing transcript row, when one exists, with a context `size`
+  resolved from the model id. It does not invent a dollar cost. An AGY
   checkpoint may reduce active context without changing the conversation ID.
 - `session/list` lists sessions created through the proxy. Sessions created
   directly by the `agy` CLI are not merged into that list.
-- `authenticate` targets the highest-ranked profile. Re-authenticate a specific
-  account with `agy-multi profile add <slug>` (or `agy acp --login` in its HOME);
-  the proxy is intentionally one provider instance, not one per account.
+- `authenticate` runs on the current control profile (the healthy profile chosen
+  for `initialize`). Re-authenticate a specific account with `agy-multi profile
+  add <slug>` (or `agy acp --login` in its HOME); the proxy is intentionally one
+  provider instance, not one per account.
 
-Limitations: handoff carries recent user/assistant text under a 60,000-character
-budget, not complete tool results or in-memory tool state. Handoff requires the
-selected model; if the target rejects `session/set_model`, the turn fails rather
-than silently generating with another model. Completed and protocol-error turns
-are persisted, but a hard process kill can still interrupt a streamed response
-before its full text is saved.
+Limitations: the fallback `session/new` replay carries user/assistant text — the
+whole transcript by default, or the newest turns under
+`--handoff-context <chars>` — not complete tool results or in-memory tool state.
+Handoff requires the selected model; if the target rejects `session/set_model`,
+the turn fails rather than silently generating with another model. Completed and
+protocol-error turns are persisted, but a hard process kill can still interrupt
+a streamed response before its full text is saved.
 
 ## Layout
 

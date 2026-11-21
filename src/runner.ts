@@ -1,16 +1,14 @@
 import { join } from "node:path";
-import { AGY_BIN, DEFAULT_BLOCK_MS, DEFAULT_RESERVE_PCT, PROBE_SPACING_MS, profileDir } from "./paths";
-import type { AgyResultEvent, Checkpoint, FailureKind, ModelsSnapshot, Profile, RunOutcome, UsageSnapshot } from "./types";
+import { AccountPool } from "./account-pool";
 import { classifyRun, isModelUnsupportedError } from "./classify";
 import { ensureDir, run } from "./fs-utils";
-import { listProfiles, profileEnvOf, profileHomeOf, saveProfile } from "./registry";
-import { block, getCheckpoint, loadState, pin, pinnedProfile, saveState, setCheckpoint } from "./state";
-import { blockingReset, familyForModel, readCachedUsage } from "./usage";
-import { readCachedModels, reservedProfilesFor, withoutUnsupportedModel, writeCachedModels } from "./models";
-import { ProbeSync } from "./probe-sync";
-import { SerialQueue } from "./serial-queue";
-import { rankProfiles } from "./select";
 import { buildInjectedPrompt } from "./injection";
+import { ModelCatalog, readCachedModels, reservedProfilesFor } from "./model-catalog";
+import { AGY_BIN, DEFAULT_RESERVE_PCT, DEFAULT_SWITCH_DELAY_MS, profileDir } from "./paths";
+import { ProbeSync } from "./probe-sync";
+import { profileEnvOf } from "./registry";
+import type { AgyResultEvent, Checkpoint, FailureKind, ModelsSnapshot, Profile, RunOutcome, UsageSnapshot } from "./types";
+import { familyForModel, readCachedUsage } from "./usage";
 
 export function parseResult(stdout: string): AgyResultEvent | undefined {
 	let last: AgyResultEvent | undefined;
@@ -78,7 +76,7 @@ export interface FailoverOptions {
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	skills?: string[];
-	/** Pool mode only: pause between attempts. Pacing, not evasion. */
+	/** Pause between failover attempts (default: 10s). */
 	switchDelayMs?: number;
 }
 
@@ -133,61 +131,60 @@ function buildHandoffPrompt(checkpoint: Checkpoint | undefined, prompt: string):
 }
 
 export async function runWithFailover(opts: FailoverOptions): Promise<FailoverReport> {
-	const state = await loadState();
-	const all = await listProfiles();
+	const pool = await AccountPool.load({ reservePct: DEFAULT_RESERVE_PCT });
+	const all = pool.list();
 	if (!all.length) throw new Error("no profiles; add one with `agy-multi profile add <slug>`");
 	const candidates = opts.onlyProfile ? all.filter(p => p.slug === opts.onlyProfile) : all.filter(p => !p.disabled);
 	if (!candidates.length) throw new Error(`unknown profile: ${opts.onlyProfile}`);
 
-	const family = familyForModel(opts.model);
-	const now = Date.now();
+	const wantsModels = Boolean(opts.model && !opts.onlyProfile);
+	const probes = new ProbeSync();
+	await probes.syncAll(candidates, { usage: true, models: wantsModels });
+
+	const catalog = new ModelCatalog();
+	await catalog.warmFromDisk(candidates);
+
 	const usage = new Map<string, UsageSnapshot | null>();
 	const models = new Map<string, ModelsSnapshot | null>();
-	const wantsModels = Boolean(opts.model && !opts.onlyProfile);
-	for (const profile of candidates) {
-		usage.set(profile.slug, await readCachedUsage(profile.slug));
-		if (wantsModels) models.set(profile.slug, await readCachedModels(profile.slug));
-	}
-	// A one-shot run may wait for a probe, but never fans one out across accounts:
-	// stale caches are refreshed one account at a time, oldest first.
-	const probes = new ProbeSync({ queue: new SerialQueue({ spacingMs: PROBE_SPACING_MS }) });
-	await probes.syncStale(candidates, { usage: true, models: wantsModels });
-	for (const profile of candidates) {
-		usage.set(profile.slug, (await readCachedUsage(profile.slug)) ?? usage.get(profile.slug) ?? null);
-		if (wantsModels) {
-			models.set(profile.slug, (await readCachedModels(profile.slug)) ?? models.get(profile.slug) ?? null);
-		}
-	}
+	await Promise.all(
+		candidates.map(async profile => {
+			usage.set(profile.slug, await readCachedUsage(profile.slug));
+			if (wantsModels) models.set(profile.slug, await readCachedModels(profile.slug));
+		}),
+	);
 
-	const ranked = rankProfiles(candidates, usage, state, {
+	const rankedProfiles = await pool.rankCandidates({
 		modelId: opts.model,
-		now,
-		reservePct: DEFAULT_RESERVE_PCT,
-		...(opts.model && !opts.onlyProfile ? { models } : {}),
+		onlyProfile: opts.onlyProfile,
+		usage,
+		models: wantsModels ? models : undefined,
 	});
-	if (opts.model && !opts.onlyProfile && ranked.length === 0) {
+	if (opts.model && !opts.onlyProfile && rankedProfiles.length === 0) {
 		const reserved = reservedProfilesFor(models, opts.model);
 		if (reserved.size > 0) {
 			throw new Error(
 				`no available account for model ${opts.model}; ${[...reserved].join(", ")} reserved for newer models`,
 			);
 		}
-		const withoutModelFilter = rankProfiles(candidates, usage, state, {
+		const withoutModelFilter = await pool.rankCandidates({
 			modelId: opts.model,
-			now,
-			reservePct: DEFAULT_RESERVE_PCT,
+			usage,
+			models: new Map(),
 		});
 		if (withoutModelFilter.length > 0) {
 			throw new Error(`no available account supports model ${opts.model}`);
 		}
 	}
-	const owner = pinnedProfile(state, opts.conversationId);
+
+	const ranked = rankedProfiles.map(p => p.slug);
+	const owner = pool.pinnedProfile(opts.conversationId);
 	const ordered = owner && ranked.includes(owner) ? [owner, ...ranked.filter(slug => slug !== owner)] : ranked;
 	// Unknown owner (conversation created outside the wrapper): assume the first
 	// ranked profile, so --conversation still resumes history instead of forking.
 	const assumedOwner = owner ?? (opts.conversationId ? ordered[0] : undefined);
 
 	const maxSwitches = opts.maxSwitches ?? 3;
+	const switchDelayMs = opts.switchDelayMs ?? DEFAULT_SWITCH_DELAY_MS;
 	const attempts: RunAttempt[] = [];
 	let last: { outcome: RunOutcome; profile: Profile; kind: FailureKind } | undefined;
 
@@ -201,21 +198,20 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 	});
 
 	for (const slug of ordered.slice(0, maxSwitches + 1)) {
-		const profile = candidates.find(p => p.slug === slug);
+		const profile = pool.get(slug);
 		if (!profile) continue;
 
-		if (attempts.length > 0 && opts.switchDelayMs && opts.switchDelayMs > 0) {
+		if (attempts.length > 0 && switchDelayMs > 0) {
 			const { promise, resolve } = Promise.withResolvers<void>();
-			setTimeout(resolve, opts.switchDelayMs);
+			setTimeout(resolve, switchDelayMs);
 			await promise;
 		}
 
-		// Handoff-only: never resume another account's conversation. Only the
-		// profile that owns the conversation may pass --conversation.
+		// Handoff-only: never resume another account's conversation.
 		const canResume = Boolean(opts.conversationId && assumedOwner === slug);
 		const prompt =
 			opts.conversationId && !canResume
-				? buildHandoffPrompt(getCheckpoint(state, opts.conversationId), basePrompt)
+				? buildHandoffPrompt(pool.getCheckpoint(opts.conversationId), basePrompt)
 				: basePrompt;
 
 		const outcome = await runTurn(profile, {
@@ -230,54 +226,39 @@ export async function runWithFailover(opts: FailoverOptions): Promise<FailoverRe
 
 		if (kind === "ok") {
 			const conversationId = outcome.result?.conversation_id;
-			if (conversationId) {
-				pin(state, conversationId, slug);
-				setCheckpoint(state, conversationId, {
-					conversationId,
-					prompt: opts.prompt,
-					response: outcome.result?.response,
-					slug,
-					updatedAt: new Date().toISOString(),
-					cwd: opts.cwd ?? process.cwd(),
-					gitHead: await gitHead(opts.cwd ?? process.cwd()),
-				});
-			}
-			profile.lastGenerationOkAt = new Date().toISOString();
-			delete profile.bannedAt;
-			delete profile.bannedReason;
-			delete profile.authRequiredAt;
-			await saveProfile(profile);
-			await saveState(state);
+			const cwd = opts.cwd ?? process.cwd();
+			await pool.recordSuccess(slug, {
+				conversationId,
+				...(conversationId
+					? {
+							checkpoint: {
+								conversationId,
+								prompt: opts.prompt,
+								response: outcome.result?.response,
+								slug,
+								updatedAt: new Date().toISOString(),
+								cwd,
+								gitHead: await gitHead(cwd),
+							},
+						}
+					: {}),
+			});
 			const switched = attempts.length > 1 || Boolean(opts.conversationId && assumedOwner !== profile.slug);
 			return { outcome, profile, kind, switched, attempts };
 		}
 
 		last = { outcome, profile, kind };
 
-		if (kind === "banned") {
-			profile.bannedAt = new Date().toISOString();
-			profile.bannedReason = "violation of Terms of Service";
-			await saveProfile(profile);
-			continue;
-		}
-		if (kind === "auth") {
-			profile.authRequiredAt = new Date().toISOString();
-			await saveProfile(profile);
-			continue;
-		}
-		if (kind === "quota") {
-			const until =
-				blockingReset(usage.get(slug) ?? null, family, Date.now()) ?? Date.now() + DEFAULT_BLOCK_MS;
-			block(state, slug, family, until);
-			await saveState(state);
+		if (kind === "banned" || kind === "auth" || kind === "quota") {
+			await pool.recordFailure(slug, kind, {
+				modelId: opts.model,
+				usageSnapshot: usage.get(slug) ?? null,
+			});
 			continue;
 		}
 		if (opts.model && isModelUnsupportedError(`${outcome.stdout}\n${outcome.stderr}`)) {
-			const updated = withoutUnsupportedModel(models.get(slug) ?? (await readCachedModels(slug)), opts.model);
-			if (updated) {
-				models.set(slug, updated);
-				await writeCachedModels(updated).catch(() => {});
-			}
+			const updated = await catalog.markUnsupported(profile, opts.model);
+			if (updated) models.set(slug, updated);
 			continue;
 		}
 		// transient/error: another account will not fix it.

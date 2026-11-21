@@ -5,7 +5,7 @@ import { describe, expect, test, setDefaultTimeout } from "bun:test";
 // These tests drive real child processes; the 5 s default flakes on loaded CI runners.
 setDefaultTimeout(20_000);
 
-import { isRecord } from "../src/acp/guards";
+import { isRecord } from "../src/fs-utils";
 import { LineReader } from "../src/acp/rpc";
 
 const projectRoot = join(import.meta.dir, "..");
@@ -392,16 +392,15 @@ async function seedProfile(
 
 describe("agy-multi ACP proxy (account pool default)", () => {
 	test(
-		"account pool is the default and warns about the Terms of Service before serving requests",
+		"account pool is the default and starts quietly without blocking initialize",
 		async () => {
 			const f = await fixture(["acct-a", "acct-b"]);
 			const client = f.proxy([]);
 			try {
-				await client.waitForStderr(line => line.includes("Terms of Service"));
-				expect(client.stderrLines.join("\n")).toContain("not supported");
+				await client.waitForStderr(line => line.includes("ready —"));
+				expect(client.stderrLines.join("\n")).toContain("mode: pool");
+				expect(client.stderrLines.join("\n")).not.toContain("Terms of Service");
 
-				// The warning was observed before any request was written, so it
-				// precedes the first served request rather than racing the handshake.
 				const initialized = await client.send<Reply>("initialize", {
 					protocolVersion: 1,
 					clientCapabilities: {},

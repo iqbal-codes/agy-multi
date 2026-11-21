@@ -111,6 +111,33 @@ export async function linkOrReplaceWithSymlink(target: string, source: string): 
 	return true;
 }
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Terminates a detached child process tree atomically with SIGKILL.
+ * On Unix, kills the owned process group (`-pid`) so credential readers and
+ * MCP descendants cannot outlive the child or trigger interactive OAuth.
+ */
+export function killProcessGroup(
+	proc: { pid: number; kill(signal?: number | NodeJS.Signals): void },
+	onError?: (error: unknown) => void,
+): void {
+	try {
+		if (process.platform === "win32") {
+			proc.kill("SIGKILL");
+		} else {
+			process.kill(-proc.pid, "SIGKILL");
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+			if (onError) onError(error);
+			else throw error;
+		}
+	}
+}
+
 export async function run(
 	cmd: string[],
 	options: { env?: Record<string, string | undefined>; cwd?: string } = {},

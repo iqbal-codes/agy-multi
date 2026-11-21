@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { killProcessGroup } from "../fs-utils";
 import { profileDir } from "../paths";
 import type { Profile } from "../types";
 import { profileEnvOf, profileHomeOf } from "../registry";
@@ -148,16 +149,11 @@ export class AcpChild {
 	}
 
 	private stopProcessTree(): void {
-		try {
-			// As with quota probes, terminate the owned group atomically: a
-			// partially interrupted credential read can otherwise launch OAuth.
-			if (process.platform === "win32") this.proc.kill("SIGKILL");
-			else process.kill(-this.proc.pid, "SIGKILL");
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-				this.options.log(`[agy:${this.slug}] process cleanup failed: ${error}`);
-			}
-		}
+		// As with quota probes, terminate the owned group atomically: a
+		// partially interrupted credential read can otherwise launch OAuth.
+		killProcessGroup(this.proc, error => {
+			this.options.log(`[agy:${this.slug}] process cleanup failed: ${error}`);
+		});
 	}
 
 	private handleLine(line: string): void {

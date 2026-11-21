@@ -247,6 +247,48 @@ export interface AddProfileOptions {
 	clean?: boolean;
 }
 
+async function runInteractiveLogin(slug: string, home: string, remote = false): Promise<string> {
+	const logPath = join(profileDir(slug), "login.log");
+	const env = profileEnvOf(home);
+	if (remote) env.BROWSER = "/usr/bin/false";
+	const exitCode = await Bun.spawn([AGY_BIN, "acp", "--login", "--log-file", logPath], {
+		env,
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+	}).exited;
+	if (exitCode !== 0) throw new Error(`login exited with code ${exitCode}; see ${logPath}`);
+	const logText = await Bun.file(logPath)
+		.text()
+		.catch(() => "");
+	const email = readEmailFromLog(logText);
+	if (!email) throw new Error(`login did not record an account email; see ${logPath}`);
+	return email;
+}
+
+async function runCanaryCheck(profile: Profile): Promise<void> {
+	console.log("Verifying account health (running canary test, ~15-30s)...");
+	const outcome = await runTurn(profile, {
+		prompt: "Reply with exactly OK.",
+		logPath: join(profileDir(profile.slug), "canary.log"),
+	});
+	const kind = classifyRun(outcome.result?.status, outcome.stdout, outcome.stderr);
+	if (kind === "ok") {
+		profile.lastGenerationOkAt = new Date().toISOString();
+		delete profile.bannedAt;
+		delete profile.bannedReason;
+		delete profile.authRequiredAt;
+		console.log("Canary check passed: account is healthy and ready.");
+	} else if (kind === "banned") {
+		profile.bannedAt = new Date().toISOString();
+		profile.bannedReason = "violation of Terms of Service";
+		console.error("Warning: Account failed canary check (Terms of Service violation detected).");
+	} else if (kind === "auth") {
+		profile.authRequiredAt = new Date().toISOString();
+		console.error("Warning: Account requires re-authentication.");
+	}
+}
+
 export async function addProfile(slug: string, opts: AddProfileOptions = {}): Promise<Profile> {
 	if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
 		throw new Error(`invalid profile slug: ${slug} (use lowercase letters, digits, dashes)`);
@@ -269,47 +311,12 @@ export async function addProfile(slug: string, opts: AddProfileOptions = {}): Pr
 	await ensureDir(profileDir(slug));
 
 	if (opts.login !== false) {
-		const logPath = join(profileDir(slug), "login.log");
-		const env = profileEnvOf(home);
-		if (opts.remote) {
-			env.BROWSER = "/usr/bin/false";
-		}
-		const exitCode = await Bun.spawn([AGY_BIN, "acp", "--login", "--log-file", logPath], {
-			env,
-			stdin: "inherit",
-			stdout: "inherit",
-			stderr: "inherit",
-		}).exited;
-		if (exitCode !== 0) throw new Error(`login exited with code ${exitCode}; see ${logPath}`);
-		const logText = await Bun.file(logPath)
-			.text()
-			.catch(() => "");
-		const email = readEmailFromLog(logText);
-		if (!email) throw new Error(`login did not record an account email; see ${logPath}`);
-		profile.email = email;
+		profile.email = await runInteractiveLogin(slug, home, Boolean(opts.remote));
 		profile.lastLoginAt = new Date().toISOString();
 	}
 
 	if (opts.canary !== false) {
-		console.log("Verifying account health (running canary test, ~15-30s)...");
-		const outcome = await runTurn(profile, {
-			prompt: "Reply with exactly OK.",
-			logPath: join(profileDir(slug), "canary.log"),
-		});
-		const kind = classifyRun(outcome.result?.status, outcome.stdout, outcome.stderr);
-		if (kind === "ok") {
-			profile.lastGenerationOkAt = new Date().toISOString();
-			console.log("Canary check passed: account is healthy and ready.");
-		}
-		if (kind === "banned") {
-			profile.bannedAt = new Date().toISOString();
-			profile.bannedReason = "violation of Terms of Service";
-			console.error("Warning: Account failed canary check (Terms of Service violation detected).");
-		}
-		if (kind === "auth") {
-			profile.authRequiredAt = new Date().toISOString();
-			console.error("Warning: Account requires re-authentication.");
-		}
+		await runCanaryCheck(profile);
 	}
 
 	await saveProfile(profile);
@@ -337,42 +344,12 @@ export async function loginProfile(
 		await ensureKeychain(home);
 	}
 
-	const logPath = join(profileDir(slug), "login.log");
-	const env = profileEnvOf(home);
-	if (opts.remote) {
-		env.BROWSER = "/usr/bin/false";
-	}
-	const exitCode = await Bun.spawn([AGY_BIN, "acp", "--login", "--log-file", logPath], {
-		env,
-		stdin: "inherit",
-		stdout: "inherit",
-		stderr: "inherit",
-	}).exited;
-	if (exitCode !== 0) throw new Error(`login exited with code ${exitCode}; see ${logPath}`);
-	const logText = await Bun.file(logPath)
-		.text()
-		.catch(() => "");
-	const email = readEmailFromLog(logText);
-	if (!email) throw new Error(`login did not record an account email; see ${logPath}`);
-
-	profile.email = email;
+	profile.email = await runInteractiveLogin(slug, home, Boolean(opts.remote));
 	profile.lastLoginAt = new Date().toISOString();
 	delete profile.authRequiredAt;
 
 	if (opts.canary !== false) {
-		console.log("Verifying account health (running canary test, ~15-30s)...");
-		const outcome = await runTurn(profile, {
-			prompt: "Reply with exactly OK.",
-			logPath: join(profileDir(slug), "canary.log"),
-		});
-		const kind = classifyRun(outcome.result?.status, outcome.stdout, outcome.stderr);
-		if (kind === "ok") {
-			profile.lastGenerationOkAt = new Date().toISOString();
-			console.log("Canary check passed: account is healthy and ready.");
-		} else if (kind === "auth") {
-			profile.authRequiredAt = new Date().toISOString();
-			console.error("Warning: Account still requires re-authentication.");
-		}
+		await runCanaryCheck(profile);
 	}
 
 	await saveProfile(profile);
@@ -383,20 +360,16 @@ export async function loginProfile(
 export async function syncProfile(slug: string): Promise<boolean> {
 	const profile = await loadProfile(slug);
 	if (!profile || profile.home) return false;
-	await provision(profileHome(slug));
+	await provision(profileHome(slug), Boolean(profile.clean));
 	return true;
 }
 
-/** Resync all registered isolated profiles. */
+/** Resync all registered isolated profiles in parallel. */
 export async function syncProfiles(): Promise<string[]> {
 	const profiles = await listProfiles();
-	const synced: string[] = [];
-	for (const p of profiles) {
-		if (p.home) continue;
-		await provision(profileHome(p.slug));
-		synced.push(p.slug);
-	}
-	return synced;
+	const managed = profiles.filter(p => !p.home);
+	await Promise.all(managed.map(p => provision(profileHome(p.slug), Boolean(p.clean))));
+	return managed.map(p => p.slug);
 }
 
 /** Temporarily disable a profile from candidate selection and failover. */
