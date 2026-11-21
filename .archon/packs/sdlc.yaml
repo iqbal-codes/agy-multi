@@ -1,0 +1,4 @@
+settings:
+  ci: forge
+  build_lane: auto
+  merge_lane: manual
