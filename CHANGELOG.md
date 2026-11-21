@@ -6,6 +6,29 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-21
+
+### Added
+
+- parallel multi-account auto-sync and deep module architecture
+  Consolidate shallow modules into five deep modules (AccountPool, ModelCatalog, SessionLedger, TurnSupervisor, ProbeSync), enable unbounded parallel multi-account auto-sync across CLI and ACP startup, enrich catalogs consistently across session operations, and quiet ACP startup logs.
+
+### Maintenance
+
+- scaffold Archon SDLC policy and configuration
+- remove Animus scaffolding (#14)
+  The repository no longer uses the Animus software factory. Its
+  repository memory, holdout hooks, loop guard, check harness, and
+  agent playbooks referenced files and playbooks that do not exist
+  here, while the Claude/OMP/Pi settings loaded those hooks into
+  every session.
+
+  Remove the stale scaffolding so the tree contains only project-owned
+  assets. Keep the release skill, trail notes, and graft ignore rules,
+  which serve separate tools.
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v1.0.2...v1.1.0)
+
 ## [1.0.2] - 2026-11-18
 
 ### Fixed
