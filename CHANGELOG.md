@@ -6,6 +6,18 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-22
+
+### Added
+
+- **acp**: add transparent session/fork fallback via session/new and transcript replay
+
+### Fixed
+
+- isolate Linux profile D-Bus auth, repair broken symlinks, and report missing auth on sync
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v1.1.0...v1.2.0)
+
 ## [1.1.0] - 2026-11-21
 
 ### Added
