@@ -29,16 +29,30 @@ export async function exists(path: string): Promise<boolean> {
 	}
 }
 
-/** Link `source` at `target` only when the source exists and the target does not. */
+/** Link `source` at `target` when `source` exists and `target` is absent or a broken symlink. */
 export async function symlinkIfMissing(target: string, source: string): Promise<boolean> {
-	if (await exists(target)) return false;
+	let sourceStat;
 	try {
-		await stat(source);
+		sourceStat = await stat(source);
 	} catch {
 		return false;
 	}
+	try {
+		const targetStat = await lstat(target);
+		if (targetStat.isSymbolicLink()) {
+			const reachable = await stat(target).then(
+				() => true,
+				() => false,
+			);
+			if (reachable) return false;
+			await rm(target, { force: true });
+		} else {
+			return false;
+		}
+	} catch {
+		// target does not exist
+	}
 	await mkdir(dirname(target), { recursive: true });
-	const sourceStat = await stat(source);
 	if (sourceStat.isDirectory()) {
 		await symlink(source, target, process.platform === "win32" ? "junction" : "dir");
 	} else {

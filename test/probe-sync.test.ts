@@ -195,4 +195,18 @@ describe("ProbeSync deep module", () => {
 		await probes.refreshUsage(profileOf("needs-login"));
 		expect(signedOut).toEqual(["needs-login"]);
 	});
+
+	test("syncAll keeps cached usage when a refresh resolves to null", async () => {
+		const now = Date.now();
+		const profile = profileOf("fallback-usage");
+		await writeCachedUsage(snapshotOf("fallback-usage", now - 60 * 60_000, 42));
+		const probes = new ProbeSync({
+			now: () => now,
+			fetchers: {
+				usage: async () => null,
+			},
+		});
+		const [result] = await probes.syncAll([profile], { usage: true });
+		expect(result?.usage?.windows[0]?.remainingPct).toBe(42);
+	});
 });

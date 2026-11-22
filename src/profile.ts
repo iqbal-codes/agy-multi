@@ -1,10 +1,10 @@
-import { lstat, realpath, rename, rm, symlink } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { chmod, lstat, mkdtemp, realpath, rename, rm, symlink } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, join, resolve } from "node:path";
 import { AGY_BIN, profileDir, profileHome } from "./paths";
 import type { Profile } from "./types";
 import { ensureDir, exists, linkOrReplaceWithSymlink, run, symlinkIfMissing } from "./fs-utils";
-import { listProfiles, loadProfile, profileEnvOf, saveProfile } from "./registry";
+import { ISOLATED_LINUX_DBUS_ADDRESS, listProfiles, loadProfile, profileEnvOf, saveProfile } from "./registry";
 import { linkSharedConversations } from "./conversation-store";
 import { classifyRun } from "./classify";
 import { runTurn } from "./runner";
@@ -109,9 +109,14 @@ async function provisionShellBridge(home: string, sourceHome: string): Promise<v
 	for (const { name, target } of files) {
 		const filePath = join(home, name);
 		const content = [
-			`# agy-multi: restore real user HOME for child shells`,
+			`# agy-multi: restore real user HOME (and Linux D-Bus) for child shells`,
 			`export REAL_HOME="${sourceHome}"`,
 			`export HOME="$REAL_HOME"`,
+			`if [ -n "\${REAL_DBUS_SESSION_BUS_ADDRESS:-}" ]; then`,
+			`  export DBUS_SESSION_BUS_ADDRESS="$REAL_DBUS_SESSION_BUS_ADDRESS"`,
+			`elif [ "\${DBUS_SESSION_BUS_ADDRESS:-}" = "${ISOLATED_LINUX_DBUS_ADDRESS}" ]; then`,
+			`  unset DBUS_SESSION_BUS_ADDRESS`,
+			`fi`,
 			`[ -f "$REAL_HOME/${target}" ] && . "$REAL_HOME/${target}"`,
 			"",
 		].join("\n");
@@ -247,23 +252,46 @@ export interface AddProfileOptions {
 	clean?: boolean;
 }
 
-async function runInteractiveLogin(slug: string, home: string, remote = false): Promise<string> {
-	const logPath = join(profileDir(slug), "login.log");
-	const env = profileEnvOf(home);
-	if (remote) env.BROWSER = "/usr/bin/false";
-	const exitCode = await Bun.spawn([AGY_BIN, "acp", "--login", "--log-file", logPath], {
-		env,
-		stdin: "inherit",
-		stdout: "inherit",
-		stderr: "inherit",
-	}).exited;
-	if (exitCode !== 0) throw new Error(`login exited with code ${exitCode}; see ${logPath}`);
-	const logText = await Bun.file(logPath)
-		.text()
-		.catch(() => "");
-	const email = readEmailFromLog(logText);
-	if (!email) throw new Error(`login did not record an account email; see ${logPath}`);
-	return email;
+const BROWSER_LAUNCHERS = ["xdg-open", "open", "gio", "gnome-open", "sensible-browser"] as const;
+
+async function createNoBrowserShimDir(): Promise<string> {
+	const dir = await mkdtemp(join(tmpdir(), "agy-multi-nobrowser-"));
+	for (const name of BROWSER_LAUNCHERS) {
+		const bin = join(dir, name);
+		await Bun.write(bin, "#!/bin/sh\nexit 1\n");
+		await chmod(bin, 0o700);
+	}
+	return dir;
+}
+
+async function runInteractiveLogin(profile: Profile, _remote = false): Promise<string> {
+	const logPath = join(profileDir(profile.slug), "login.log");
+	const env = profileEnvOf(profile);
+	// Never auto-open a browser during `agy acp --login`: with an isolated profile HOME,
+	// `xdg-open` launches browsers with a brand-new empty profile. Always let the user
+	// click the printed OAuth URL manually in their existing browser.
+	env.BROWSER = "/usr/bin/false";
+	const shimDir = process.platform !== "win32" ? await createNoBrowserShimDir() : undefined;
+	if (shimDir) {
+		env.PATH = env.PATH ? `${shimDir}${delimiter}${env.PATH}` : shimDir;
+	}
+	try {
+		const exitCode = await Bun.spawn([AGY_BIN, "acp", "--login", "--log-file", logPath], {
+			env,
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+		}).exited;
+		if (exitCode !== 0) throw new Error(`login exited with code ${exitCode}; see ${logPath}`);
+		const logText = await Bun.file(logPath)
+			.text()
+			.catch(() => "");
+		const email = readEmailFromLog(logText);
+		if (!email) throw new Error(`login did not record an account email; see ${logPath}`);
+		return email;
+	} finally {
+		if (shimDir) await rm(shimDir, { recursive: true, force: true }).catch(() => {});
+	}
 }
 
 async function runCanaryCheck(profile: Profile): Promise<void> {
@@ -311,7 +339,7 @@ export async function addProfile(slug: string, opts: AddProfileOptions = {}): Pr
 	await ensureDir(profileDir(slug));
 
 	if (opts.login !== false) {
-		profile.email = await runInteractiveLogin(slug, home, Boolean(opts.remote));
+		profile.email = await runInteractiveLogin(profile, Boolean(opts.remote));
 		profile.lastLoginAt = new Date().toISOString();
 	}
 
@@ -344,7 +372,7 @@ export async function loginProfile(
 		await ensureKeychain(home);
 	}
 
-	profile.email = await runInteractiveLogin(slug, home, Boolean(opts.remote));
+	profile.email = await runInteractiveLogin(profile, Boolean(opts.remote));
 	profile.lastLoginAt = new Date().toISOString();
 	delete profile.authRequiredAt;
 

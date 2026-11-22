@@ -195,7 +195,10 @@ export class ProbeSync {
 			ordered.map(async ({ profile, usage: cachedUsage, models: cachedModels }): Promise<SyncProfileResult> => {
 				const usageTask = wantsUsage
 					? force || this.isStale(cachedUsage?.fetchedAt, this.usageTtlMs)
-						? this.refreshUsage(profile).catch(() => cachedUsage)
+						? this.refreshUsage(profile).then(
+								snapshot => snapshot ?? cachedUsage,
+								() => cachedUsage,
+							)
 						: Promise.resolve(cachedUsage)
 					: Promise.resolve(cachedUsage);
 

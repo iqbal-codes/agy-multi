@@ -7,7 +7,7 @@ import { aggregateTokens, collectAllTurns, renderPeriodTable, renderStatsTable }
 import { isPublicGeminiModel } from "./model-catalog";
 import { DEFAULT_SWITCH_DELAY_MS } from "./paths";
 import { ProbeSync, type SyncProfileResult } from "./probe-sync";
-import { addProfile, disableProfile, enableProfile, loginProfile, syncProfile, syncProfiles } from "./profile";
+import { addProfile, disableProfile, enableProfile, hasValidAuth, loginProfile, syncProfile, syncProfiles } from "./profile";
 import { listProfiles, loadProfile, removeProfile } from "./registry";
 import { RunFailure, runWithFailover } from "./runner";
 import { ensureAgy } from "./setup";
@@ -27,30 +27,45 @@ function ageText(ms: number): string {
 	return `${Math.round(hours / 24)}d`;
 }
 
-function printSyncSummary(result: SyncProfileResult): void {
-	const quotaText =
+interface SyncSummaryEntry extends SyncProfileResult {
+	authMissing?: boolean;
+}
+
+function printSyncSummary(result: SyncSummaryEntry): void {
+	const quotaRaw =
 		result.usage && result.usage.windows.length > 0
 			? result.usage.windows.map(w => `${w.family} ${w.window} ${w.remainingPct}%`).join(", ")
 			: "unavailable";
+	const quotaText = result.authMissing && quotaRaw !== "unavailable" ? `cached (${quotaRaw})` : quotaRaw;
 	const modelsCount = result.models
 		? result.models.models.filter(m => isPublicGeminiModel(m.modelId)).length
 		: 0;
 	const reasoningText =
 		result.reasoningCount !== undefined ? `${result.reasoningCount} model(s)` : "skipped";
-	console.log(`${result.slug}\tquota: ${quotaText}\tmodels: ${modelsCount}\treasoning: ${reasoningText}`);
+	const authHint = result.authMissing
+		? `\tauth: missing (run \`agy-multi profile login ${result.slug}\`)`
+		: "";
+	console.log(`${result.slug}${authHint}\tquota: ${quotaText}\tmodels: ${modelsCount}\treasoning: ${reasoningText}`);
 }
 
 /**
  * Sync usage, models, and reasoning in parallel right after login or explicit profile sync.
  */
-async function syncAccountCaches(profiles: Profile[], force = false): Promise<SyncProfileResult[]> {
+async function syncAccountCaches(profiles: Profile[], force = false): Promise<SyncSummaryEntry[]> {
+	const authStates = new Map(
+		await Promise.all(profiles.map(async profile => [profile.slug, await hasValidAuth(profile)] as const)),
+	);
 	const probes = new ProbeSync();
-	return await probes.syncAll(profiles, {
+	const results = await probes.syncAll(profiles, {
 		usage: true,
 		models: true,
 		reasoning: true,
 		force,
 	});
+	return results.map(result => ({
+		...result,
+		...(authStates.get(result.slug) === false ? { authMissing: true } : {}),
+	}));
 }
 
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
