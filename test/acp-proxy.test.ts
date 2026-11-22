@@ -152,7 +152,12 @@ interface Invocation {
 }
 
 interface Reply {
-	result?: { protocolVersion?: number; sessionId?: string; stopReason?: string };
+	result?: {
+		protocolVersion?: number;
+		sessionId?: string;
+		stopReason?: string;
+		agentCapabilities?: Record<string, unknown>;
+	};
 	error?: { code: number; message: string };
 }
 
@@ -1013,6 +1018,345 @@ describe("agy-multi ACP proxy (daemon tasks and /multi-usage)", () => {
 						"Claude and GPT models\tFive Hour Limit Remaining\t50%\t2099-01-01T00:00:00Z",
 					].join("\n"),
 				);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+});
+
+describe("agy-multi ACP proxy (session/fork fallback)", () => {
+	test(
+		"advertises sessionCapabilities.fork and falls back to session/new + full transcript replay on -32601",
+		async () => {
+			const f = await fixture(["acct-a"]);
+			// Use a tiny --handoff-context cap to verify emulated forks still replay full history.
+			const client = f.proxy(["--handoff-context", "30"]);
+			try {
+				const initialized = await client.send<Reply>("initialize", {
+					protocolVersion: 1,
+					clientCapabilities: {},
+				});
+				expect(initialized.error).toBeUndefined();
+				const capabilities = initialized.result?.agentCapabilities;
+				expect(isRecord(capabilities)).toBe(true);
+				const sessionCaps = isRecord(capabilities?.sessionCapabilities)
+					? capabilities.sessionCapabilities
+					: undefined;
+				expect(sessionCaps?.fork).toEqual({});
+				expect(sessionCaps?.list).toEqual({});
+				expect(sessionCaps?.resume).toEqual({});
+
+				const created = await client.send<Reply>("session/new", {
+					cwd: f.root,
+					mcpServers: [],
+					additionalDirectories: [f.root],
+				});
+				expect(created.error).toBeUndefined();
+				const sourceId = created.result?.sessionId;
+				expect(sourceId).toBeTruthy();
+
+				const originalPrompt = "ORIGINAL HISTORY ".repeat(4).trim();
+				const firstTurn = await client.send<Reply>("session/prompt", {
+					sessionId: sourceId,
+					prompt: [{ type: "text", text: originalPrompt }],
+				});
+				expect(firstTurn.error).toBeUndefined();
+				expect(firstTurn.result?.stopReason).toBe("end_turn");
+
+				const forked = await client.send<Reply>("session/fork", { sessionId: sourceId });
+				expect(forked.error).toBeUndefined();
+				const forkId = forked.result?.sessionId;
+				expect(forkId).toBeTruthy();
+				expect(forkId).not.toBe(sourceId);
+
+				// Source session remains usable on its own child session.
+				const sourceContinue = await client.send<Reply>("session/prompt", {
+					sessionId: sourceId,
+					prompt: [{ type: "text", text: "SOURCE CONTINUES" }],
+				});
+				expect(sourceContinue.error).toBeUndefined();
+				expect(sourceContinue.result?.stopReason).toBe("end_turn");
+
+				// Fork's first prompt replays full copied history + new prompt on a fresh child session.
+				const forkTurn = await client.send<Reply>("session/prompt", {
+					sessionId: forkId,
+					prompt: [{ type: "text", text: "NEXT TURN" }],
+				});
+				expect(forkTurn.error).toBeUndefined();
+				expect(forkTurn.result?.stopReason).toBe("end_turn");
+
+				// Subsequent prompt on the fork goes directly without replaying history again.
+				const forkSecondTurn = await client.send<Reply>("session/prompt", {
+					sessionId: forkId,
+					prompt: [{ type: "text", text: "FOLLOW UP" }],
+				});
+				expect(forkSecondTurn.error).toBeUndefined();
+
+				// Forking a fork also works.
+				const nestedFork = await client.send<Reply>("session/fork", { sessionId: forkId });
+				expect(nestedFork.error).toBeUndefined();
+				const nestedForkId = nestedFork.result?.sessionId;
+				expect(nestedForkId).toBeTruthy();
+				expect(nestedForkId).not.toBe(sourceId);
+				expect(nestedForkId).not.toBe(forkId);
+
+				const nestedTurn = await client.send<Reply>("session/prompt", {
+					sessionId: nestedForkId,
+					prompt: [{ type: "text", text: "NESTED TURN" }],
+				});
+				expect(nestedTurn.error).toBeUndefined();
+
+				const prompts = (await f.invocations()).filter(entry => entry.method === "session/prompt");
+				expect(prompts).toHaveLength(5);
+
+				const [sourceFirst, sourceSecond, forkFirst, forkSecond, nestedFirst] = prompts;
+				expect(sourceFirst?.sessionId).toBe(sourceSecond?.sessionId);
+				expect(forkFirst?.sessionId).toBeTruthy();
+				expect(forkFirst?.sessionId).not.toBe(sourceFirst?.sessionId);
+				expect(forkFirst?.sessionId).toBe(forkSecond?.sessionId);
+				expect(forkFirst?.text).toContain(originalPrompt);
+				expect(forkFirst?.text).toContain("NEXT TURN");
+				expect(forkSecond?.text).toBe("FOLLOW UP");
+
+				expect(nestedFirst?.sessionId).toBeTruthy();
+				expect(nestedFirst?.sessionId).not.toBe(sourceFirst?.sessionId);
+				expect(nestedFirst?.sessionId).not.toBe(forkFirst?.sessionId);
+				expect(nestedFirst?.text).toContain(originalPrompt);
+				expect(nestedFirst?.text).toContain("NEXT TURN");
+				expect(nestedFirst?.text).toContain("FOLLOW UP");
+				expect(nestedFirst?.text).toContain("NESTED TURN");
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"forks an empty session cleanly on -32601 fallback",
+		async () => {
+			const f = await fixture(["acct-a"]);
+			const client = f.proxy([]);
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const sourceId = created.result?.sessionId;
+				expect(sourceId).toBeTruthy();
+
+				const forked = await client.send<Reply>("session/fork", { sessionId: sourceId });
+				expect(forked.error).toBeUndefined();
+				const forkId = forked.result?.sessionId;
+				expect(forkId).toBeTruthy();
+				expect(forkId).not.toBe(sourceId);
+
+				expect(
+					(await client.send<Reply>("session/prompt", { sessionId: forkId, prompt: [{ type: "text", text: "FORK FIRST" }] }))
+						.error,
+				).toBeUndefined();
+				expect(
+					(await client.send<Reply>("session/prompt", { sessionId: sourceId, prompt: [{ type: "text", text: "SOURCE FIRST" }] }))
+						.error,
+				).toBeUndefined();
+
+				const prompts = (await f.invocations()).filter(entry => entry.method === "session/prompt");
+				expect(prompts).toHaveLength(2);
+				expect(prompts[0]?.sessionId).not.toBe(prompts[1]?.sessionId);
+				expect(prompts[0]?.text).toContain("FORK FIRST");
+				expect(prompts[1]?.text).toBe("SOURCE FIRST");
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"propagates non--32601 child errors from session/fork unchanged",
+		async () => {
+			const failingForkAgent = `#!/usr/bin/env bun
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+
+const log = process.env.FAKE_AGY_LOG;
+const record = entry => {
+  if (log) appendFileSync(log, JSON.stringify(entry) + "\\n");
+};
+if (Bun.argv.includes("/usage")) {
+  process.stdout.write(JSON.stringify({ status: "SUCCESS", response: "" }) + "\\n");
+  process.exit(0);
+}
+if (Bun.argv.includes("models")) {
+  process.stdout.write("gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n");
+  process.exit(0);
+}
+let seq = 0;
+const send = msg => process.stdout.write(JSON.stringify(msg) + "\\n");
+createInterface({ input: process.stdin }).on("line", line => {
+  const m = JSON.parse(line);
+  record({ event: "request", method: m.method, sessionId: m.params?.sessionId });
+  if (m.method === "initialize") {
+    return send({ jsonrpc: "2.0", id: m.id, result: {
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true, sessionCapabilities: { list: {} } },
+      authMethods: [],
+    }});
+  }
+  if (m.method === "session/new") {
+    return send({ jsonrpc: "2.0", id: m.id, result: {
+      sessionId: "child-" + (++seq),
+      models: { currentModelId: "gemini-3.8-flash-high", availableModels: [] },
+    }});
+  }
+  if (m.method === "session/fork") {
+    return send({ jsonrpc: "2.0", id: m.id, error: { code: -32000, message: "RESOURCE_EXHAUSTED: fork quota exceeded" } });
+  }
+  send({ jsonrpc: "2.0", id: m.id, result: {} });
+});
+`;
+			const f = await fixture(["acct-a"], { agent: failingForkAgent });
+			const client = f.proxy([]);
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const sourceId = created.result?.sessionId;
+
+				const forked = await client.send<Reply>("session/fork", { sessionId: sourceId });
+				expect(forked.result).toBeUndefined();
+				expect(forked.error).toEqual({
+					code: -32000,
+					message: "RESOURCE_EXHAUSTED: fork quota exceeded",
+				});
+
+				const newRequests = (await f.invocations()).filter(entry => entry.method === "session/new");
+				expect(newRequests).toHaveLength(1);
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"preserves native session/fork fast path and augments snake_case session_capabilities",
+		async () => {
+			const nativeForkAgent = `#!/usr/bin/env bun
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+
+const log = process.env.FAKE_AGY_LOG;
+const record = entry => {
+  if (log) appendFileSync(log, JSON.stringify(entry) + "\\n");
+};
+if (Bun.argv.includes("/usage")) {
+  process.stdout.write(JSON.stringify({ status: "SUCCESS", response: "" }) + "\\n");
+  process.exit(0);
+}
+if (Bun.argv.includes("models")) {
+  process.stdout.write("gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n");
+  process.exit(0);
+}
+let seq = 0;
+const send = msg => process.stdout.write(JSON.stringify(msg) + "\\n");
+createInterface({ input: process.stdin }).on("line", line => {
+  const m = JSON.parse(line);
+  record({
+    event: "request",
+    method: m.method,
+    sessionId: m.params?.sessionId,
+    ...(m.method === "session/prompt" ? { text: m.params?.prompt?.[0]?.text } : {}),
+  });
+  if (m.method === "initialize") {
+    return send({ jsonrpc: "2.0", id: m.id, result: {
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true, session_capabilities: { list: {} } },
+      authMethods: [],
+    }});
+  }
+  if (m.method === "session/new") {
+    return send({ jsonrpc: "2.0", id: m.id, result: {
+      sessionId: "child-" + (++seq),
+      models: { currentModelId: "gemini-3.8-flash-high", availableModels: [] },
+    }});
+  }
+  if (m.method === "session/fork") {
+    const forkChildId = "native-fork-" + (++seq);
+    send({ jsonrpc: "2.0", method: "session/update", params: {
+      sessionId: forkChildId,
+      update: { sessionUpdate: "session_info_update", title: "Forked Title" },
+    }});
+    return send({ jsonrpc: "2.0", id: m.id, result: {
+      sessionId: forkChildId,
+      models: { currentModelId: "gemini-3.8-flash-high", availableModels: [] },
+    }});
+  }
+  if (m.method === "session/prompt") {
+    send({ jsonrpc: "2.0", method: "session/update", params: {
+      sessionId: m.params.sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OK" } },
+    }});
+    return send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } });
+  }
+  send({ jsonrpc: "2.0", id: m.id, result: {} });
+});
+`;
+			const f = await fixture(["acct-a"], { agent: nativeForkAgent });
+			const client = f.proxy([]);
+			try {
+				const initialized = await client.send<Reply>("initialize", {
+					protocolVersion: 1,
+					clientCapabilities: {},
+				});
+				const capabilities = initialized.result?.agentCapabilities;
+				const snakeCaps = isRecord(capabilities?.session_capabilities)
+					? capabilities.session_capabilities
+					: undefined;
+				expect(snakeCaps?.fork).toEqual({});
+				expect(snakeCaps?.list).toEqual({});
+
+				const created = await client.send<Reply>("session/new", { cwd: f.root, mcpServers: [] });
+				const sourceId = created.result?.sessionId;
+				await client.send<Reply>("session/prompt", {
+					sessionId: sourceId,
+					prompt: [{ type: "text", text: "NATIVE SOURCE" }],
+				});
+
+				const forked = await client.send<Reply>("session/fork", { sessionId: sourceId });
+				expect(forked.error).toBeUndefined();
+				const forkId = forked.result?.sessionId;
+				expect(forkId).toBeTruthy();
+				expect(forkId).not.toBe(sourceId);
+				expect(forkId).not.toContain("native-fork-");
+
+				const titleNotice = await client.waitForNotification(
+					msg =>
+						isRecord(msg) &&
+						msg.method === "session/update" &&
+						isRecord(msg.params) &&
+						msg.params.sessionId === forkId &&
+						isRecord(msg.params.update) &&
+						msg.params.update.title === "Forked Title",
+				);
+				expect(titleNotice).toBeDefined();
+
+				await client.send<Reply>("session/prompt", {
+					sessionId: forkId,
+					prompt: [{ type: "text", text: "NATIVE FOLLOWUP" }],
+				});
+
+				const invocations = await f.invocations();
+				// Native fast path never fell back to a second session/new.
+				expect(invocations.filter(entry => entry.method === "session/new")).toHaveLength(1);
+				const prompts = invocations.filter(entry => entry.method === "session/prompt");
+				expect(prompts).toHaveLength(2);
+				// Native fork does not prepend transcript replay.
+				expect(prompts[1]?.text).toBe("NATIVE FOLLOWUP");
+				expect(prompts[1]?.sessionId).toContain("native-fork-");
 			} finally {
 				await stop(client);
 				await f.cleanup();

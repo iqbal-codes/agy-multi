@@ -66,6 +66,41 @@ function errorMessage(error: unknown): string {
 }
 
 /**
+ * Advertise `sessionCapabilities.fork = {}` since the proxy handles `session/fork`
+ * natively when supported by the child or via `session/new` + transcript replay fallback.
+ */
+function augmentInitializeResult(result: unknown): unknown {
+	if (!isRecord(result)) return result;
+	const capabilities = isRecord(result.agentCapabilities) ? result.agentCapabilities : {};
+	const hasCamel = isRecord(capabilities.sessionCapabilities);
+	const hasSnake = isRecord(capabilities.session_capabilities);
+
+	const nextCapabilities: Record<string, unknown> = { ...capabilities };
+	if (hasCamel) {
+		const existing = capabilities.sessionCapabilities as Record<string, unknown>;
+		nextCapabilities.sessionCapabilities = {
+			...existing,
+			fork: isRecord(existing.fork) ? existing.fork : {},
+		};
+	}
+	if (hasSnake) {
+		const existing = capabilities.session_capabilities as Record<string, unknown>;
+		nextCapabilities.session_capabilities = {
+			...existing,
+			fork: isRecord(existing.fork) ? existing.fork : {},
+		};
+	}
+	if (!hasCamel && !hasSnake) {
+		nextCapabilities.sessionCapabilities = { fork: {} };
+	}
+
+	return {
+		...result,
+		agentCapabilities: nextCapabilities,
+	};
+}
+
+/**
  * Stdio JSON-RPC 2.0 ACP router fronting per-profile `agy acp` child processes.
  *
  * Delegates pool ranking/state to `AccountPool`, model/reasoning catalogs to `ModelCatalog`,
@@ -663,7 +698,7 @@ class AcpProxy {
 				const child = await this.ensureChild(profile);
 				const result = await child.initialize(request.params);
 				this.controlChild = child;
-				this.respond(request.id, result);
+				this.respond(request.id, augmentInitializeResult(result));
 				return;
 			} catch (error) {
 				lastError = error;
@@ -908,24 +943,86 @@ class AcpProxy {
 		const params = isRecord(request.params) ? request.params : {};
 		const sessionId = readString(params.sessionId);
 		if (!sessionId) throw new Error("session/fork requires sessionId");
-		const session = this.ledger.get(sessionId);
+		const session = await this.ledger.resolveOrLoad(sessionId);
 		if (!session) throw new Error(`unknown session: ${sessionId}`);
 		const child = await this.ensureSessionChild(session);
 		const response = await child.request("session/fork", { ...params, sessionId: session.childSessionId });
-		if (response.error) throw new AcpRpcError(response.error);
+		if (response.error) {
+			if (response.error.code !== -32601) throw new AcpRpcError(response.error);
+			await this.fallbackSessionFork(request.id, session, child);
+			return;
+		}
 		const result = isRecord(response.result) ? response.result : {};
 		const forkProfile = this.pool.get(session.profile);
 		if (forkProfile) this.catalog.discoverFromAcpResult(forkProfile, result);
 		const childSessionId = readString(result.sessionId);
 		if (!childSessionId) throw new Error("agent returned no sessionId for session/fork");
+		if (childSessionId === session.childSessionId) {
+			throw new Error("agent returned source sessionId for session/fork");
+		}
 
 		const models = isRecord(result.models) ? result.models : undefined;
 		const modelId = models && typeof models.currentModelId === "string" ? models.currentModelId : undefined;
-		const forked = this.ledger.fork(session, childSessionId, modelId);
+		const forked = this.ledger.fork(session, childSessionId, modelId, {
+			needsHandoff: session.needsHandoff,
+			handoffSessionReady: session.handoffSessionReady,
+			fullHandoffReplay: session.fullHandoffReplay,
+			bufferPendingOut: true,
+		});
 		child.loadedSessions.add(childSessionId);
+		for (const message of this.ledger.takeUnknownUpdates(session.profile, childSessionId)) {
+			this.handleAgentNotification(child, message);
+		}
 		await this.ledger.save();
 		const enriched = await this.catalog.enrichSessionResult(result, session.profile, this.pool.healthyProfiles());
 		this.respond(request.id, { ...enriched, sessionId: forked.id });
+		this.ledger.drainPendingOut(forked, msg => this.sendToClient(msg));
+	}
+
+	private async fallbackSessionFork(clientId: JsonRpcId, source: SessionState, child: AcpChild): Promise<void> {
+		this.log(
+			`child ${source.profile} does not support session/fork (-32601); falling back to session/new + transcript replay`,
+		);
+		const payload: Record<string, unknown> = {
+			cwd: source.cwd,
+			mcpServers: source.mcpServers,
+			...(source.additionalDirectories ? { additionalDirectories: source.additionalDirectories } : {}),
+		};
+		const created = await child.request("session/new", payload);
+		if (created.error) throw new AcpRpcError(created.error);
+		const createdResult = isRecord(created.result) ? created.result : {};
+		const childSessionId = readString(createdResult.sessionId);
+		if (!childSessionId) throw new Error("agent returned no sessionId for session/new");
+		if (childSessionId === source.childSessionId) {
+			throw new Error("agent returned source sessionId for session/new during fork fallback");
+		}
+
+		const forkProfile = this.pool.get(source.profile);
+		if (forkProfile) this.catalog.discoverFromAcpResult(forkProfile, createdResult);
+		const models = isRecord(createdResult.models) ? createdResult.models : undefined;
+		const createdModelId = models && typeof models.currentModelId === "string" ? models.currentModelId : undefined;
+		const modelId = source.modelId ?? createdModelId;
+
+		const forked = this.ledger.fork(source, childSessionId, modelId, {
+			needsHandoff: true,
+			handoffSessionReady: true,
+			fullHandoffReplay: true,
+			bufferPendingOut: true,
+		});
+		child.loadedSessions.add(childSessionId);
+		for (const message of this.ledger.takeUnknownUpdates(source.profile, childSessionId)) {
+			this.handleAgentNotification(child, message);
+		}
+		await this.ledger.save();
+
+		const enriched = await this.catalog.enrichSessionResult(
+			createdResult,
+			source.profile,
+			this.pool.healthyProfiles(),
+		);
+		this.respond(clientId, { ...enriched, sessionId: forked.id });
+		this.ledger.drainPendingOut(forked, msg => this.sendToClient(msg));
+		this.broadcastAvailableCommands(forked);
 	}
 
 	private async onGenericRequest(request: JsonRpcRequest): Promise<void> {
@@ -1205,7 +1302,7 @@ class AcpProxy {
 					this.ledger.getByChild(profile.slug, session.childSessionId) === session &&
 					child.loadedSessions.has(session.childSessionId);
 				const resumed =
-					!ready && session.childSessionId && session.profile !== profile.slug
+					!ready && !session.fullHandoffReplay && session.childSessionId && session.profile !== profile.slug
 						? await child.request("session/resume", {
 								sessionId: session.childSessionId,
 								cwd: session.cwd,
@@ -1222,6 +1319,7 @@ class AcpProxy {
 						childSessionId: session.childSessionId,
 						needsHandoff: false,
 						handoffSessionReady: true,
+						fullHandoffReplay: false,
 					});
 					child.loadedSessions.add(session.childSessionId);
 					this.closePreviousChildSession(previousProfile, previousChildId);
@@ -1281,9 +1379,10 @@ class AcpProxy {
 						throw new AcpRpcError(setModel.error);
 					}
 				}
+				const replayMaxChars = session.fullHandoffReplay ? 0 : this.handoffContextChars;
 				text = resumedNative
 					? originalText
-					: buildHandoffPrompt({ history: session.history, maxChars: this.handoffContextChars }) || originalText;
+					: buildHandoffPrompt({ history: session.history, maxChars: replayMaxChars }) || originalText;
 			}
 
 			const transport = this.transportFor(child);
@@ -1370,6 +1469,7 @@ class AcpProxy {
 			}
 			session.needsHandoff = false;
 			session.handoffSessionReady = false;
+			session.fullHandoffReplay = false;
 			session.record.updatedAt = new Date().toISOString();
 			await this.pool.recordSuccess(profile.slug);
 			await this.ledger.save();

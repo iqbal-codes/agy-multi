@@ -109,4 +109,75 @@ describe("SessionLedger deep module", () => {
 			await rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("fork copies history, isolates child mapping, and persists handoff/replay flags across reload", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "agy-session-ledger-fork-"));
+		const path = join(dir, "acp-sessions.json");
+		try {
+			const ledger = new SessionLedger(path);
+			await ledger.load();
+
+			const source = ledger.create({
+				profile: "acct-a",
+				childSessionId: "child-1",
+				cwd: "/repo",
+				mcpServers: [{ name: "mcp-1" }],
+				additionalDirectories: ["/extra"],
+				modelId: "gemini-3.8-flash-high",
+			});
+			source.history.push(
+				{ role: "user", text: "ORIGINAL PROMPT" },
+				{ role: "assistant", text: "ORIGINAL ANSWER" },
+			);
+
+			const forked = ledger.fork(source, "child-fork-1", source.modelId, {
+				needsHandoff: true,
+				handoffSessionReady: true,
+				fullHandoffReplay: true,
+				bufferPendingOut: true,
+			});
+
+			expect(forked.id).not.toBe(source.id);
+			expect(forked.childSessionId).toBe("child-fork-1");
+			expect(source.childSessionId).toBe("child-1");
+			expect(ledger.getByChild("acct-a", "child-1")).toBe(source);
+			expect(ledger.getByChild("acct-a", "child-fork-1")).toBe(forked);
+			expect(forked.pendingOut).toEqual([]);
+			expect(forked.needsHandoff).toBe(true);
+			expect(forked.handoffSessionReady).toBe(true);
+			expect(forked.fullHandoffReplay).toBe(true);
+			expect(forked.modelId).toBe("gemini-3.8-flash-high");
+			expect(forked.history).toEqual(source.history);
+
+			// Mutating the fork does not mutate the source session.
+			forked.history.push({ role: "user", text: "FORK ONLY" });
+			expect(source.history).toHaveLength(2);
+			expect(forked.history).toHaveLength(3);
+
+			await ledger.save();
+
+			const reloaded = new SessionLedger(path);
+			await reloaded.load();
+			const restoredFork = await reloaded.resolveOrLoad(forked.id);
+			const restoredSource = await reloaded.resolveOrLoad(source.id);
+			expect(restoredFork).toBeDefined();
+			expect(restoredFork?.childSessionId).toBe("child-fork-1");
+			expect(restoredFork?.modelId).toBe("gemini-3.8-flash-high");
+			expect(restoredFork?.additionalDirectories).toEqual(["/extra"]);
+			expect(restoredFork?.needsHandoff).toBe(true);
+			expect(restoredFork?.handoffSessionReady).toBe(true);
+			expect(restoredFork?.fullHandoffReplay).toBe(true);
+			expect(restoredFork?.history).toEqual([
+				{ role: "user", text: "ORIGINAL PROMPT" },
+				{ role: "assistant", text: "ORIGINAL ANSWER" },
+				{ role: "user", text: "FORK ONLY" },
+			]);
+			expect(restoredSource?.childSessionId).toBe("child-1");
+			expect(restoredSource?.needsHandoff).toBeUndefined();
+			expect(restoredSource?.fullHandoffReplay).toBeUndefined();
+			expect(restoredSource?.history).toHaveLength(2);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
 });

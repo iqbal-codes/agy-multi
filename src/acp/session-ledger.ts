@@ -23,6 +23,8 @@ export interface AcpSessionRecord {
 	history?: HistoryEntry[];
 	needsHandoff?: boolean;
 	handoffSessionReady?: boolean;
+	/** Replay full history on handoff regardless of global `handoffContextChars` cap (used by emulated forks). */
+	fullHandoffReplay?: boolean;
 	title?: string;
 	createdAt: string;
 	updatedAt: string;
@@ -56,6 +58,7 @@ export interface SessionState {
 	activeTurn?: TurnState;
 	needsHandoff?: boolean;
 	handoffSessionReady?: boolean;
+	fullHandoffReplay?: boolean;
 	loading?: boolean;
 	suppressReplay?: boolean;
 	cancelled?: boolean;
@@ -309,24 +312,44 @@ export class SessionLedger {
 	}
 
 	/** Fork an existing session into a new proxy ID with copied history and metadata. */
-	fork(source: SessionState, childSessionId: string, modelId?: string): SessionState {
+	fork(
+		source: SessionState,
+		childSessionId: string,
+		modelId?: string,
+		options?: {
+			needsHandoff?: boolean;
+			handoffSessionReady?: boolean;
+			fullHandoffReplay?: boolean;
+			bufferPendingOut?: boolean;
+		},
+	): SessionState {
 		const now = new Date().toISOString();
 		const id = randomUUID();
+		const additionalDirectories = source.additionalDirectories ? [...source.additionalDirectories] : undefined;
+		const mcpServers = [...source.mcpServers];
+		const history = source.history.map(entry => ({ ...entry }));
+		const resolvedModelId = modelId ?? source.modelId;
 		const record: AcpSessionRecord = {
 			id,
 			profile: source.profile,
 			childSessionId,
 			cwd: source.cwd,
-			...(source.additionalDirectories ? { additionalDirectories: source.additionalDirectories } : {}),
-			mcpServers: source.mcpServers,
+			...(additionalDirectories ? { additionalDirectories } : {}),
+			mcpServers,
+			...(resolvedModelId ? { modelId: resolvedModelId } : {}),
+			history,
+			...(options?.needsHandoff !== undefined ? { needsHandoff: options.needsHandoff } : {}),
+			...(options?.handoffSessionReady !== undefined ? { handoffSessionReady: options.handoffSessionReady } : {}),
+			...(options?.fullHandoffReplay !== undefined ? { fullHandoffReplay: options.fullHandoffReplay } : {}),
 			createdAt: now,
 			updatedAt: now,
 		};
 		const forked: SessionState = {
 			...record,
-			mcpServers: record.mcpServers ?? [],
-			history: [...source.history],
-			modelId: modelId ?? source.modelId,
+			mcpServers,
+			history,
+			modelId: resolvedModelId,
+			...(options?.bufferPendingOut ? { pendingOut: [] } : {}),
 			record,
 		};
 		this.sessions.set(id, forked);
@@ -346,6 +369,7 @@ export class SessionLedger {
 			childSessionId: string;
 			needsHandoff?: boolean;
 			handoffSessionReady?: boolean;
+			fullHandoffReplay?: boolean;
 		},
 	): { previousProfile: string; previousChildId: string } {
 		const previousProfile = session.profile;
@@ -359,6 +383,7 @@ export class SessionLedger {
 		session.record.updatedAt = new Date().toISOString();
 		if (next.needsHandoff !== undefined) session.needsHandoff = next.needsHandoff;
 		if (next.handoffSessionReady !== undefined) session.handoffSessionReady = next.handoffSessionReady;
+		if (next.fullHandoffReplay !== undefined) session.fullHandoffReplay = next.fullHandoffReplay;
 
 		this.sessionsByChild.set(childKey(next.profile, next.childSessionId), session);
 		return { previousProfile, previousChildId };
@@ -482,6 +507,7 @@ export class SessionLedger {
 			session.record.modelId = session.modelId;
 			session.record.needsHandoff = session.needsHandoff;
 			session.record.handoffSessionReady = session.handoffSessionReady;
+			session.record.fullHandoffReplay = session.fullHandoffReplay;
 		}
 		const snapshot = structuredClone(this.store);
 		const deleted = new Set(this.deletedSessionIds);

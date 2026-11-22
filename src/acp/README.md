@@ -40,6 +40,17 @@ catalogs to [`ModelCatalog`](../model-catalog.ts), parallel probing to
   with `--switch-delay` defaulting to 10 s.
 - **Resume before replay.** Cross-profile handoff tries `session/resume` on the shared
   conversation store first and falls back to `session/new` + verbatim transcript replay.
+- **Transparent `session/fork` fallback.** `initialize` augments `agentCapabilities` to
+  advertise `sessionCapabilities.fork = {}` (preserving existing `sessionCapabilities` /
+  `session_capabilities`). `session/fork` calls the child's native `session/fork` first
+  (fast path). Only when the child rejects it with JSON-RPC `-32601` (method not found)
+  does the proxy fall back to creating a fresh child session via `session/new` (copying
+  `cwd`, `mcpServers`, and `additionalDirectories`), registering a new forked proxy
+  session with `needsHandoff`, `handoffSessionReady`, and full-history replay armed, and
+  replaying the copied text transcript on the fork's first prompt. Non-`-32601` child
+  errors propagate unchanged. The source session remains completely unchanged and keeps
+  its own child session. Emulated fork is text transcript replay, not a byte-for-byte
+  clone of native tool-call snapshots or internal child state.
 - **Consistent catalog enrichment.** `session/new`, `session/load`, `session/resume`,
   and `session/fork` all enrich results through `ModelCatalog.enrichSessionResult` and
   filter outbound responses to public Gemini releases.
