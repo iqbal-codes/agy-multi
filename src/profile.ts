@@ -30,6 +30,15 @@ const SHARED_ENTRIES = [
 const TOOL_ENTRIES = [".gitconfig", ".config", ".ssh", ".npmrc", ".netrc", ".agents", ".aws", ".kube", ".docker"];
 
 /**
+ * Regenerable caches, shared so N accounts don't download N copies of the same
+ * browser binary and npm tarballs. Nothing here holds credentials, account
+ * state, or conversation data, so a shared cache keeps the isolation that
+ * matters while dropping the duplication. Safe to delete at any time: every
+ * entry is rebuilt on demand.
+ */
+const CACHE_ENTRIES = [".agent-browser", ".npm", ".cache", ".local/share/vite-plus"];
+
+/**
  * A fake HOME has no login keychain, so macOS pops
  * "A keychain cannot be found to store ...". Create an isolated keychain in
  * the profile HOME with no timeout and no auto-lock.
@@ -230,6 +239,13 @@ async function provision(home: string, clean = false): Promise<void> {
 		}
 	}
 	await provisionShellBridge(home, sourceHome);
+	// Caches contain no config or credentials, so both clean and normal profiles
+	// use the primary home's copy instead of growing their own.
+	for (const rel of CACHE_ENTRIES) {
+		const shared = join(sourceHome, rel);
+		await ensureDir(shared);
+		await linkOrReplaceWithSymlink(join(home, rel), shared);
+	}
 	// Conversations are shared by every account; credentials and settings are not.
 	await linkSharedConversations(home);
 }
