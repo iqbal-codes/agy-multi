@@ -161,6 +161,36 @@ describe("ProbeSync deep module", () => {
 		expect((await readCachedModels("stale"))?.models[0]?.modelId).toBe("gemini-3.8-flash-high");
 	});
 
+	test("forceUsage re-probes fresh quota without forcing models", async () => {
+		const now = Date.now();
+		await writeCachedUsage(snapshotOf("fresh-force", now - 1_000, 40));
+		await writeCachedModels(modelsOf("fresh-force", now - 1_000));
+		const seenUsage: string[] = [];
+		const seenModels: string[] = [];
+		const probes = new ProbeSync({
+			now: () => now,
+			fetchers: {
+				usage: async profile => {
+					seenUsage.push(profile.slug);
+					return snapshotOf(profile.slug, now, 91);
+				},
+				models: async profile => {
+					seenModels.push(profile.slug);
+					return modelsOf(profile.slug, now);
+				},
+			},
+		});
+		const [result] = await probes.syncAll([profileOf("fresh-force")], {
+			usage: true,
+			models: true,
+			forceUsage: true,
+		});
+		expect(seenUsage).toEqual(["fresh-force"]);
+		expect(seenModels).toEqual([]);
+		expect(result?.usageRefreshed).toBe(true);
+		expect(result?.usage?.windows[0]?.remainingPct).toBe(91);
+	});
+
 	test("passes skipCacheWrite=true so each probe performs a single authoritative disk write", async () => {
 		const flags: boolean[] = [];
 		const probes = new ProbeSync({
@@ -208,5 +238,6 @@ describe("ProbeSync deep module", () => {
 		});
 		const [result] = await probes.syncAll([profile], { usage: true });
 		expect(result?.usage?.windows[0]?.remainingPct).toBe(42);
+		expect(result?.usageRefreshed).toBe(false);
 	});
 });

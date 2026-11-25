@@ -37,11 +37,15 @@ export interface SyncAllOptions {
 	reasoning?: boolean;
 	/** Probe even when the cache is still fresh. */
 	force?: boolean;
+	/** Probe usage even when its cache is still fresh, without forcing models. */
+	forceUsage?: boolean;
 }
 
 export interface SyncProfileResult {
 	slug: string;
 	usage: UsageSnapshot | null;
+	/** Whether `usage` came from a live probe during this sync (false = reused cache). */
+	usageRefreshed?: boolean;
 	models: ModelsSnapshot | null;
 	reasoningCount?: number;
 }
@@ -177,6 +181,7 @@ export class ProbeSync {
 		const wantsModels = options.models ?? false;
 		const wantsReasoning = options.reasoning ?? false;
 		const force = options.force ?? false;
+		const forceUsage = options.forceUsage ?? force;
 		const healthy = profiles.filter(profile => !profile.disabled && !profile.bannedAt && !profile.authRequiredAt);
 
 		const ordered = await Promise.all(
@@ -193,14 +198,13 @@ export class ProbeSync {
 
 		return await Promise.all(
 			ordered.map(async ({ profile, usage: cachedUsage, models: cachedModels }): Promise<SyncProfileResult> => {
-				const usageTask = wantsUsage
-					? force || this.isStale(cachedUsage?.fetchedAt, this.usageTtlMs)
+				const usageTask: Promise<{ snapshot: UsageSnapshot | null; refreshed: boolean }> =
+					wantsUsage && (forceUsage || this.isStale(cachedUsage?.fetchedAt, this.usageTtlMs))
 						? this.refreshUsage(profile).then(
-								snapshot => snapshot ?? cachedUsage,
-								() => cachedUsage,
+								snapshot => ({ snapshot: snapshot ?? cachedUsage, refreshed: snapshot !== null }),
+								() => ({ snapshot: cachedUsage, refreshed: false }),
 							)
-						: Promise.resolve(cachedUsage)
-					: Promise.resolve(cachedUsage);
+						: Promise.resolve({ snapshot: cachedUsage, refreshed: false });
 
 				const catalogTask = (async (): Promise<{ models: ModelsSnapshot | null; reasoningCount?: number }> => {
 					let reasoningCount: number | undefined;
@@ -226,7 +230,8 @@ export class ProbeSync {
 				const [usage, catalog] = await Promise.all([usageTask, catalogTask]);
 				return {
 					slug: profile.slug,
-					usage,
+					usage: usage.snapshot,
+					usageRefreshed: usage.refreshed,
 					models: catalog.models,
 					reasoningCount: catalog.reasoningCount,
 				};

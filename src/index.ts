@@ -36,7 +36,13 @@ function printSyncSummary(result: SyncSummaryEntry): void {
 		result.usage && result.usage.windows.length > 0
 			? result.usage.windows.map(w => `${w.family} ${w.window} ${w.remainingPct}%`).join(", ")
 			: "unavailable";
-	const quotaText = result.authMissing && quotaRaw !== "unavailable" ? `cached (${quotaRaw})` : quotaRaw;
+	const usageAge = result.usage ? ageText(Date.now() - result.usage.fetchedAt) : undefined;
+	const quotaText =
+		quotaRaw === "unavailable"
+			? quotaRaw
+			: result.usageRefreshed
+				? quotaRaw
+				: `cached (${quotaRaw}${usageAge ? `, ${usageAge} old` : ""})`;
 	const modelsCount = result.models
 		? result.models.models.filter(m => isPublicGeminiModel(m.modelId)).length
 		: 0;
@@ -51,7 +57,10 @@ function printSyncSummary(result: SyncSummaryEntry): void {
 /**
  * Sync usage, models, and reasoning in parallel right after login or explicit profile sync.
  */
-async function syncAccountCaches(profiles: Profile[], force = false): Promise<SyncSummaryEntry[]> {
+async function syncAccountCaches(
+	profiles: Profile[],
+	options: { force?: boolean; forceUsage?: boolean } = {},
+): Promise<SyncSummaryEntry[]> {
 	const authStates = new Map(
 		await Promise.all(profiles.map(async profile => [profile.slug, await hasValidAuth(profile)] as const)),
 	);
@@ -60,7 +69,7 @@ async function syncAccountCaches(profiles: Profile[], force = false): Promise<Sy
 		usage: true,
 		models: true,
 		reasoning: true,
-		force,
+		...options,
 	});
 	return results.map(result => ({
 		...result,
@@ -97,10 +106,10 @@ Profile Naming:
   pass a slug to name it manually.
 
 Sync & Quota:
-  profile sync provisions shared configuration and refreshes usage, models, and
-  reasoning across all healthy accounts in parallel. ACP automatically warms stale
-  caches in the background on startup in pool mode. --refresh probes all accounts
-  in parallel on demand.
+  profile sync provisions shared configuration and always re-probes quota for
+  all healthy accounts in parallel; --force also refreshes model catalogs.
+  ACP automatically warms stale caches in the background on startup in pool
+  mode. --refresh probes all accounts in parallel on demand.
 
 ACP Options:
   --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
@@ -197,7 +206,7 @@ async function main(): Promise<void> {
 						: "unknown";
 			console.log(`${profile.slug}\t${profile.email ?? "(no email)"}\t${status}`);
 			if (!values["no-login"]) {
-				const [summary] = await syncAccountCaches([profile], true);
+				const [summary] = await syncAccountCaches([profile], { force: true });
 				if (summary) printSyncSummary(summary);
 			}
 			return;
@@ -211,7 +220,7 @@ async function main(): Promise<void> {
 				canary: !values["no-canary"],
 			});
 			console.log(`logged in ${profile.slug}\t${profile.email ?? "(no email)"}`);
-			const [summary] = await syncAccountCaches([profile], true);
+			const [summary] = await syncAccountCaches([profile], { force: true });
 			if (summary) printSyncSummary(summary);
 			return;
 		}
@@ -260,16 +269,28 @@ async function main(): Promise<void> {
 					if (!(await syncProfile(slug))) throw new Error(`could not sync profile: ${slug}`);
 					console.log(`synced ${slug}`);
 				}
-				const [summary] = await syncAccountCaches([profile], Boolean(values.force));
+				const [summary] = await syncAccountCaches([profile], {
+					forceUsage: true,
+					force: Boolean(values.force),
+				});
 				if (summary) printSyncSummary(summary);
+				else console.error(`${slug}: skipped (disabled, banned, or auth-required)`);
 			} else {
 				const synced = await syncProfiles();
 				if (synced.length > 0) {
 					console.log(`synced ${synced.length} profile(s): ${synced.join(", ")}`);
 				}
 				const profiles = await listProfiles();
-				const results = await syncAccountCaches(profiles, Boolean(values.force));
+				const results = await syncAccountCaches(profiles, {
+					forceUsage: true,
+					force: Boolean(values.force),
+				});
 				for (const summary of results) printSyncSummary(summary);
+				const syncedSlugs = new Set(results.map(result => result.slug));
+				const skipped = profiles.filter(profile => !syncedSlugs.has(profile.slug));
+				if (skipped.length > 0) {
+					console.error(`skipped ${skipped.length} unhealthy profile(s): ${skipped.map(p => p.slug).join(", ")}`);
+				}
 			}
 			return;
 		}

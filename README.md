@@ -334,10 +334,11 @@ agy-multi profile login work --remote
 # Adopt the existing main installation (no login, no canary).
 agy-multi profile add main --home "$HOME" --no-login
 
-# Resync shared configuration, quota, models, and reasoning across all profiles in parallel.
+# Resync shared configuration and re-probe quota across all profiles in parallel.
+# Quota is always re-probed; --force also refreshes model catalogs.
 agy-multi profile sync
 
-# Resync and force-refresh one profile (or pass --force for all profiles).
+# Resync one profile and force-refresh its model catalog too.
 agy-multi profile sync work --force
 
 agy-multi profile list
@@ -373,7 +374,7 @@ agy-multi update [--check] [--force]
 
 ### Token Usage & Cost Analytics (`usage`)
 
-`agy-multi quota` prints the cached remaining-quota percentages that the proxy already synced from the CLI's `/usage` command; it never starts a check of its own, so it answers in milliseconds. `--refresh` probes on demand, one account at a time. `agy-multi usage` (or `agy-multi tokens`) is a different report: it aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
+`agy-multi quota` prints the cached remaining-quota percentages that the proxy already synced from the CLI's `/usage` command; it never starts a check of its own, so it answers in milliseconds. `--refresh` probes all healthy accounts in parallel. `agy-multi usage` (or `agy-multi tokens`) is a different report: it aggregates exact token metrics and computes estimated cost across all profile transcript logs (`transcript.jsonl`).
 
 Rates are calculated based on **Gemini 3.8 Flash** pricing:
 - **Input Tokens**: `$1.50` / 1M tokens
@@ -461,7 +462,7 @@ When running `agy-multi profile add [<slug>]` on a remote machine, VPS, or over 
 
 
 `acp` ranks candidates from cached `/usage` and model snapshots. One-shot `run`
-refreshes stale snapshots serially before ranking. Both keep track of the
+refreshes stale snapshots in parallel before ranking. Both keep track of the
 conversation's account and can fail over on quota, ban, or auth errors.
 
 ## Pool failover rules
@@ -526,11 +527,12 @@ In t3code: **Settings → Providers → Add provider → Local ACP command**.
 `agy-multi acp -- --dangerously-skip-permissions` forwards extra args to the
 `agy acp` child it runs.
 
-After login, on `agy-multi profile sync`, and automatically in the background
-when `agy-multi acp` starts in pool mode, `agy-multi` refreshes quota, models,
-and reasoning levels across all healthy accounts in parallel. Session responses
-(`session/new`, `session/load`, `session/resume`, `session/fork`) merge this
-cached catalog across healthy accounts automatically.
+After login and on every `agy-multi profile sync`, `agy-multi` re-probes quota
+(and reasoning) across all healthy accounts in parallel; model catalogs refresh
+when stale or with `--force`. ACP also warms stale caches in the background on
+startup in pool mode. Session responses (`session/new`, `session/load`,
+`session/resume`, `session/fork`) merge this cached catalog across healthy
+accounts automatically.
 
 For **OMP (Oh My Pi)** or harnesses expecting a dedicated ACP executable:
 ```bash

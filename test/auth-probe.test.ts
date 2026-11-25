@@ -80,7 +80,8 @@ describe("hasValidAuth", () => {
 			]);
 			expect(await proc.exited, stderr).toBe(0);
 			expect(stdout).toContain("auth: missing (run `agy-multi profile login signed-out`)");
-			expect(stdout).toContain("quota: cached (gemini weekly 87%)");
+			expect(stdout).toContain("quota: cached (gemini weekly 87%");
+			expect(stdout).toContain("1h old");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
