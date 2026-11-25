@@ -6,6 +6,27 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-25
+
+### Added
+
+- **profile**: auto-name new profiles account-N
+  - Make the slug optional for `profile add`; generate account-1, account-2, ... past the highest existing account-N.
+  - Manual slugs still take precedence; orphaned profile directories are skipped.
+  - Update CLI help, README, and no-profile guidance.
+- **profile**: share regenerable caches across account HOMEs
+  - Symlink .agent-browser, .npm, .cache, and .local/share/vite-plus from each isolated HOME to the primary home.
+  - Keeps per-account credentials and config isolated while avoiding duplicate browser binaries and npm tarballs.
+
+### Fixed
+
+- **sync**: force quota refresh on manual profile sync
+  - Add forceUsage so `profile sync` always re-probes quota while --force continues to control model catalog refresh.
+  - Report cached quota age instead of presenting reused data as fresh, and warn when unhealthy profiles are skipped.
+  - Correct docs that claimed quota refresh and one-shot cache sync were serial.
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v1.2.0...v1.3.0)
+
 ## [1.2.0] - 2026-11-22
 
 ### Added
