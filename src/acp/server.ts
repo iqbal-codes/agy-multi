@@ -198,7 +198,7 @@ class AcpProxy {
 	}
 
 	private noUsableAccountError(): Error {
-		return new Error("no profiles configured; add one with `agy-multi profile add <slug>`");
+		return new Error("no profiles configured; add one with `agy-multi profile add`");
 	}
 
 	private async paceAccountSwitch(from: string, to: string): Promise<void> {

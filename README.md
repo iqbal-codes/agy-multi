@@ -317,6 +317,9 @@ so instead of guessing — rebuild a checkout with `./install.sh`, or re-run
 # The first quota snapshot is recorded right after the login check.
 agy-multi profile add work
 
+# Omit the name to auto-generate account-1, account-2, ... instead.
+agy-multi profile add
+
 # Re-authenticate or login to an existing profile (also records a snapshot)
 agy-multi profile login work
 
@@ -443,7 +446,7 @@ This automatically instructs `agy acp` to launch with `--include-default-customi
 
 ### Remote / Headless / SSH Login
 
-When running `agy-multi profile add <slug>` on a remote machine, VPS, or over SSH:
+When running `agy-multi profile add [<slug>]` on a remote machine, VPS, or over SSH:
 1. `agy` automatically prints the Google OAuth URL directly in the terminal:
    ```
    Open this link in a browser to log in with Google:

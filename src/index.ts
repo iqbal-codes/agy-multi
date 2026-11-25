@@ -71,7 +71,7 @@ async function syncAccountCaches(profiles: Profile[], force = false): Promise<Sy
 const HELP = `agy-multi — run the official agy CLI across multiple isolated accounts
 
 Usage:
-  agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary] [--clean]
+  agy-multi profile add [<slug>] [--home <dir>] [--remote] [--no-login] [--no-canary] [--clean]
   agy-multi profile login <slug> [--remote] [--no-canary]
   agy-multi profile list
   agy-multi profile disable <slug>
@@ -91,6 +91,10 @@ Usage:
   agy-multi state
   agy-multi update [--check] [--force]
   agy-multi --version
+
+Profile Naming:
+  profile add names the account account-1, account-2, … when <slug> is omitted;
+  pass a slug to name it manually.
 
 Sync & Quota:
   profile sync provisions shared configuration and refreshes usage, models, and
@@ -174,11 +178,6 @@ async function main(): Promise<void> {
 	if (command === "profile") {
 		if (subcommand === "add") {
 			const slug = rest[0];
-			if (!slug) {
-				throw new Error(
-					"usage: agy-multi profile add <slug> [--home <dir>] [--remote] [--no-login] [--no-canary] [--clean]",
-				);
-			}
 			if (!values["no-login"] || !values["no-canary"]) {
 				await ensureAgy();
 			}

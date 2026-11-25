@@ -133,7 +133,7 @@ function buildHandoffPrompt(checkpoint: Checkpoint | undefined, prompt: string):
 export async function runWithFailover(opts: FailoverOptions): Promise<FailoverReport> {
 	const pool = await AccountPool.load({ reservePct: DEFAULT_RESERVE_PCT });
 	const all = pool.list();
-	if (!all.length) throw new Error("no profiles; add one with `agy-multi profile add <slug>`");
+	if (!all.length) throw new Error("no profiles; add one with `agy-multi profile add`");
 	const candidates = opts.onlyProfile ? all.filter(p => p.slug === opts.onlyProfile) : all.filter(p => !p.disabled);
 	if (!candidates.length) throw new Error(`unknown profile: ${opts.onlyProfile}`);
 

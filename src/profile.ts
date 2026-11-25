@@ -333,26 +333,44 @@ async function runCanaryCheck(profile: Profile): Promise<void> {
 	}
 }
 
-export async function addProfile(slug: string, opts: AddProfileOptions = {}): Promise<Profile> {
-	if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
-		throw new Error(`invalid profile slug: ${slug} (use lowercase letters, digits, dashes)`);
+/**
+ * Next auto-generated profile name: `account-1`, `account-2`, …
+ * Continues past the highest existing `account-N`; manually named profiles do
+ * not affect the counter. Orphaned directories are skipped so a stale profile
+ * directory is never reused silently.
+ */
+export async function nextAccountSlug(): Promise<string> {
+	let next = 1;
+	for (const profile of await listProfiles()) {
+		const match = /^account-(\d+)$/.exec(profile.slug);
+		const n = match ? Number(match[1]) : NaN;
+		if (Number.isSafeInteger(n)) next = Math.max(next, n + 1);
 	}
-	if (await loadProfile(slug)) throw new Error(`profile already exists: ${slug}`);
+	while (await exists(profileDir(`account-${next}`))) next++;
+	return `account-${next}`;
+}
+
+export async function addProfile(slug: string | undefined, opts: AddProfileOptions = {}): Promise<Profile> {
+	const resolved = slug ?? (await nextAccountSlug());
+	if (!/^[a-z0-9][a-z0-9-]*$/.test(resolved)) {
+		throw new Error(`invalid profile slug: ${resolved} (use lowercase letters, digits, dashes)`);
+	}
+	if (await loadProfile(resolved)) throw new Error(`profile already exists: ${resolved}`);
 
 	const adopted = Boolean(opts.home);
-	const home = opts.home ? resolve(opts.home) : profileHome(slug);
+	const home = opts.home ? resolve(opts.home) : profileHome(resolved);
 	if (adopted && !(await exists(home))) throw new Error(`home does not exist: ${home}`);
 	await ensureDir(home);
 
 	const profile: Profile = {
-		slug,
+		slug: resolved,
 		createdAt: new Date().toISOString(),
 		...(adopted ? { home } : {}),
 		...(opts.clean ? { clean: true } : {}),
 	};
 
 	if (!adopted) await provision(home, Boolean(opts.clean));
-	await ensureDir(profileDir(slug));
+	await ensureDir(profileDir(resolved));
 
 	if (opts.login !== false) {
 		profile.email = await runInteractiveLogin(profile, Boolean(opts.remote));
