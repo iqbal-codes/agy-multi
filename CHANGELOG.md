@@ -6,6 +6,18 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-26
+
+### Fixed
+
+- **acp**: preserve full model catalog across config option updates
+
+### Maintenance
+
+- **acp**: deflake catalog surface test against background reasoning sync
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v1.3.0...v1.3.1)
+
 ## [1.3.0] - 2026-11-25
 
 ### Added
