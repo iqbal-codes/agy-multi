@@ -13,14 +13,25 @@ import { runTurn } from "./runner";
 const SHARED_ENTRIES = [
 	".gemini/config",
 	".gemini/skills",
+	".gemini/agents",
+	".gemini/commands",
+	".gemini/hooks",
+	".gemini/plugins",
+	".gemini/rules",
 	".gemini/GEMINI.md",
 	".gemini/settings.json",
 	".gemini/mcp-server-enablement.json",
 	".gemini/antigravity-cli/settings.json",
 	".gemini/antigravity-cli/keybindings.json",
 	".gemini/antigravity-cli/skills",
+	".gemini/antigravity-cli/agents",
+	".gemini/antigravity-cli/commands",
+	".gemini/antigravity-cli/hooks",
+	".gemini/antigravity-cli/plugins",
 	".gemini/antigravity-cli/builtin",
 	".gemini/antigravity-cli/mcp",
+	".gemini/antigravity-cli/mcp_config.json",
+	".gemini/antigravity-cli/mcp_oauth_tokens.json",
 ];
 
 /**

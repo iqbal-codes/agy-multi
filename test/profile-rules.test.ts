@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { ensureGlobalGeminiRules, T3_ACP_RULES } from "../src/profile";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { addProfile, ensureGlobalGeminiRules, syncProfile, T3_ACP_RULES } from "../src/profile";
 
 const LEGACY_USER_LINE = "# Custom Instructions\nAlways speak kindly.";
 const LEGACY_RULES = `# ACP & Multi-Agent Orchestration Rules
@@ -129,6 +129,51 @@ describe("ensureGlobalGeminiRules helper", () => {
 			expect(content.match(/# ACP & Multi-Agent Orchestration Rules/g)?.length).toBe(1);
 		} finally {
 			rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("links shared skills, MCP configs, tokens, hooks, and agents from primary home rather than isolating per account", async () => {
+		const sandbox = join(tmpdir(), `test-profile-shared-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const realHome = join(sandbox, "real-home");
+		const multiRoot = join(sandbox, "multi-root");
+		const prevRealHome = process.env.REAL_HOME;
+		const prevMultiRoot = process.env.AGY_MULTI_ROOT;
+
+		try {
+			mkdirSync(join(realHome, ".gemini", "config"), { recursive: true });
+			mkdirSync(join(realHome, ".gemini", "skills", "shared-skill"), { recursive: true });
+			mkdirSync(join(realHome, ".gemini", "hooks"), { recursive: true });
+			mkdirSync(join(realHome, ".gemini", "agents"), { recursive: true });
+			mkdirSync(join(realHome, ".gemini", "antigravity-cli", "mcp"), { recursive: true });
+			writeFileSync(join(realHome, ".gemini", "config", "mcp_config.json"), '{"mcpServers":{"s1":{}}}');
+			writeFileSync(join(realHome, ".gemini", "skills", "shared-skill", "SKILL.md"), "---\nname: shared-skill\n---\n");
+			writeFileSync(join(realHome, ".gemini", "antigravity-cli", "mcp_oauth_tokens.json"), '{"t":"1"}');
+
+			process.env.REAL_HOME = realHome;
+			process.env.AGY_MULTI_ROOT = multiRoot;
+
+			await addProfile("acct-shared", { login: false, canary: false });
+			await syncProfile("acct-shared");
+
+			const acctGemini = join(multiRoot, "profiles", "acct-shared", "home", ".gemini");
+			for (const rel of [
+				"config",
+				"skills",
+				"hooks",
+				"agents",
+				join("antigravity-cli", "mcp"),
+				join("antigravity-cli", "mcp_oauth_tokens.json"),
+			]) {
+				const target = join(acctGemini, rel);
+				expect(lstatSync(target).isSymbolicLink()).toBe(true);
+				expect(realpathSync(target)).toBe(realpathSync(join(realHome, ".gemini", rel)));
+			}
+		} finally {
+			if (prevRealHome === undefined) delete process.env.REAL_HOME;
+			else process.env.REAL_HOME = prevRealHome;
+			if (prevMultiRoot === undefined) delete process.env.AGY_MULTI_ROOT;
+			else process.env.AGY_MULTI_ROOT = prevMultiRoot;
+			rmSync(sandbox, { recursive: true, force: true });
 		}
 	});
 });
