@@ -262,9 +262,17 @@ async function setupTieredEnv(adopted = false) {
 	return { root, projectRoot, fake, promptLog };
 }
 
-function spawnProxy(projectRoot: string, root: string, fake: string, promptLog: string, probeLog?: string, extendedCatalog = false) {
+function spawnProxy(
+	projectRoot: string,
+	root: string,
+	fake: string,
+	promptLog: string,
+	probeLog?: string,
+	extendedCatalog = false,
+	extraArgs: string[] = [],
+) {
 	// Cross-profile model routing is enabled in the default account pool.
-	const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--switch-delay", "0"], {
+	const proxy = Bun.spawn(["bun", "run", join(projectRoot, "src/index.ts"), "acp", "--switch-delay", "0", ...extraArgs], {
 		cwd: projectRoot,
 		env: {
 			...process.env,
@@ -312,7 +320,16 @@ describe("ACP proxy model capability routing", () => {
 		const { root, projectRoot, fake, promptLog } = await setupTieredEnv(true);
 		const basicProfile = join(root, "profiles/acct-basic/profile.json");
 		await writeFile(basicProfile, JSON.stringify({ ...JSON.parse(await readFile(basicProfile, "utf8")), disabled: true }));
-		const { proxy, send, notifications } = spawnProxy(projectRoot, root, fake, promptLog, undefined, true);
+		// Skip background startup reasoning sync so initial session/new isn't racing against cached base-ID overlays.
+		const { proxy, send, notifications } = spawnProxy(
+			projectRoot,
+			root,
+			fake,
+			promptLog,
+			undefined,
+			true,
+			["--sequential"],
+		);
 		const modelIds = [
 			"gemini-3.8-flash-high", "gemini-4-argon-high", "gemini-4-carbon", "gemini-4-hydrogen-high", "gemini-5-flash",
 		];
@@ -345,7 +362,7 @@ describe("ACP proxy model capability routing", () => {
 			expect(updates.map(choiceValues)).toEqual([selectorIds]);
 
 			const list = Bun.spawn([process.execPath, join(projectRoot, "src/index.ts"), "models", "--profile", "acct-pro"], {
-				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake },
+				env: { ...process.env, AGY_MULTI_ROOT: root, AGY_BIN: fake, FAKE_AGY_EXTENDED_CATALOG: "1" },
 				stdout: "pipe",
 			});
 			const stdout = await new Response(list.stdout).text();
