@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 export interface ResolvedSkill {
 	name: string;
@@ -163,33 +163,38 @@ export function parseSkillMarkdown(content: string): { description: string; body
 /**
  * Searches for a skill by identifier (direct file/dir path, or name across standard skill locations).
  */
-export function findSkill(identifier: string, searchRoots?: string[]): ResolvedSkill | null {
+export function findSkill(identifier: string, searchRoots?: string[], cwd: string = process.cwd()): ResolvedSkill | null {
 	const trimmed = identifier.trim();
 	if (!trimmed) return null;
 
 	const candidatePaths: string[] = [];
 
-	// 1. Direct path
-	if (existsSync(trimmed)) {
-		const stat = statSync(trimmed);
+	// 1. Direct path (resolved against cwd when relative)
+	const directCandidate = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
+	for (const directPath of directCandidate === trimmed ? [trimmed] : [directCandidate, trimmed]) {
+		if (!existsSync(directPath)) continue;
+		const stat = statSync(directPath);
 		if (stat.isDirectory()) {
-			candidatePaths.push(join(trimmed, "SKILL.md"));
+			candidatePaths.push(join(directPath, "SKILL.md"));
 		} else if (stat.isFile()) {
-			candidatePaths.push(trimmed);
+			candidatePaths.push(directPath);
 		}
+		break;
 	}
 
-	// 2. Standard search directories strictly from primary user home
+	// 2. Standard search directories strictly from primary user home and workspace cwd
 	const home = process.env.REAL_HOME || homedir();
 	const roots = searchRoots ?? [
+		join(cwd, ".gemini", "skills"),
+		join(cwd, ".agents", "skills"),
+		join(cwd, ".claude", "skills"),
+		join(cwd, "skills"),
 		join(home, ".gemini", "skills"),
 		join(home, ".agents", "skills"),
+		join(home, ".claude", "skills"),
 		join(home, ".gemini", "config", "skills"),
 		join(home, ".gemini", "antigravity-cli", "skills"),
 		join(home, ".gemini", "antigravity-cli", "builtin", "skills"),
-		join(process.cwd(), ".gemini", "skills"),
-		join(process.cwd(), ".agents", "skills"),
-		join(process.cwd(), "skills"),
 	];
 
 	for (const root of roots) {
@@ -241,11 +246,13 @@ export function findSkill(identifier: string, searchRoots?: string[]): ResolvedS
 /**
  * Formats a list of skill identifiers into an Antigravity <skills> block.
  */
-export function buildSkillsBlock(identifiers: string[]): string {
+export function buildSkillsBlock(identifiers: string[], cwd?: string): string {
 	const skills: ResolvedSkill[] = [];
+	const seenPaths = new Set<string>();
 	for (const id of identifiers) {
-		const resolved = findSkill(id);
-		if (resolved) {
+		const resolved = findSkill(id, undefined, cwd);
+		if (resolved && !seenPaths.has(resolved.path)) {
+			seenPaths.add(resolved.path);
 			skills.push(resolved);
 		}
 	}

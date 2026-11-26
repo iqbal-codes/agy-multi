@@ -38,4 +38,22 @@ describe("parseAcpProxyOptions", () => {
 			rest: ["--foo"],
 		});
 	});
+
+	test("parses --clean without --disable-slash-commands and recognizes --include-default-customizations=false", () => {
+		const cleanOpts = parseAcpProxyOptions(["--clean"]);
+		expect(cleanOpts.clean).toBe(true);
+		expect(cleanOpts.extraArgs).toEqual(["--include-default-customizations=false"]);
+		expect(cleanOpts.extraArgs).not.toContain("--disable-slash-commands");
+
+		const passthroughOpts = parseAcpProxyOptions(["--", "--dangerously-skip-permissions", "--include-default-customizations=false"]);
+		expect(passthroughOpts.clean).toBe(true);
+		expect(passthroughOpts.extraArgs).toEqual(["--dangerously-skip-permissions", "--include-default-customizations=false"]);
+	});
+
+	test("parses comma-separated and repeated --skills flags", () => {
+		const opts = parseAcpProxyOptions(["--clean", "--skills", "alpha, beta", "--skills=gamma"]);
+		expect(opts.clean).toBe(true);
+		expect(opts.skills).toEqual(["alpha", "beta", "gamma"]);
+		expect(opts.extraArgs).toEqual(["--include-default-customizations=false"]);
+	});
 });

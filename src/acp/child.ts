@@ -1,3 +1,5 @@
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { killProcessGroup } from "../fs-utils";
 import { profileDir } from "../paths";
@@ -21,11 +23,50 @@ export interface AcpChildOptions {
 	profile: Profile;
 	agyBin: string;
 	extraArgs: string[];
+	clean?: boolean;
 	env?: NodeJS.ProcessEnv;
 	log: (message: string) => void;
 	onRequest: (child: AcpChild, request: JsonRpcRequest) => void;
 	onNotification: (child: AcpChild, notification: JsonRpcMessage) => void;
 	onExit: (child: AcpChild, code: number | null) => void;
+}
+
+function hasGeminiDirFlag(args: string[]): boolean {
+	return args.some(
+		(arg, i) =>
+			arg.startsWith("--gemini-dir=") ||
+			arg.startsWith("--gemini_dir=") ||
+			((arg === "--gemini-dir" || arg === "--gemini_dir") && i + 1 < args.length),
+	);
+}
+
+/**
+ * Builds an isolated `.gemini` directory for clean ACP runs containing only the
+ * profile's OAuth token and shared conversation directories — omitting user
+ * `config/` (mcp_config.json, plugins), `skills/`, `GEMINI.md`, and `mcp/`.
+ */
+function createCleanGeminiDir(profile: Profile): string {
+	const cleanDir = mkdtempSync(join(tmpdir(), "agy-multi-clean-gemini-"));
+	const targetCliDir = join(cleanDir, "antigravity-cli");
+	mkdirSync(targetCliDir, { recursive: true });
+	const sourceCliDir = join(profileHomeOf(profile), ".gemini", "antigravity-cli");
+	const entries: Array<{ name: string; dir: boolean }> = [
+		{ name: "antigravity-oauth-token", dir: false },
+		{ name: "brain", dir: true },
+		{ name: "conversations", dir: true },
+		{ name: "history.jsonl", dir: false },
+	];
+	for (const entry of entries) {
+		const src = join(sourceCliDir, entry.name);
+		if (!existsSync(src)) continue;
+		const kind = entry.dir ? (process.platform === "win32" ? "junction" : "dir") : "file";
+		try {
+			symlinkSync(src, join(targetCliDir, entry.name), kind);
+		} catch {
+			// Best-effort link; missing optional conversation files are non-fatal.
+		}
+	}
+	return cleanDir;
 }
 
 interface PendingRequest {
@@ -55,13 +96,19 @@ export class AcpChild {
 	private exitNotified = false;
 	private exitCode: number | null = null;
 	private readonly exited = Promise.withResolvers<void>();
+	private cleanGeminiDir?: string;
 
 	constructor(private readonly options: AcpChildOptions) {
 		this.slug = options.profile.slug;
 		this.profile = options.profile;
 
 		const logPath = join(profileDir(this.slug), `acp-${process.pid}.log`);
-		const args = [options.agyBin, "acp", "--log-file", logPath, ...options.extraArgs];
+		const cleanArgs: string[] = [];
+		if (options.clean && !hasGeminiDirFlag(options.extraArgs)) {
+			this.cleanGeminiDir = createCleanGeminiDir(options.profile);
+			cleanArgs.push("--gemini-dir", this.cleanGeminiDir);
+		}
+		const args = [options.agyBin, "acp", "--log-file", logPath, ...options.extraArgs, ...cleanArgs];
 		const proc = Bun.spawn(args, {
 			// Own an isolated process group so MCP servers and their descendants
 			// can be reclaimed without signalling the host or another account.
@@ -133,6 +180,7 @@ export class AcpChild {
 		if (this.exitNotified) return;
 		this.closed = true;
 		this.stopProcessTree();
+		this.cleanupCleanGeminiDir();
 		this.rejectPending(new Error(`agent ${this.slug} was stopped`));
 	}
 
@@ -190,8 +238,20 @@ export class AcpChild {
 		this.closed = true;
 		// The agent may crash or close stdout while MCP descendants stay alive.
 		this.stopProcessTree();
+		this.cleanupCleanGeminiDir();
 		this.rejectPending(new Error(`agent ${this.slug} exited`));
 		this.options.onExit(this, this.exitCode);
+	}
+
+	private cleanupCleanGeminiDir(): void {
+		if (!this.cleanGeminiDir) return;
+		const dir = this.cleanGeminiDir;
+		this.cleanGeminiDir = undefined;
+		try {
+			rmSync(dir, { recursive: true, force: true });
+		} catch {
+			// Best-effort cleanup of ephemeral clean dir.
+		}
 	}
 
 	private rejectPending(error: Error): void {

@@ -91,8 +91,9 @@ Usage:
   agy-multi multi-usage [--profile <slug>] [--refresh]
   agy-multi models [--profile <slug>] [--refresh]
   agy-multi usage [--daily | --weekly | --monthly] [--profile <slug>] [--json]
-  agy-multi acp [--sequential] [--clean] [--compaction-threshold <tokens>]
-                [--switch-delay <seconds>] [--handoff-context <chars>] [-- agy acp args...]
+  agy-multi acp [--sequential] [--clean] [--skills <list>]
+                [--compaction-threshold <tokens>] [--switch-delay <seconds>]
+                [--handoff-context <chars>] [-- agy acp args...]
   agy-multi run --prompt <text> [--clean] [--no-skills] [--skills <list>]
                  [--system-prompt <text|file>] [--append-system-prompt <text|file>]
                  [--conversation <id>] [--model <id>] [--profile <slug>]
@@ -112,7 +113,8 @@ Sync & Quota:
   mode. --refresh probes all accounts in parallel on demand.
 
 ACP Options:
-  --clean                        Bypasses default skills, plugins, rules bloat and slash commands.
+  --clean                        Bypasses ambient user skills, MCP servers, plugins, and rules.
+  --skills <list>                Comma-separated skill names or directories to inject per session.
   --compaction-threshold <tokens> Auto-compacts conversation when context reaches this limit (default: 300000, 0 to disable).
   --switch-delay <seconds>       Pause before handing a turn to another account (default: 10).
   --handoff-context <chars>      Cap the transcript replayed when a conversation cannot be resumed (default: all of it).

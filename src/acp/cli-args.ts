@@ -42,6 +42,34 @@ export function extractCompactionThresholdArg(args: string[]): {
 	return { threshold, remainingArgs };
 }
 
+/** Pulls all `--name <value>` / `--name=<value>` occurrences out of argv. */
+export function extractAllFlagArgs(args: string[], name: string): { values: string[]; rest: string[] } {
+	const rest: string[] = [];
+	const values: string[] = [];
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === name && index + 1 < args.length) {
+			values.push(args[++index]!);
+			continue;
+		}
+		if (arg.startsWith(`${name}=`)) {
+			values.push(arg.slice(name.length + 1));
+			continue;
+		}
+		rest.push(arg);
+	}
+	return { values, rest };
+}
+
+function hasCleanCustomizationFlag(args: string[]): boolean {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		if (arg === "--clean" || arg === "--include-default-customizations=false") return true;
+		if (arg === "--include-default-customizations" && args[i + 1] === "false") return true;
+	}
+	return false;
+}
+
 /**
  * Parses `agy-multi acp` / `agy-multi-acp` CLI flags into `AcpProxyOptions`.
  *
@@ -49,7 +77,7 @@ export function extractCompactionThresholdArg(args: string[]): {
  * active account at a time.
  */
 export function parseAcpProxyOptions(rawArgs: string[]): AcpProxyOptions {
-	const clean = rawArgs.includes("--clean");
+	const clean = hasCleanCustomizationFlag(rawArgs);
 	const sequential = rawArgs.includes("--sequential");
 
 	const withoutFlags = rawArgs.filter(
@@ -61,14 +89,29 @@ export function parseAcpProxyOptions(rawArgs: string[]): AcpProxyOptions {
 	);
 	const { value: switchDelay, rest: pacedArgs } = extractFlagArg(withoutFlags, "--switch-delay");
 	const { value: handoffContext, rest: replayArgs } = extractFlagArg(pacedArgs, "--handoff-context");
-	const { threshold, remainingArgs } = extractCompactionThresholdArg(replayArgs);
-	const extraArgs = clean
-		? ["--include-default-customizations=false", "--disable-slash-commands", ...remainingArgs]
-		: remainingArgs;
+	const { values: rawSkills, rest: skillFreeArgs } = extractAllFlagArgs(replayArgs, "--skills");
+	const { threshold, remainingArgs } = extractCompactionThresholdArg(skillFreeArgs);
+
+	const skills = rawSkills
+		.flatMap(entry => entry.split(","))
+		.map(entry => entry.trim())
+		.filter(Boolean);
+
+	const hasDefaultCustomizationsFlag = remainingArgs.some(
+		(arg, i) =>
+			arg.startsWith("--include-default-customizations=") ||
+			(arg === "--include-default-customizations" && i + 1 < remainingArgs.length),
+	);
+	const extraArgs =
+		clean && !hasDefaultCustomizationsFlag
+			? ["--include-default-customizations=false", ...remainingArgs]
+			: remainingArgs;
 	const switchDelayMs = switchDelay === undefined ? undefined : Math.round(Number(switchDelay) * 1000);
 	const handoffContextChars = handoffContext === undefined ? undefined : Number(handoffContext);
 
 	return {
+		...(clean ? { clean: true } : {}),
+		...(skills.length > 0 ? { skills } : {}),
 		compactionThreshold: threshold,
 		extraArgs,
 		sequential,

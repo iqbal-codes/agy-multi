@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { AccountPool } from "../account-pool";
 import { classifyAcpError, isModelUnsupportedError, isSessionLostError } from "../classify";
 import { exists, isRecord } from "../fs-utils";
-import { listUserSkills } from "../injection";
+import { buildSkillsBlock, findSkill, listUserSkills } from "../injection";
 import { isModelKnownUnsupported, ModelCatalog } from "../model-catalog";
 import {
 	ACP_SESSIONS_PATH,
@@ -39,6 +39,8 @@ const DEFAULT_HANDOFF_CONTEXT_CHARS = 0;
 export interface AcpProxyOptions {
 	agyBin?: string;
 	extraArgs?: string[];
+	clean?: boolean;
+	skills?: string[];
 	maxSwitches?: number;
 	reservePct?: number;
 	compactionThreshold?: number;
@@ -50,6 +52,81 @@ export interface AcpProxyOptions {
 	handoffContextChars?: number;
 	/** Keep exactly one account active at a time and skip idle-account background sync. */
 	sequential?: boolean;
+}
+
+function hasCleanArg(args: string[]): boolean {
+	return args.some(
+		(arg, i) =>
+			arg === "--include-default-customizations=false" ||
+			(arg === "--include-default-customizations" && args[i + 1] === "false"),
+	);
+}
+
+function readAntigravityMeta(params: Record<string, unknown>): {
+	skills?: string[];
+	systemPromptAppend?: string;
+} {
+	const meta = isRecord(params._meta) ? params._meta : undefined;
+	const agy = meta && isRecord(meta.antigravity) ? meta.antigravity : undefined;
+	if (!agy) return {};
+	const skills = Array.isArray(agy.skills)
+		? agy.skills
+				.filter((item): item is string => typeof item === "string")
+				.map(item => item.trim())
+				.filter(Boolean)
+		: undefined;
+	const sys = isRecord(agy.systemPrompt) ? agy.systemPrompt : undefined;
+	const systemPromptAppend = sys && typeof sys.append === "string" && sys.append ? sys.append : undefined;
+	return { skills, systemPromptAppend };
+}
+
+function buildChildNewSessionPayload(options: {
+	baseParams?: Record<string, unknown>;
+	cwd: string;
+	mcpServers: unknown[];
+	additionalDirectories?: string[];
+	skills?: string[];
+	systemPromptAppend?: string;
+}): Record<string, unknown> {
+	const payload: Record<string, unknown> = {
+		...(options.baseParams ?? {}),
+		cwd: options.cwd,
+		mcpServers: options.mcpServers,
+	};
+	if (options.additionalDirectories) payload.additionalDirectories = options.additionalDirectories;
+	else delete payload.additionalDirectories;
+
+	const rawMeta = isRecord(payload._meta) ? { ...payload._meta } : undefined;
+	const rawAgy = rawMeta && isRecord(rawMeta.antigravity) ? { ...rawMeta.antigravity } : undefined;
+	if (rawAgy) delete rawAgy.skills;
+
+	const skillsBlock =
+		options.skills && options.skills.length > 0 ? buildSkillsBlock(options.skills, options.cwd) : "";
+	const existingAppend =
+		rawAgy && isRecord(rawAgy.systemPrompt) && typeof rawAgy.systemPrompt.append === "string"
+			? rawAgy.systemPrompt.append
+			: options.systemPromptAppend;
+	const combinedAppend = [existingAppend, skillsBlock].filter(part => Boolean(part && part.trim())).join("\n\n");
+
+	if (combinedAppend) {
+		const nextAgy: Record<string, unknown> = {
+			...(rawAgy ?? {}),
+			systemPrompt: {
+				...(rawAgy && isRecord(rawAgy.systemPrompt) ? rawAgy.systemPrompt : {}),
+				append: combinedAppend,
+			},
+		};
+		payload._meta = { ...(rawMeta ?? {}), antigravity: nextAgy };
+	} else if (rawMeta && rawAgy) {
+		if (Object.keys(rawAgy).length === 0) {
+			delete rawMeta.antigravity;
+		} else {
+			rawMeta.antigravity = rawAgy;
+		}
+		if (Object.keys(rawMeta).length === 0) delete payload._meta;
+		else payload._meta = rawMeta;
+	}
+	return payload;
 }
 
 function readString(value: unknown): string | undefined {
@@ -110,6 +187,8 @@ function augmentInitializeResult(result: unknown): unknown {
 class AcpProxy {
 	private readonly agyBin: string;
 	private readonly extraArgs: string[];
+	private readonly clean: boolean;
+	private readonly defaultSkills?: string[];
 	private readonly switchDelayMs: number;
 	private readonly handoffContextChars: number;
 	private readonly sequential: boolean;
@@ -137,6 +216,8 @@ class AcpProxy {
 	constructor(options: AcpProxyOptions = {}) {
 		this.agyBin = options.agyBin ?? AGY_BIN;
 		this.extraArgs = options.extraArgs ?? [];
+		this.clean = options.clean ?? hasCleanArg(this.extraArgs);
+		this.defaultSkills = options.skills && options.skills.length > 0 ? [...options.skills] : undefined;
 		this.switchDelayMs = options.switchDelayMs ?? DEFAULT_SWITCH_DELAY_MS;
 		this.handoffContextChars = options.handoffContextChars ?? DEFAULT_HANDOFF_CONTEXT_CHARS;
 		this.sequential = options.sequential ?? false;
@@ -394,7 +475,7 @@ class AcpProxy {
 		}
 		if (kind === "available_commands_update") {
 			const commands = Array.isArray(update.availableCommands) ? update.availableCommands : [];
-			const augmented = this.buildAvailableCommands(session.cwd, commands);
+			const augmented = this.buildAvailableCommands(session.cwd, commands, session.skills);
 			deliver({ ...outMessage, params: { ...outParams, update: { ...update, availableCommands: augmented } } });
 			return;
 		}
@@ -432,6 +513,7 @@ class AcpProxy {
 	private buildAvailableCommands(
 		cwd?: string,
 		childCommands: unknown[] = [],
+		sessionSkills?: string[],
 	): Array<{ name: string; description?: string; input?: { hint?: string } }> {
 		const seen = new Set<string>();
 		const result: Array<{ name: string; description?: string; input?: { hint?: string } }> = [];
@@ -480,7 +562,16 @@ class AcpProxy {
 		];
 
 		for (const std of STANDARD_COMMANDS) add(std.name, std.description);
-		for (const skill of listUserSkills(cwd)) add(`$${skill.name}`, skill.description);
+		const declaredSkills = sessionSkills ?? this.defaultSkills;
+		if (declaredSkills && declaredSkills.length > 0) {
+			for (const id of declaredSkills) {
+				const resolved = findSkill(id, undefined, cwd);
+				if (resolved) add(`$${resolved.name}`, resolved.description || undefined);
+			}
+		}
+		if (!this.clean) {
+			for (const skill of listUserSkills(cwd)) add(`$${skill.name}`, skill.description);
+		}
 
 		for (const cmd of childCommands) {
 			if (isRecord(cmd) && typeof cmd.name === "string") {
@@ -488,10 +579,10 @@ class AcpProxy {
 				if (!name) continue;
 				const desc = typeof cmd.description === "string" ? cmd.description : undefined;
 				const hint = isRecord(cmd.input) && typeof cmd.input.hint === "string" ? cmd.input.hint : undefined;
-				if (name.startsWith("$") || SYSTEM_SLASH_COMMANDS.has(name.toLowerCase())) {
+				if (SYSTEM_SLASH_COMMANDS.has(name.toLowerCase())) {
 					add(name, desc, hint);
-				} else {
-					add(`$${name}`, desc, hint);
+				} else if (!this.clean) {
+					add(name.startsWith("$") ? name : `$${name}`, desc, hint);
 				}
 			}
 		}
@@ -506,7 +597,7 @@ class AcpProxy {
 				sessionId: session.id,
 				update: {
 					sessionUpdate: "available_commands_update",
-					availableCommands: this.buildAvailableCommands(session.cwd),
+					availableCommands: this.buildAvailableCommands(session.cwd, [], session.skills),
 				},
 			},
 		});
@@ -572,6 +663,7 @@ class AcpProxy {
 			profile,
 			agyBin: this.agyBin,
 			extraArgs: this.extraArgs,
+			clean: this.clean,
 			log: this.log,
 			onRequest: (source, request) => this.handleAgentRequest(source, request),
 			onNotification: (source, notification) => this.handleAgentNotification(source, notification),
@@ -615,11 +707,16 @@ class AcpProxy {
 		}
 
 		// The new process lost the conversation; create a fresh one and arm handoff.
-		const created = await child.request("session/new", {
-			cwd: session.cwd,
-			mcpServers: session.mcpServers,
-			...(session.additionalDirectories ? { additionalDirectories: session.additionalDirectories } : {}),
-		});
+		const created = await child.request(
+			"session/new",
+			buildChildNewSessionPayload({
+				cwd: session.cwd,
+				mcpServers: session.mcpServers,
+				additionalDirectories: session.additionalDirectories,
+				skills: session.skills,
+				systemPromptAppend: session.systemPromptAppend,
+			}),
+		);
 		if (created.error) throw new AcpRpcError(created.error);
 		const createdResult = isRecord(created.result) ? created.result : {};
 		const createdId = readString(createdResult.sessionId);
@@ -726,9 +823,16 @@ class AcpProxy {
 		if (!cwd) throw new Error("session/new requires an absolute cwd");
 		const mcpServers = Array.isArray(params.mcpServers) ? params.mcpServers : [];
 		const additionalDirectories = readStringArray(params.additionalDirectories);
-		const payload: Record<string, unknown> = { ...params, cwd, mcpServers };
-		if (additionalDirectories) payload.additionalDirectories = additionalDirectories;
-		else delete payload.additionalDirectories;
+		const meta = readAntigravityMeta(params);
+		const skills = meta.skills !== undefined ? meta.skills : this.defaultSkills;
+		const payload = buildChildNewSessionPayload({
+			baseParams: params,
+			cwd,
+			mcpServers,
+			additionalDirectories,
+			skills,
+			systemPromptAppend: meta.systemPromptAppend,
+		});
 
 		const candidates = await this.rankCandidates({ allowBlocked: true });
 		if (!candidates.length) throw this.noUsableAccountError();
@@ -752,6 +856,8 @@ class AcpProxy {
 					cwd,
 					mcpServers,
 					additionalDirectories,
+					skills,
+					systemPromptAppend: meta.systemPromptAppend,
 					modelId,
 					bufferPendingOut: true,
 				});
@@ -984,11 +1090,13 @@ class AcpProxy {
 		this.log(
 			`child ${source.profile} does not support session/fork (-32601); falling back to session/new + transcript replay`,
 		);
-		const payload: Record<string, unknown> = {
+		const payload = buildChildNewSessionPayload({
 			cwd: source.cwd,
 			mcpServers: source.mcpServers,
-			...(source.additionalDirectories ? { additionalDirectories: source.additionalDirectories } : {}),
-		};
+			additionalDirectories: source.additionalDirectories,
+			skills: source.skills,
+			systemPromptAppend: source.systemPromptAppend,
+		});
 		const created = await child.request("session/new", payload);
 		if (created.error) throw new AcpRpcError(created.error);
 		const createdResult = isRecord(created.result) ? created.result : {};
@@ -1115,11 +1223,16 @@ class AcpProxy {
 					await this.paceAccountSwitch(session.profile, candidate.slug);
 					const nextChild = await this.ensureChild(candidate);
 					await nextChild.initialize(this.clientInitialize);
-					const created = await nextChild.request("session/new", {
-						cwd: session.cwd,
-						mcpServers: session.mcpServers,
-						...(session.additionalDirectories ? { additionalDirectories: session.additionalDirectories } : {}),
-					});
+					const created = await nextChild.request(
+						"session/new",
+						buildChildNewSessionPayload({
+							cwd: session.cwd,
+							mcpServers: session.mcpServers,
+							additionalDirectories: session.additionalDirectories,
+							skills: session.skills,
+							systemPromptAppend: session.systemPromptAppend,
+						}),
+					);
 					if (created.error) throw new AcpRpcError(created.error);
 					const createdResult = isRecord(created.result) ? created.result : {};
 					const createdId = readString(createdResult.sessionId);
@@ -1342,13 +1455,16 @@ class AcpProxy {
 					this.log(`resumed conversation ${session.childSessionId} on ${profile.slug}`);
 					await this.ledger.save();
 				} else if (!ready) {
-					const created = await child.request("session/new", {
-						cwd: session.cwd,
-						mcpServers: session.mcpServers,
-						...(session.additionalDirectories
-							? { additionalDirectories: session.additionalDirectories }
-							: {}),
-					});
+					const created = await child.request(
+						"session/new",
+						buildChildNewSessionPayload({
+							cwd: session.cwd,
+							mcpServers: session.mcpServers,
+							additionalDirectories: session.additionalDirectories,
+							skills: session.skills,
+							systemPromptAppend: session.systemPromptAppend,
+						}),
+					);
 					if (created.error) throw new AcpRpcError(created.error);
 					const createdResult = isRecord(created.result) ? created.result : {};
 					const createdId = readString(createdResult.sessionId);

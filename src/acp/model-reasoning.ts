@@ -118,6 +118,7 @@ export async function syncProfileModelReasoning(
 			profile,
 			agyBin: AGY_BIN,
 			extraArgs: ["--include-default-customizations=false"],
+			clean: true,
 			env: { ...process.env, BROWSER: "/usr/bin/true" },
 			log: () => {},
 			onExit: () => {},

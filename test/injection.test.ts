@@ -123,4 +123,25 @@ Do something in workspace.`,
 			rmSync(testDir, { recursive: true, force: true });
 		}
 	});
+
+	it("resolves skills by name and relative path against an explicit cwd", () => {
+		const wsDir = join(tmpdir(), `skills-cwd-test-${Date.now()}`);
+		const namedDir = join(wsDir, ".agents", "skills", "named-ws-skill");
+		const claudeDir = join(wsDir, ".claude", "skills", "claude-ws-skill");
+		mkdirSync(namedDir, { recursive: true });
+		mkdirSync(claudeDir, { recursive: true });
+		writeFileSync(join(namedDir, "SKILL.md"), "---\nname: named-ws-skill\ndescription: Agents dir skill\n---\nBody A.");
+		writeFileSync(join(claudeDir, "SKILL.md"), "---\nname: claude-ws-skill\ndescription: Claude dir skill\n---\nBody C.");
+
+		try {
+			expect(findSkill("named-ws-skill", undefined, wsDir)?.content).toBe("Body A.");
+			expect(findSkill(".claude/skills/claude-ws-skill", undefined, wsDir)?.content).toBe("Body C.");
+			const block = buildSkillsBlock(["named-ws-skill", "claude-ws-skill", "named-ws-skill"], wsDir);
+			expect(block).toContain("### Skill: named-ws-skill");
+			expect(block).toContain("### Skill: claude-ws-skill");
+			expect(block.match(/### Skill: named-ws-skill/g)?.length).toBe(1);
+		} finally {
+			rmSync(wsDir, { recursive: true, force: true });
+		}
+	});
 });

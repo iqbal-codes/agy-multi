@@ -19,6 +19,8 @@ export interface AcpSessionRecord {
 	cwd: string;
 	additionalDirectories?: string[];
 	mcpServers?: unknown[];
+	skills?: string[];
+	systemPromptAppend?: string;
 	modelId?: string;
 	history?: HistoryEntry[];
 	needsHandoff?: boolean;
@@ -53,6 +55,8 @@ export interface SessionState {
 	cwd: string;
 	additionalDirectories?: string[];
 	mcpServers: unknown[];
+	skills?: string[];
+	systemPromptAppend?: string;
 	modelId?: string;
 	history: HistoryEntry[];
 	activeTurn?: TurnState;
@@ -222,11 +226,14 @@ export class SessionLedger {
 		cwd: string;
 		mcpServers: unknown[];
 		additionalDirectories?: string[];
+		skills?: string[];
+		systemPromptAppend?: string;
 		modelId?: string;
 		bufferPendingOut?: boolean;
 	}): SessionState {
 		const id = randomUUID();
 		const now = new Date().toISOString();
+		const skills = options.skills ? [...options.skills] : undefined;
 		const record: AcpSessionRecord = {
 			id,
 			profile: options.profile,
@@ -234,12 +241,16 @@ export class SessionLedger {
 			cwd: options.cwd,
 			...(options.additionalDirectories ? { additionalDirectories: options.additionalDirectories } : {}),
 			mcpServers: options.mcpServers,
+			...(skills ? { skills } : {}),
+			...(options.systemPromptAppend ? { systemPromptAppend: options.systemPromptAppend } : {}),
 			createdAt: now,
 			updatedAt: now,
 		};
 		const session: SessionState = {
 			...record,
 			mcpServers: options.mcpServers,
+			...(skills ? { skills: [...skills] } : {}),
+			...(options.systemPromptAppend ? { systemPromptAppend: options.systemPromptAppend } : {}),
 			history: [],
 			record,
 			...(options.modelId ? { modelId: options.modelId } : {}),
@@ -264,6 +275,7 @@ export class SessionLedger {
 		session = {
 			...record,
 			mcpServers: record.mcpServers ?? [],
+			...(record.skills ? { skills: [...record.skills] } : {}),
 			history: [...(record.history ?? [])],
 			record,
 		};
@@ -327,6 +339,8 @@ export class SessionLedger {
 		const id = randomUUID();
 		const additionalDirectories = source.additionalDirectories ? [...source.additionalDirectories] : undefined;
 		const mcpServers = [...source.mcpServers];
+		const skills = source.skills ? [...source.skills] : undefined;
+		const systemPromptAppend = source.systemPromptAppend;
 		const history = source.history.map(entry => ({ ...entry }));
 		const resolvedModelId = modelId ?? source.modelId;
 		const record: AcpSessionRecord = {
@@ -336,6 +350,8 @@ export class SessionLedger {
 			cwd: source.cwd,
 			...(additionalDirectories ? { additionalDirectories } : {}),
 			mcpServers,
+			...(skills ? { skills } : {}),
+			...(systemPromptAppend ? { systemPromptAppend } : {}),
 			...(resolvedModelId ? { modelId: resolvedModelId } : {}),
 			history,
 			...(options?.needsHandoff !== undefined ? { needsHandoff: options.needsHandoff } : {}),
@@ -347,6 +363,7 @@ export class SessionLedger {
 		const forked: SessionState = {
 			...record,
 			mcpServers,
+			...(skills ? { skills: [...skills] } : {}),
 			history,
 			modelId: resolvedModelId,
 			...(options?.bufferPendingOut ? { pendingOut: [] } : {}),

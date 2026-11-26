@@ -1295,6 +1295,9 @@ createInterface({ input: process.stdin }).on("line", line => {
       models: { currentModelId: "gemini-3.8-flash-high", availableModels: [] },
     }});
   }
+  if (m.method === "session/resume") {
+    return send({ jsonrpc: "2.0", id: m.id, error: { code: -32002, message: "session not found" } });
+  }
   if (m.method === "session/prompt") {
     send({ jsonrpc: "2.0", method: "session/update", params: {
       sessionId: m.params.sessionId,
@@ -1357,6 +1360,203 @@ createInterface({ input: process.stdin }).on("line", line => {
 				// Native fork does not prepend transcript replay.
 				expect(prompts[1]?.text).toBe("NATIVE FOLLOWUP");
 				expect(prompts[1]?.sessionId).toContain("native-fork-");
+			} finally {
+				await stop(client);
+				await f.cleanup();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"clean mode isolates --gemini-dir, forwards mcpServers, injects _meta skills, and preserves both across failover",
+		async () => {
+			const inspectAgent = `#!/usr/bin/env bun
+import { appendFileSync, existsSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+
+const argv = Bun.argv.slice(2);
+const home = process.env.HOME ?? "";
+const log = process.env.FAKE_AGY_LOG;
+const record = entry => {
+  if (log) appendFileSync(log, JSON.stringify({ home, ...entry }) + "\\n");
+};
+
+const geminiIdx = argv.indexOf("--gemini-dir");
+const geminiDir = geminiIdx !== -1 ? argv[geminiIdx + 1] : undefined;
+const geminiCliEntries = geminiDir && existsSync(join(geminiDir, "antigravity-cli"))
+  ? readdirSync(join(geminiDir, "antigravity-cli")).sort()
+  : [];
+const geminiRootEntries = geminiDir && existsSync(geminiDir) ? readdirSync(geminiDir).sort() : [];
+record({ event: "start", argv, geminiDir, geminiRootEntries, geminiCliEntries });
+
+if (argv.includes("/usage")) {
+  const pct = home.includes("/acct-a/") ? 100 : 80;
+  process.stdout.write(JSON.stringify({
+    status: "SUCCESS",
+    response: [
+      "Gemini Models\\tWeekly Limit Remaining\\t" + pct + "%\\t2099-01-01T00:00:00Z",
+      "Gemini Models\\tFive Hour Limit Remaining\\t" + pct + "%\\t2099-01-01T00:00:00Z",
+    ].join("\\n"),
+  }) + "\\n");
+  process.exit(0);
+}
+if (argv.includes("models")) {
+  process.stdout.write("gemini-3.8-flash-high\\tGemini 3.8 Flash (High)\\n");
+  process.exit(0);
+}
+
+let seq = 0;
+const send = msg => process.stdout.write(JSON.stringify(msg) + "\\n");
+createInterface({ input: process.stdin }).on("line", line => {
+  const m = JSON.parse(line);
+  if (m.method === "initialize") {
+    return send({ jsonrpc: "2.0", id: m.id, result: {
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: true },
+      authMethods: [],
+    }});
+  }
+  if (m.method === "session/new") {
+    record({
+      event: "session_new",
+      cwd: m.params?.cwd,
+      mcpServers: m.params?.mcpServers,
+      _meta: m.params?._meta,
+    });
+    const childId = "child-" + (++seq);
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: childId,
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: [
+            { name: "plan", description: "Plan mode" },
+            { name: "ambient-leak", description: "Should be filtered in clean mode" },
+          ],
+        },
+      },
+    });
+    return send({ jsonrpc: "2.0", id: m.id, result: {
+      sessionId: childId,
+      models: { currentModelId: "gemini-3.8-flash-high", availableModels: [] },
+    }});
+  }
+  if (m.method === "session/resume") {
+    return send({ jsonrpc: "2.0", id: m.id, error: { code: -32002, message: "session not found" } });
+  }
+  if (m.method === "session/prompt") {
+    const marker = join(process.env.AGY_MULTI_ROOT, "failed-once");
+    if (!existsSync(marker)) {
+      writeFileSync(marker, home);
+      return send({ jsonrpc: "2.0", id: m.id, error: { code: -32000, message: "RESOURCE_EXHAUSTED: quota exceeded" } });
+    }
+    send({ jsonrpc: "2.0", method: "session/update", params: {
+      sessionId: m.params.sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OK" } },
+    }});
+    return send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } });
+  }
+  send({ jsonrpc: "2.0", id: m.id, result: {} });
+});
+`;
+			const f = await fixture(["acct-a", "acct-b"], { agent: inspectAgent });
+			const wsSkillDir = join(f.root, "custom-skills", "node-skill");
+			const ambientSkillDir = join(f.root, ".gemini", "skills", "ambient-ws-skill");
+			await mkdir(wsSkillDir, { recursive: true });
+			await mkdir(ambientSkillDir, { recursive: true });
+			await writeFile(
+				join(wsSkillDir, "SKILL.md"),
+				"---\nname: node-skill\ndescription: Declared node skill\n---\nFollow declared instructions.",
+			);
+			await writeFile(
+				join(ambientSkillDir, "SKILL.md"),
+				"---\nname: ambient-ws-skill\ndescription: Ambient skill\n---\nDo not advertise in clean mode.",
+			);
+			// Stage ambient config + token in acct-a and acct-b homes to prove --gemini-dir excludes config/mcp_config.json.
+			for (const slug of ["acct-a", "acct-b"]) {
+				const profileHome = join(f.root, "profiles", slug, "home");
+				await mkdir(join(profileHome, ".gemini", "config"), { recursive: true });
+				await mkdir(join(profileHome, ".gemini", "antigravity-cli"), { recursive: true });
+				await writeFile(join(profileHome, ".gemini", "config", "mcp_config.json"), '{"mcpServers":{"ambient":{}}}');
+				await writeFile(join(profileHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"), "tok");
+			}
+
+			const client = f.proxy(["--clean", "--switch-delay", "0"]);
+			const mcpServers = [{ name: "declared-mcp", command: "node", args: ["srv.js"], env: [] }];
+			try {
+				await client.send<Reply>("initialize", { protocolVersion: 1, clientCapabilities: {} });
+				const created = await client.send<Reply>("session/new", {
+					cwd: f.root,
+					mcpServers,
+					_meta: {
+						antigravity: {
+							systemPrompt: { append: "Base system append." },
+							skills: [wsSkillDir],
+						},
+					},
+				});
+				const sessionId = created.result?.sessionId;
+				expect(sessionId).toBeTruthy();
+
+				const cmdUpdate = await client.waitForNotification(
+					msg =>
+						isRecord(msg) &&
+						msg.method === "session/update" &&
+						isRecord(msg.params) &&
+						msg.params.sessionId === sessionId &&
+						isRecord(msg.params.update) &&
+						msg.params.update.sessionUpdate === "available_commands_update",
+				);
+				const cmdNames = ((cmdUpdate as { params: { update: { availableCommands: Array<{ name: string }> } } })
+					.params.update.availableCommands ?? []
+				).map(c => c.name);
+				expect(cmdNames).toContain("$node-skill");
+				expect(cmdNames).not.toContain("$ambient-ws-skill");
+				expect(cmdNames).not.toContain("$ambient-leak");
+
+				// Trigger failover from acct-a to acct-b so we verify handoff session/new retains mcpServers + skills.
+				const promptReply = await client.send<Reply>("session/prompt", {
+					sessionId,
+					prompt: [{ type: "text", text: "RUN" }],
+				});
+				expect(promptReply.result).toEqual({ stopReason: "end_turn" });
+
+				const logEntries = (await readFile(join(f.root, "invocations.jsonl"), "utf8"))
+					.trim()
+					.split("\n")
+					.map(line => JSON.parse(line) as Record<string, unknown>);
+				const starts = logEntries.filter(
+					entry => entry.event === "start" && Array.isArray(entry.argv) && entry.argv[0] === "acp",
+				);
+				expect(starts.length).toBeGreaterThanOrEqual(2);
+				for (const start of starts) {
+					const argv = start.argv as string[];
+					expect(argv).toContain("--include-default-customizations=false");
+					expect(argv).not.toContain("--disable-slash-commands");
+					expect(argv).toContain("--gemini-dir");
+					expect(start.geminiRootEntries).toEqual(["antigravity-cli"]);
+					expect(start.geminiCliEntries).toEqual([
+						"antigravity-oauth-token",
+						"brain",
+						"conversations",
+						"history.jsonl",
+					]);
+				}
+
+				const sessionNews = logEntries.filter(entry => entry.event === "session_new" && entry.cwd === f.root);
+				expect(sessionNews).toHaveLength(2);
+				for (const req of sessionNews) {
+					expect(req.mcpServers).toEqual(mcpServers);
+					const meta = req._meta as { antigravity?: { skills?: unknown; systemPrompt?: { append?: string } } };
+					expect(meta.antigravity?.skills).toBeUndefined();
+					expect(meta.antigravity?.systemPrompt?.append).toContain("Base system append.");
+					expect(meta.antigravity?.systemPrompt?.append).toContain("### Skill: node-skill");
+					expect(meta.antigravity?.systemPrompt?.append).toContain("Follow declared instructions.");
+				}
 			} finally {
 				await stop(client);
 				await f.cleanup();
