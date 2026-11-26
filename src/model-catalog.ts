@@ -228,6 +228,14 @@ export function readAcpSelectChoices(options: unknown): ModelConfigOption[] {
 	});
 }
 
+function isModelConfigOption(option: unknown): option is Record<string, unknown> & { options: unknown[] } {
+	return (
+		isRecord(option) &&
+		(option.id === "model" || option.category === "model") &&
+		Array.isArray(option.options)
+	);
+}
+
 /** Extract `ModelInfo[]` and `ModelConfigOption[]` from an ACP `session/new` / `load` / `fork` result. */
 export function extractAcpModelsFromResult(result: Record<string, unknown>): {
 	models: ModelInfo[];
@@ -255,10 +263,8 @@ export function extractAcpModelsFromResult(result: Record<string, unknown>): {
 	const configOptions: ModelConfigOption[] = [];
 	if (Array.isArray(result.configOptions)) {
 		for (const opt of result.configOptions) {
-			if (!opt || typeof opt !== "object") continue;
-			const rec = opt as Record<string, unknown>;
-			if (rec.id !== "model" || !Array.isArray(rec.options)) continue;
-			configOptions.push(...readAcpSelectChoices(rec.options));
+			if (!isModelConfigOption(opt)) continue;
+			configOptions.push(...readAcpSelectChoices(opt.options));
 		}
 	}
 
@@ -298,9 +304,7 @@ export function filterModelCatalog(value: unknown): unknown {
 		...(Array.isArray(configOptions)
 			? {
 					configOptions: configOptions.map(option =>
-						isRecord(option) && (option.id === "model" || option.category === "model") && Array.isArray(option.options)
-							? { ...option, options: filterChoices(option.options) }
-							: option,
+						isModelConfigOption(option) ? { ...option, options: filterChoices(option.options) } : option,
 					),
 				}
 			: {}),
@@ -431,23 +435,67 @@ export class ModelCatalog {
 		return updated;
 	}
 
+	private mergeConfigOptions(
+		value: Record<string, unknown>,
+		healthySnapshots: ModelsSnapshot[],
+		extractedConfigOptions: ModelConfigOption[],
+	): Record<string, unknown> {
+		if (!Array.isArray(value.configOptions) || healthySnapshots.length === 0) return value;
+		const mergedConfigChoices = mergeConfigOptionLists([
+			...healthySnapshots.map(s => s.configOptions ?? deriveBaseConfigOptions(s.models)),
+			extractedConfigOptions,
+		]);
+		if (mergedConfigChoices.length === 0) return value;
+		return {
+			...value,
+			configOptions: value.configOptions.map(opt =>
+				isModelConfigOption(opt) ? { ...opt, options: mergedConfigChoices } : opt,
+			),
+		};
+	}
+
+	/** Merge cached models across healthy profiles into a `configOptions`-bearing ACP result. */
+	async enrichConfigOptionsResult(
+		result: Record<string, unknown>,
+		healthyProfiles: Profile[],
+	): Promise<Record<string, unknown>> {
+		if (!Array.isArray(result.configOptions)) return result;
+		const snapshots = await this.snapshotsFor(healthyProfiles);
+		const healthySnapshots = [...snapshots.values()].filter(
+			(s): s is ModelsSnapshot => Boolean(s && s.models.length > 0),
+		);
+		if (healthySnapshots.length === 0) return result;
+		const extracted = extractAcpModelsFromResult(result);
+		return this.mergeConfigOptions(result, healthySnapshots, extracted.configOptions);
+	}
+
+	/** Synchronously merge in-memory cached models into a `config_option_update` notification payload. */
+	enrichConfigOptionsUpdate(
+		update: Record<string, unknown>,
+		healthyProfiles: Profile[],
+	): Record<string, unknown> {
+		if (!Array.isArray(update.configOptions)) return update;
+		const healthySnapshots = healthyProfiles
+			.map(profile => this.memory.get(profile.slug))
+			.filter((s): s is ModelsSnapshot => Boolean(s && s.models.length > 0));
+		if (healthySnapshots.length === 0) return update;
+		const extracted = extractAcpModelsFromResult(update);
+		return this.mergeConfigOptions(update, healthySnapshots, extracted.configOptions);
+	}
+
 	/** Merge cached models and reasoning levels across healthy profiles into an ACP session result. */
 	async enrichSessionResult(
 		result: Record<string, unknown>,
 		activeProfile: string,
 		healthyProfiles: Profile[],
 	): Promise<Record<string, unknown>> {
+		const snapshots = await this.snapshotsFor(healthyProfiles);
 		const catalogs = await Promise.all(
-			healthyProfiles.map(async profile => {
-				const [disk, reasoning] = await Promise.all([
-					readCachedModels(profile.slug),
-					readCachedModelReasoning(profile.slug),
-				]);
-				const mem = this.memory.get(profile.slug);
-				const snapshot = disk && disk.fetchedAt > (mem?.fetchedAt ?? 0) ? disk : mem;
-				if (snapshot) this.memory.set(profile.slug, snapshot);
-				return { slug: profile.slug, snapshot, reasoning };
-			}),
+			healthyProfiles.map(async profile => ({
+				slug: profile.slug,
+				snapshot: snapshots.get(profile.slug) ?? undefined,
+				reasoning: await readCachedModelReasoning(profile.slug),
+			})),
 		);
 		const healthySnapshots = catalogs
 			.map(catalog => catalog.snapshot)
@@ -473,7 +521,7 @@ export class ModelCatalog {
 		let nextResult: Record<string, unknown> = result;
 		const models = isRecord(result.models) ? result.models : undefined;
 		const modelConfig = Array.isArray(result.configOptions)
-			? result.configOptions.find(opt => isRecord(opt) && opt.id === "model")
+			? result.configOptions.find(opt => isModelConfigOption(opt))
 			: undefined;
 		const currentModelId = models?.currentModelId ?? modelConfig?.currentValue;
 		if (
@@ -497,15 +545,7 @@ export class ModelCatalog {
 				models: { ...models, currentModelId, availableModels },
 			};
 		}
-		if (mergedConfigChoices.length > 0 && Array.isArray(result.configOptions)) {
-			nextResult = {
-				...nextResult,
-				configOptions: result.configOptions.map(opt =>
-					isRecord(opt) && opt.id === "model" ? { ...opt, options: mergedConfigChoices } : opt,
-				),
-			};
-		}
-		return nextResult;
+		return this.mergeConfigOptions(nextResult, healthySnapshots, extracted.configOptions);
 	}
 
 	/** Filter any outbound ACP payload to public Gemini releases. */

@@ -185,4 +185,87 @@ describe("ModelCatalog deep module", () => {
 			await rm(tempRoot, { recursive: true, force: true });
 		}
 	});
+
+	test("enrichConfigOptionsResult and enrichConfigOptionsUpdate merge models without injecting a models field", async () => {
+		const tempRoot = await mkdtemp(join(tmpdir(), "agy-multi-catalog-cfg-"));
+		const prevRoot = process.env.AGY_MULTI_ROOT;
+		process.env.AGY_MULTI_ROOT = tempRoot;
+		try {
+			const basic: Profile = { slug: "acct-basic", createdAt: "now" };
+			const pro: Profile = { slug: "acct-pro", createdAt: "now" };
+			await writeCachedModels({
+				profile: "acct-basic",
+				fetchedAt: Date.now(),
+				models: [{ modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" }],
+				configOptions: [{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }],
+			});
+			await writeCachedModels({
+				profile: "acct-pro",
+				fetchedAt: Date.now(),
+				models: [
+					{ modelId: "gemini-4-neon-high", name: "Gemini 4 Neon (High)" },
+					{ modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" },
+					{ modelId: "claude-opus-5-5-high", name: "Claude Opus 5.5" },
+				],
+				configOptions: [
+					{ value: "gemini-4-neon", name: "Gemini 4 Neon" },
+					{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+					{ value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+				],
+			});
+
+			const catalog = new ModelCatalog();
+			await catalog.warmFromDisk([basic, pro]);
+
+			const setConfigResult = {
+				configOptions: [
+					{
+						id: "model",
+						category: "model",
+						currentValue: "gemini-4-hydrogen",
+						options: [{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }],
+					},
+				],
+			};
+			const enrichedResult = catalog.filterOutbound(
+				await catalog.enrichConfigOptionsResult(setConfigResult, [basic, pro]),
+			) as {
+				models?: unknown;
+				configOptions: Array<{ currentValue: string; options: Array<{ value: string }> }>;
+			};
+			expect(enrichedResult.models).toBeUndefined();
+			expect(enrichedResult.configOptions[0]?.currentValue).toBe("gemini-4-hydrogen");
+			expect(enrichedResult.configOptions[0]?.options.map(o => o.value)).toEqual([
+				"gemini-4-hydrogen",
+				"gemini-4-neon",
+			]);
+
+			const updatePayload = {
+				sessionUpdate: "config_option_update",
+				configOptions: [
+					{
+						id: "model-selector",
+						category: "model",
+						currentValue: "gemini-4-hydrogen",
+						options: [{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }],
+					},
+				],
+			};
+			const enrichedUpdate = catalog.filterOutbound(
+				catalog.enrichConfigOptionsUpdate(updatePayload, [basic, pro]),
+			) as {
+				models?: unknown;
+				configOptions: Array<{ options: Array<{ value: string }> }>;
+			};
+			expect(enrichedUpdate.models).toBeUndefined();
+			expect(enrichedUpdate.configOptions[0]?.options.map(o => o.value)).toEqual([
+				"gemini-4-hydrogen",
+				"gemini-4-neon",
+			]);
+		} finally {
+			if (prevRoot !== undefined) process.env.AGY_MULTI_ROOT = prevRoot;
+			else delete process.env.AGY_MULTI_ROOT;
+			await rm(tempRoot, { recursive: true, force: true });
+		}
+	});
 });

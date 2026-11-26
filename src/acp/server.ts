@@ -399,7 +399,8 @@ class AcpProxy {
 			return;
 		}
 		if (kind === "config_option_update") {
-			deliver({ ...outMessage, params: { ...outParams, update: this.catalog.filterOutbound(update) } });
+			const enriched = this.catalog.enrichConfigOptionsUpdate(update, this.pool.healthyProfiles());
+			deliver({ ...outMessage, params: { ...outParams, update: this.catalog.filterOutbound(enriched) } });
 			return;
 		}
 		deliver(outMessage);
@@ -1025,6 +1026,18 @@ class AcpProxy {
 		this.broadcastAvailableCommands(forked);
 	}
 
+	private async enrichModelPayload(result: unknown, activeProfile?: string): Promise<unknown> {
+		if (!isRecord(result)) return result;
+		const healthy = this.pool.healthyProfiles();
+		if (isRecord(result.models) && activeProfile) {
+			return await this.catalog.enrichSessionResult(result, activeProfile, healthy);
+		}
+		if (Array.isArray(result.configOptions)) {
+			return await this.catalog.enrichConfigOptionsResult(result, healthy);
+		}
+		return result;
+	}
+
 	private async onGenericRequest(request: JsonRpcRequest): Promise<void> {
 		const params = isRecord(request.params) ? request.params : {};
 		const sessionId = readString(params.sessionId);
@@ -1047,7 +1060,8 @@ class AcpProxy {
 		const payload = session ? { ...params, sessionId: session.childSessionId } : params;
 		const response = await child.request(request.method, payload);
 		if (response.error) throw new AcpRpcError(response.error);
-		this.respond(request.id, response.result ?? {});
+		const enriched = await this.enrichModelPayload(response.result ?? {}, session?.profile ?? child.slug);
+		this.respond(request.id, enriched);
 	}
 
 	private async handleModelChangeRequest(
@@ -1080,7 +1094,8 @@ class AcpProxy {
 					session.handoffSessionReady = false;
 				}
 				await this.ledger.save();
-				this.respond(request.id, response.result ?? {});
+				const enriched = await this.enrichModelPayload(response.result ?? {}, currentProfile.slug);
+				this.respond(request.id, enriched);
 				return;
 			}
 			if (!isModelUnsupportedError(response.error)) {
@@ -1134,7 +1149,8 @@ class AcpProxy {
 					this.closePreviousChildSession(previousProfile, previousChildId);
 					this.log(`switched session ${session.id} to ${candidate.slug} for model ${modelId}`);
 					await this.ledger.save();
-					this.respond(request.id, apply.result ?? {});
+					const enriched = await this.enrichModelPayload(apply.result ?? {}, candidate.slug);
+					this.respond(request.id, enriched);
 					return;
 				} catch (error) {
 					if (!(error instanceof AcpRpcError) || !isModelUnsupportedError(error.rpcError)) {

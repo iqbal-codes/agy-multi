@@ -587,4 +587,132 @@ describe("ACP proxy model capability routing", () => {
 		},
 		30_000,
 	);
+
+	test(
+		"session/set_config_option and config_option_update keep all healthy profile models after routing to a smaller-catalog account",
+		async () => {
+			const { root, projectRoot, fake, promptLog } = await setupTieredEnv();
+			// Seed acct-pro (95%) ahead of acct-basic (80%) so session/new starts on acct-pro,
+			// then choosing gemini-3.8-flash routes to acct-basic (smaller catalog) via reservation.
+			await writeFile(
+				join(root, "profiles", "acct-pro", "usage.json"),
+				JSON.stringify({
+					profile: "acct-pro",
+					fetchedAt: Date.now(),
+					windows: [
+						{ family: "gemini", window: "weekly", remainingPct: 95, resetsAt: "2099-01-01T00:00:00Z" },
+						{ family: "gemini", window: "fiveHour", remainingPct: 95, resetsAt: "2099-01-01T00:00:00Z" },
+					],
+					raw: "",
+				}),
+			);
+			await writeFile(
+				join(root, "profiles", "acct-basic", "usage.json"),
+				JSON.stringify({
+					profile: "acct-basic",
+					fetchedAt: Date.now(),
+					windows: [
+						{ family: "gemini", window: "weekly", remainingPct: 80, resetsAt: "2099-01-01T00:00:00Z" },
+						{ family: "gemini", window: "fiveHour", remainingPct: 80, resetsAt: "2099-01-01T00:00:00Z" },
+					],
+					raw: "",
+				}),
+			);
+			await writeFile(
+				join(root, "profiles", "acct-basic", "models.json"),
+				JSON.stringify({
+					profile: "acct-basic",
+					fetchedAt: Date.now(),
+					models: [{ modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" }],
+					configOptions: [{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" }],
+				}),
+			);
+			await writeFile(
+				join(root, "profiles", "acct-pro", "models.json"),
+				JSON.stringify({
+					profile: "acct-pro",
+					fetchedAt: Date.now(),
+					models: [
+						{ modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" },
+						{ modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
+						{ modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
+					],
+					configOptions: [
+						{ value: "gemini-4-argon", name: "Gemini 4 Argon" },
+						{ value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+						{ value: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
+					],
+				}),
+			);
+
+			const { proxy, send, notifications } = spawnProxy(projectRoot, root, fake, promptLog, undefined, true);
+			const choiceValues = (options: unknown[]) => {
+				const model = options.find(option => isRecord(option) && option.id === "model") as {
+					options: Array<{ value?: string; options?: Array<{ value: string }> }>;
+				};
+				return model.options.flatMap(option => option.options?.map(choice => choice.value) ?? [option.value]).sort();
+			};
+			try {
+				await send("initialize", { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: "test", version: "1" } });
+				const created = await send<{ result: { sessionId: string; configOptions: unknown[] } }>("session/new", {
+					cwd: root,
+					mcpServers: [],
+				});
+				const expectedIds = ["gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-5-flash"];
+				expect(choiceValues(created.result.configOptions)).toEqual(expectedIds);
+
+				// Switching to gemini-3.8-flash moves the session from acct-pro to acct-basic;
+				// acct-basic's response must still expose the full merged Gemini catalog.
+				const switched = await send<{ result: { configOptions: unknown[] } }>("session/set_config_option", {
+					sessionId: created.result.sessionId,
+					configId: "model",
+					value: "gemini-3.8-flash",
+				});
+				expect(choiceValues(switched.result.configOptions)).toEqual(expectedIds);
+
+				// Follow-up model config change while already bound to acct-basic emits
+				// both response configOptions and config_option_update notification with full catalog.
+				const stayOnBasic = await send<{ result: { configOptions: unknown[] } }>("session/set_config_option", {
+					sessionId: created.result.sessionId,
+					configId: "model",
+					value: "gemini-3.8-flash",
+				});
+				expect(choiceValues(stayOnBasic.result.configOptions)).toEqual(expectedIds);
+
+				// Non-model config option change on acct-basic also preserves full model catalog.
+				const nonModelSet = await send<{ result: { configOptions: unknown[] } }>("session/set_config_option", {
+					sessionId: created.result.sessionId,
+					configId: "thinking",
+					value: "high",
+				});
+				expect(choiceValues(nonModelSet.result.configOptions)).toEqual(expectedIds);
+
+				const updates = notifications.flatMap(message => {
+					const params = message.params;
+					if (!isRecord(params) || !isRecord(params.update) || params.update.sessionUpdate !== "config_option_update") {
+						return [];
+					}
+					return [params.update.configOptions as unknown[]];
+				});
+				expect(updates.length).toBeGreaterThan(0);
+				for (const updateOptions of updates) {
+					expect(choiceValues(updateOptions)).toEqual(expectedIds);
+				}
+
+				const prompted = await send<{ result?: { stopReason: string }; error?: unknown }>("session/prompt", {
+					sessionId: created.result.sessionId,
+					prompt: [{ type: "text", text: "Hello flash" }],
+				});
+				expect(prompted.error).toBeUndefined();
+				expect(prompted.result?.stopReason).toBe("end_turn");
+				const entries = (await readFile(promptLog, "utf8")).trim().split("\n");
+				expect(entries).toEqual(["acct-basic:gemini-3.8-flash"]);
+			} finally {
+				proxy.kill();
+				await proxy.exited.catch(() => {});
+				await rm(root, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
 });
