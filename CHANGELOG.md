@@ -6,6 +6,18 @@ published only by running `.github/workflows/release.yml` via `workflow_dispatch
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-26
+
+### Added
+
+- **acp**: add clean --gemini-dir isolation and per-session --skills injection
+
+### Fixed
+
+- **profile**: share MCP OAuth tokens and customization dirs across accounts
+
+[Full Changelog](https://github.com/iqbal-codes/agy-multi/compare/v1.3.1...v1.4.0)
+
 ## [1.3.1] - 2026-11-26
 
 ### Fixed
